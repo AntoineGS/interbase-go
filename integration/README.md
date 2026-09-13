@@ -98,6 +98,68 @@ Owned subprocess groups are terminated on execution failure. Native driver
 calls remain non-interruptible in flight, so the Go process timeout is still
 necessary. No filesystem permissions or server security settings are changed.
 
+The tested InterBase isql returns exit status 1 even after successful SQL.
+The harness therefore requires a standalone SQL completion marker, complete
+captured output, no SQL error diagnostics, and a zero/one exit status. It also
+verifies that creation produced the owned file and that DROP removed it. Exit
+status 1 alone is never evidence of successful provisioning or cleanup.
+
+## Docker-Backed Runs
+
+The sibling `interbase-server-docker` project supplies the server image. Use a
+dedicated container instead of its normal Compose deployment, which mounts
+persistent databases, backups and logs. Set `IMAGE` to an existing local image;
+these commands do not build, pull or publish a licensed image:
+
+```sh
+TEST_ROOT=$(mktemp -d /tmp/interbase-go-docker.XXXXXX)
+TEST_CONTAINER="interbase-go-test-${TEST_ROOT##*.}"
+docker run --pull=never --detach --rm --name "$TEST_CONTAINER" \
+  --publish 127.0.0.1:3050:3050 \
+  --mount "type=bind,source=$TEST_ROOT,target=$TEST_ROOT" \
+  --mount type=tmpfs,destination=/var/lib/interbase \
+  --env IB_SYSDBA_USER=SYSDBA --env IB_SYSDBA_PASSWORD=masterkey \
+  --env IB_DATA_DIR=/var/lib/interbase/data \
+  --env IB_BACKUP_DIR=/var/lib/interbase/backups --env IB_BACKUP_DATABASES= \
+  "${IMAGE:?set IMAGE to the local InterBase server image}"
+```
+
+The same-path bind mount is required: the host creates the temporary directories
+and the server creates the database files at those exact absolute paths. The
+image used for validation runs as root under rootful Docker; other UID mappings
+need their own permission validation. Do not broaden host permissions globally.
+Wait for the server to accept the configured password and reject a wrong one
+before running tests. Do not bind the test server to all host interfaces.
+
+In the validated setup, the installed 14.7 client library failed authentication
+against the container's 15.1 server. A temporary copy of the image's client
+library resolved it; no host installation or driver source was changed:
+
+```sh
+docker cp -L "$TEST_CONTAINER:/opt/interbase/lib/libgds.so" "$TEST_ROOT/libgds.so"
+docker cp -L "$TEST_CONTAINER:/opt/interbase/bin/isql" "$TEST_ROOT/isql"
+
+env -u INTERBASE_DATABASE -u INTERBASE_USER -u INTERBASE_PASSWORD \
+  LD_LIBRARY_PATH="$TEST_ROOT:/opt/interbase/lib" TMPDIR="$TEST_ROOT" \
+  INTERBASE_TEST_ISQL="$TEST_ROOT/isql" \
+  INTERBASE_TEST_USER=SYSDBA INTERBASE_TEST_PASSWORD=masterkey \
+  go test -tags=integration ./integration -count=1 -timeout=10m
+```
+
+Run the same command with `-run '^TestReadFixtureSmoke$'` first to check setup.
+After testing, **even when the test command fails**, stop only this container:
+
+```sh
+docker stop "$TEST_CONTAINER"
+rm -- "$TEST_ROOT/isql" "$TEST_ROOT/libgds.so"
+rmdir -- "$TEST_ROOT"
+```
+
+The nonrecursive `rmdir` intentionally fails if a fixture was retained. Inspect
+that path rather than recursively deleting it. The container's tmpfs security
+database disappears with the container; existing Docker volumes are untouched.
+Never commit the temporary vendor binaries or license files.
+
 ## Coverage Map
 
 Source methods below are selected/adapted assertions, not whole-method parity.
@@ -153,11 +215,28 @@ results and scaled floating-point results. Those contracts are expected to
 remain red until implemented; there are no feature skips or expected-failure
 wrappers. A driver defect can also make a read-side contract fail.
 
-Offline tests, tagged compilation and static reviews do not prove live SQL
-compatibility. During migration on this machine, the local smoke test reached
-isql but failed to connect to `localhost/3050`: only the client installation was
-available. Consequently no successful live contract run or healthy create/drop
-cycle has yet been established. Setup failures must not be reported as the
-expected unsupported-driver failures. The failed setup left no fixture files.
+The first host-only attempt was blocked by a missing local server. On
+2026-09-12, Docker-backed validation used server `LI-V15.1.0.49` and client
+`LI-V15.1.0.42` with the existing driver compiled against the installed SDK.
+Provisioning and cleanup passed, including the complete fixture schema.
+
+The full suite had **19 passing and 28 failing top-level groups**: the smoke
+test, two helper checks, and 16 read contracts passed. All 255 individually
+named VARCHAR-length subtests passed. Three read contracts failed:
+
+- `TestReadCHARPadding`: UTF8 `CHAR(5)` decoded as 20 bytes of padded text
+  (`"AA"` plus 18 spaces), instead of five characters.
+- `TestReadWideDecimalDialectOneFloatTolerance`: the driver explicitly rejects
+  scaled floating-point results.
+- `TestReadWIN1250UTF8RoundTrip`: the bound query failed with SQLCODE -303. The
+  same charset conversion with a UTF8 SQL literal succeeded through isql,
+  narrowing this to parameter handling rather than unavailable server support.
+
+The other 25 failing groups exercise intentionally unfinished writes,
+transactions, public preparation and additional argument/BLOB types. They now
+fail on actual driver capabilities, not fixture setup. No driver behavior was
+changed or assertions relaxed to obtain these results. This validates the
+tested image/client combination, not general 14.x/15.x compatibility or a
+passing implementation of the full contract suite.
 
 Attribution and permission notices are retained in `UPSTREAM_LICENSE.txt`.

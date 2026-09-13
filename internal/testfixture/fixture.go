@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,8 @@ const (
 	defaultISQL     = "/opt/interbase/bin/isql"
 	defaultUser     = "SYSDBA"
 	defaultPassword = "masterkey"
+	createMarker    = "INTERBASE_GO_FIXTURE_CREATE_COMPLETE"
+	dropMarker      = "INTERBASE_GO_FIXTURE_DROP_COMPLETE"
 
 	commandTimeout = 30 * time.Second
 	cleanupTimeout = 30 * time.Second
@@ -33,6 +36,8 @@ var sqlFailurePattern = regexp.MustCompile(`(?i)(statement\s+failed|dynamic\s+sq
 
 var errUnsafeTempRoot = errors.New("interbase fixture: temporary root is not a local absolute path")
 var errOutputLimit = errors.New("isql output exceeded capture limit")
+var errOutputIncomplete = errors.New("isql output did not reach EOF before wait delay")
+var errOwnedDescendants = errors.New("isql owned descendants remained alive after command exit")
 
 // Config contains the test-only isql and credential settings.
 //
@@ -172,15 +177,43 @@ func Create(ctx context.Context, cfg Config, schema string) (*Database, error) {
 
 	commandContext, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
-	if err := runISQL(commandContext, cfg, createScript(path, cfg, schema), "create database"); err != nil {
+	if err := runISQL(commandContext, cfg, createScript(path, cfg, schema), "create database", createMarker); err != nil {
 		cleanupErr := db.handleFailedCreate()
 		if cleanupErr != nil {
 			return db, errors.Join(err, cleanupErr)
 		}
 		return db, err
 	}
+	exists, err := databasePathExists(db.ownedPath)
+	if err != nil {
+		proofErr := fmt.Errorf("interbase fixture: create database: inspect completion path %q: %w", db.ownedPath, err)
+		cleanupErr := db.handleFailedCreate()
+		if cleanupErr != nil {
+			return db, errors.Join(proofErr, cleanupErr)
+		}
+		return db, proofErr
+	}
+	if !exists {
+		proofErr := fmt.Errorf("interbase fixture: create database: completion marker reported but database path %q is absent", db.ownedPath)
+		cleanupErr := db.handleFailedCreate()
+		if cleanupErr != nil {
+			return db, errors.Join(proofErr, cleanupErr)
+		}
+		return db, proofErr
+	}
 	db.databaseExists = true
 	return db, nil
+}
+
+func databasePathExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (db *Database) handleFailedCreate() error {
@@ -204,7 +237,7 @@ func (db *Database) handleFailedCreate() error {
 }
 
 // Close drops the owned database and removes its now-empty temporary
-// directory. Failed cleanup leaves the artifact in place and can be retried.
+// directory. Failed cleanup leaves any remaining artifact in place and can be retried.
 func (db *Database) Close() error {
 	if db == nil {
 		return errors.New("interbase fixture: nil database")
@@ -223,14 +256,37 @@ func (db *Database) Close() error {
 		return errors.New("interbase fixture: database has no owned path")
 	}
 
+	var dropErr error
 	if db.databaseExists && !db.dropCompleted {
-		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-		err := runISQL(ctx, db.config, dropScript(db.ownedPath, db.config), "drop database")
-		cancel()
+		exists, err := databasePathExists(db.ownedPath)
 		if err != nil {
-			return fmt.Errorf("interbase fixture: cleanup failed; retained at %q: %w", db.ownedPath, err)
+			return fmt.Errorf("interbase fixture: cleanup failed; retained at %q: inspect database path: %w", db.ownedPath, err)
 		}
-		db.dropCompleted = true
+		if !exists {
+			db.dropCompleted = true
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+			dropErr = runISQL(ctx, db.config, dropScript(db.ownedPath, db.config), "drop database", dropMarker)
+			cancel()
+
+			exists, inspectErr := databasePathExists(db.ownedPath)
+			if inspectErr != nil {
+				if dropErr != nil {
+					return errors.Join(
+						fmt.Errorf("interbase fixture: cleanup failed; retained at %q: %w", db.ownedPath, dropErr),
+						fmt.Errorf("interbase fixture: cleanup failed; retained at %q: inspect database path: %w", db.ownedPath, inspectErr),
+					)
+				}
+				return fmt.Errorf("interbase fixture: cleanup failed; retained at %q: inspect database path: %w", db.ownedPath, inspectErr)
+			}
+			if exists {
+				if dropErr != nil {
+					return fmt.Errorf("interbase fixture: cleanup failed; retained at %q: %w", db.ownedPath, dropErr)
+				}
+				return fmt.Errorf("interbase fixture: cleanup failed; retained at %q: drop completion marker reported but database path remains", db.ownedPath)
+			}
+			db.dropCompleted = true
+		}
 	}
 
 	if err := os.Remove(db.directory); err != nil {
@@ -239,10 +295,13 @@ func (db *Database) Close() error {
 		}
 	}
 	db.closed = true
+	if dropErr != nil {
+		return fmt.Errorf("interbase fixture: cleanup command reported failure after database removal: %w", dropErr)
+	}
 	return nil
 }
 
-func runISQL(ctx context.Context, cfg Config, script, operation string) error {
+func runISQL(ctx context.Context, cfg Config, script, operation, marker string) error {
 	commandContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -257,25 +316,41 @@ func runISQL(ctx context.Context, cfg Config, script, operation string) error {
 		limit:  maxOutputBytes,
 		cancel: cancel,
 	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("interbase fixture: %s: create output pipe: %w", operation, err)
+	}
+	outputDone := make(chan error, 1)
+	go func() {
+		_, copyErr := io.Copy(output, reader)
+		outputDone <- copyErr
+	}()
+	command.Stdout = writer
+	command.Stderr = writer
 	command.Stdin = strings.NewReader(script)
-	command.Stdout = output
-	command.Stderr = output
-	commandErr := command.Run()
+	startErr := command.Start()
+	_ = writer.Close()
+	if startErr != nil {
+		_ = reader.Close()
+		<-outputDone
+		return formatCommandError(operation, startErr, output.String(), cfg)
+	}
+	commandErr := command.Wait()
+	outputErr := waitForISQLOutput(command, reader, outputDone)
 
 	if output.Exceeded() {
 		_ = terminateProcessGroup(command)
 		return fmt.Errorf("interbase fixture: %s: %w", operation, errOutputLimit)
 	}
+	if outputErr != nil {
+		_ = terminateProcessGroup(command)
+		if contextErr := ctx.Err(); contextErr != nil {
+			return fmt.Errorf("interbase fixture: %s: %w", operation, errors.Join(outputErr, contextErr))
+		}
+		return fmt.Errorf("interbase fixture: %s: %w", operation, outputErr)
+	}
 	text := redact(output.String(), cfg.User, cfg.Password)
 
-	if contextErr := ctx.Err(); contextErr != nil {
-		_ = terminateProcessGroup(command)
-		return formatCommandError(operation, contextErr, text, cfg)
-	}
-	if commandErr != nil {
-		_ = terminateProcessGroup(command)
-		return formatCommandError(operation, commandErr, text, cfg)
-	}
 	if sqlFailurePattern.MatchString(output.String()) {
 		_ = terminateProcessGroup(command)
 		if text == "" {
@@ -283,7 +358,127 @@ func runISQL(ctx context.Context, cfg Config, script, operation string) error {
 		}
 		return fmt.Errorf("interbase fixture: %s: %s", operation, text)
 	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		_ = terminateProcessGroup(command)
+		return formatCommandError(operation, contextErr, text, cfg)
+	}
+	if commandErr != nil {
+		var exitErr *exec.ExitError
+		if !errors.As(commandErr, &exitErr) || exitErr.ExitCode() != 1 {
+			_ = terminateProcessGroup(command)
+			return formatCommandError(operation, commandErr, text, cfg)
+		}
+	}
+	if !hasCompletionMarker(output.String(), marker) {
+		_ = terminateProcessGroup(command)
+		detail := fmt.Sprintf("completion marker %q was not found", marker)
+		if commandErr != nil {
+			detail += ": " + redact(commandErr.Error(), cfg.User, cfg.Password)
+		}
+		if text != "" {
+			detail += ": " + text
+		}
+		return fmt.Errorf("interbase fixture: %s: %s", operation, detail)
+	}
 	return nil
+}
+
+func waitForISQLOutput(command *exec.Cmd, reader *os.File, outputDone <-chan error) error {
+	timer := time.NewTimer(waitDelay)
+	defer timer.Stop()
+
+	select {
+	case copyErr := <-outputDone:
+		_ = reader.Close()
+		if copyErr != nil {
+			killErr := terminateAndWaitForProcessGroup(command)
+			if errors.Is(copyErr, errOutputLimit) {
+				if killErr != nil {
+					return errors.Join(copyErr, killErr)
+				}
+				return copyErr
+			}
+			captureErr := fmt.Errorf("%w: %v", errOutputIncomplete, copyErr)
+			if killErr != nil {
+				return errors.Join(captureErr, killErr)
+			}
+			return captureErr
+		}
+		if processGroupAlive(command) {
+			killErr := terminateAndWaitForProcessGroup(command)
+			if killErr != nil {
+				return errors.Join(errOwnedDescendants, killErr)
+			}
+			return errOwnedDescendants
+		}
+		return nil
+	case <-timer.C:
+		killErr := terminateAndWaitForProcessGroup(command)
+		_ = reader.Close()
+		copyErr := waitForOutputCopy(outputDone)
+		if errors.Is(copyErr, errOutputLimit) {
+			if killErr != nil {
+				return errors.Join(copyErr, killErr)
+			}
+			return copyErr
+		}
+		if killErr != nil {
+			return errors.Join(errOutputIncomplete, killErr)
+		}
+		return errOutputIncomplete
+	}
+}
+
+func waitForOutputCopy(outputDone <-chan error) error {
+	timer := time.NewTimer(waitDelay)
+	defer timer.Stop()
+	select {
+	case copyErr := <-outputDone:
+		return copyErr
+	case <-timer.C:
+		return nil
+	}
+}
+
+func terminateAndWaitForProcessGroup(command *exec.Cmd) error {
+	if err := terminateProcessGroup(command); err != nil {
+		return err
+	}
+	if !processGroupAlive(command) {
+		return nil
+	}
+
+	timer := time.NewTimer(waitDelay)
+	defer timer.Stop()
+	for processGroupAlive(command) {
+		select {
+		case <-timer.C:
+			return errOwnedDescendants
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+func processGroupAlive(command *exec.Cmd) bool {
+	if command.Process == nil {
+		return false
+	}
+	err := syscall.Kill(-command.Process.Pid, 0)
+	return err == nil || err == syscall.EPERM
+}
+
+func hasCompletionMarker(output, marker string) bool {
+	if marker == "" {
+		return false
+	}
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == marker {
+			return true
+		}
+	}
+	return false
 }
 
 type boundedOutput struct {
@@ -430,12 +625,14 @@ func createScript(path string, cfg Config, schema string) string {
 	if schema != "" && !strings.HasSuffix(schema, "\n") {
 		script.WriteByte('\n')
 	}
+	script.WriteString("COMMIT;\n")
+	fmt.Fprintf(&script, "SELECT %s FROM RDB$DATABASE;\n", quoteSQLString(createMarker))
 	return script.String()
 }
 
 func dropScript(path string, cfg Config) string {
-	return fmt.Sprintf("CONNECT %s USER %s PASSWORD %s;\nDROP DATABASE;\n",
-		quoteSQLString(path), quoteSQLString(cfg.User), quoteSQLString(cfg.Password))
+	return fmt.Sprintf("CONNECT %s USER %s PASSWORD %s;\nSELECT %s FROM RDB$DATABASE;\nDROP DATABASE;\n",
+		quoteSQLString(path), quoteSQLString(cfg.User), quoteSQLString(cfg.Password), quoteSQLString(dropMarker))
 }
 
 func quoteSQLString(value string) string {
