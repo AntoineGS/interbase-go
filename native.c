@@ -1,7 +1,10 @@
 #include "native.h"
 
 #include <ibase.h>
+#include <ctype.h>
+#include <errno.h>
 #include <inttypes.h>
+#include <iconv.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,13 +14,19 @@
 #define IB_STATUS_VECTOR_LENGTH 20
 #define IB_MAX_SQLDA_BUFFER (1024U * 1024U)
 #define IB_SQL_MESSAGE_LENGTH 256U
+#define IB_BLOB_SEGMENT_LENGTH 32767U
+#define IB_BLOB_BPB_LENGTH 64U
+#define IB_MAX_BLOB_BUFFER (64U * 1024U * 1024U)
+#define IB_CHARSET_UTF8 59
 
 enum ib_argument_kind {
 	IB_ARGUMENT_NULL = 0,
 	IB_ARGUMENT_STRING = 1,
 	IB_ARGUMENT_INT64 = 2,
 	IB_ARGUMENT_FLOAT64 = 3,
-	IB_ARGUMENT_BOOL = 4
+	IB_ARGUMENT_BOOL = 4,
+	IB_ARGUMENT_TIMESTAMP = 5,
+	IB_ARGUMENT_BYTES = 6
 };
 
 typedef struct ib_bind_value {
@@ -27,6 +36,13 @@ typedef struct ib_bind_value {
 	int64_t int64_value;
 	double float64_value;
 	int bool_value;
+	int year;
+	int month;
+	int day;
+	int hour;
+	int minute;
+	int second;
+	int nanosecond;
 } ib_bind_value;
 
 struct ib_bindings {
@@ -37,15 +53,33 @@ struct ib_bindings {
 struct ib_connection {
 	isc_db_handle database;
 	ib_cursor *active_cursor;
+	ib_statement *statements;
+	isc_tr_handle transaction;
+	short charset;
 	int broken;
+};
+
+struct ib_statement {
+	ib_connection *connection;
+	isc_stmt_handle statement;
+	XSQLDA *input;
+	XSQLDA *output;
+	int statement_type;
+	ib_statement *next;
 };
 
 struct ib_cursor {
 	ib_connection *connection;
+	ib_statement *prepared;
 	isc_tr_handle transaction;
 	isc_stmt_handle statement;
 	XSQLDA *input;
 	XSQLDA *output;
+	char *converted_value;
+	char *materialized_value;
+	int owns_transaction;
+	int server_cursor_open;
+	int statement_type;
 	int fetched;
 };
 
@@ -65,6 +99,208 @@ static char *ib_copy_string(const char *value, size_t length)
 	}
 	copy[length] = '\0';
 	return copy;
+}
+
+static int ib_fail(char **error, const char *message);
+
+static const char *ib_charset_encoding(short charset)
+{
+	switch (charset) {
+	case 2:
+		return "ASCII";
+	case 3:
+		return "UTF-8";
+	case 5:
+		return "SHIFT-JIS";
+	case 6:
+		return "EUC-JP";
+	case 8:
+		return "UTF-16BE";
+	case 10:
+		return "CP437";
+	case 11:
+		return "CP850";
+	case 12:
+		return "CP865";
+	case 13:
+		return "CP860";
+	case 14:
+		return "CP863";
+	case 21:
+		return "ISO-8859-1";
+	case 22:
+		return "ISO-8859-2";
+	case 39:
+		return "ISO-8859-15";
+	case 44:
+		return "EUC-KR";
+	case 45:
+		return "CP852";
+	case 46:
+		return "CP857";
+	case 47:
+		return "CP861";
+	case 51:
+		return "CP1250";
+	case 52:
+		return "CP1251";
+	case 53:
+		return "CP1252";
+	case 54:
+		return "CP1253";
+	case 55:
+		return "CP1254";
+	case 56:
+		return "BIG5";
+	case 57:
+		return "GB2312";
+	case 58:
+		return "KOI8-R";
+	case 59:
+		return "UTF-8";
+	case 64:
+		return "UTF-16LE";
+	default:
+		return NULL;
+	}
+}
+
+static int ib_charset_name_matches(const char *value, size_t length,
+	const char *expected)
+{
+	size_t index;
+	size_t expected_length;
+
+	if (value == NULL || expected == NULL) {
+		return 0;
+	}
+	expected_length = strlen(expected);
+	if (length != expected_length) {
+		return 0;
+	}
+	for (index = 0U; index < length; index++) {
+		if (toupper((unsigned char) value[index]) !=
+			toupper((unsigned char) expected[index])) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static int ib_charset_id(const char *value, size_t length, short *charset)
+{
+	if (charset == NULL) {
+		return -1;
+	}
+	if (length == 0U || ib_charset_name_matches(value, length, "UTF8")) {
+		*charset = IB_CHARSET_UTF8;
+		return 0;
+	}
+	if (ib_charset_name_matches(value, length, "WIN1250")) {
+		*charset = 51;
+		return 0;
+	}
+	return -1;
+}
+
+static const char *ib_charset_name(short charset)
+{
+	switch (charset) {
+	case IB_CHARSET_UTF8:
+		return "UTF8";
+	case 51:
+		return "WIN1250";
+	default:
+		return NULL;
+	}
+}
+
+static char *ib_convert_charset(const char *value, size_t length,
+	short source_charset, short target_charset, size_t *converted_length,
+	char **error)
+{
+	const char *source_encoding;
+	const char *target_encoding;
+	iconv_t converter;
+	char *converted;
+	char *input;
+	char *output;
+	size_t input_length;
+	size_t output_length;
+	size_t capacity;
+	size_t result;
+
+	if (converted_length == NULL) {
+		return NULL;
+	}
+	*converted_length = 0U;
+	if (length == 0U || source_charset == target_charset ||
+		source_charset == 0 || source_charset == 1 || target_charset == 0 ||
+		target_charset == 1) {
+		converted = ib_copy_string(value, length);
+		if (converted == NULL) {
+			(void) ib_fail(error, "out of memory copying string query argument");
+			return NULL;
+		}
+		*converted_length = length;
+		return converted;
+	}
+	source_encoding = ib_charset_encoding(source_charset);
+	target_encoding = ib_charset_encoding(target_charset);
+	if (source_encoding == NULL || target_encoding == NULL) {
+		(void) ib_fail(error, "the character set conversion is unsupported");
+		return NULL;
+	}
+	converter = iconv_open(target_encoding, source_encoding);
+	if (converter == (iconv_t) -1) {
+		(void) ib_fail(error, "the character set converter is unavailable");
+		return NULL;
+	}
+	if (length > (SIZE_MAX - 1U) / 4U) {
+		iconv_close(converter);
+		(void) ib_fail(error, "the value is too large to convert");
+		return NULL;
+	}
+	capacity = length * 4U + 1U;
+	converted = (char *) malloc(capacity);
+	if (converted == NULL) {
+		iconv_close(converter);
+		(void) ib_fail(error, "out of memory converting character data");
+		return NULL;
+	}
+	input = (char *) value;
+	input_length = length;
+	output = converted;
+	output_length = capacity - 1U;
+	result = iconv(converter, &input, &input_length, &output, &output_length);
+	if (result == (size_t) -1) {
+		free(converted);
+		iconv_close(converter);
+		if (errno == EILSEQ || errno == EINVAL) {
+			(void) ib_fail(error, "character data is not representable in the configured character set");
+		} else {
+			(void) ib_fail(error, "character data could not be converted");
+		}
+		return NULL;
+	}
+	*converted_length = (capacity - 1U) - output_length;
+	*output = '\0';
+	iconv_close(converter);
+	return converted;
+}
+
+static char *ib_convert_utf8(const char *value, size_t length, short charset,
+	size_t *converted_length, char **error)
+{
+	return ib_convert_charset(value, length, IB_CHARSET_UTF8, charset,
+		converted_length, error);
+}
+
+static char *ib_convert_to_utf8(const char *value, size_t length, short charset,
+	size_t *converted_length, char **error)
+{
+	return ib_convert_charset(value, length, charset, IB_CHARSET_UTF8,
+		converted_length, error);
 }
 
 static void ib_give_error(char **error, char *message)
@@ -178,6 +414,77 @@ static int ib_fail_status(char **error, const char *operation,
 	return ib_fail(error, message);
 }
 
+static void ib_append_error(char **first_error, char *next_error)
+{
+	char *joined;
+
+	if (next_error == NULL) {
+		return;
+	}
+	if (first_error == NULL) {
+		free(next_error);
+		return;
+	}
+	if (*first_error == NULL) {
+		*first_error = next_error;
+		return;
+	}
+	joined = ib_join_errors(*first_error, next_error);
+	if (joined != NULL) {
+		free(*first_error);
+		free(next_error);
+		*first_error = joined;
+	} else {
+		free(next_error);
+	}
+}
+
+static int ib_start_transaction(ib_connection *connection,
+	isc_tr_handle *transaction, int read_only, const char *operation,
+	char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	const char tpb[] = {
+		isc_tpb_version3,
+		isc_tpb_read_committed,
+		isc_tpb_rec_version,
+		isc_tpb_wait,
+		read_only ? isc_tpb_read : isc_tpb_write
+	};
+
+	if (connection == NULL || connection->database == NULL ||
+		connection->broken || transaction == NULL || *transaction != NULL) {
+		return ib_fail(error, "connection or transaction is unavailable");
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_start_transaction(status, transaction, 1,
+		&connection->database, (short) sizeof(tpb), (char *) tpb);
+	if (result != 0) {
+		connection->broken = 1;
+		if (*transaction != NULL) {
+			ISC_STATUS rollback_status[IB_STATUS_VECTOR_LENGTH];
+			char *rollback_error = NULL;
+
+			memset(rollback_status, 0, sizeof(rollback_status));
+			if (isc_rollback_transaction(rollback_status, transaction) != 0) {
+				(void) ib_fail_status(&rollback_error, "rollback failed transaction",
+					rollback_status);
+			}
+			*transaction = NULL;
+			if (rollback_error != NULL) {
+				char *primary_error = NULL;
+				(void) ib_fail_status(&primary_error, operation, status);
+				ib_append_error(&primary_error, rollback_error);
+				ib_give_error(error, primary_error);
+				return -1;
+			}
+		}
+		return ib_fail_status(error, operation, status);
+	}
+	return 0;
+}
+
 static void ib_free_sqlda(XSQLDA *sqlda)
 {
 	short index;
@@ -217,9 +524,43 @@ static XSQLDA *ib_alloc_sqlda(short count)
 	return sqlda;
 }
 
+static XSQLDA *ib_clone_sqlda(const XSQLDA *source, char **error)
+{
+	XSQLDA *clone;
+	short index;
+
+	if (source == NULL || source->sqln < 0 || source->sqld < 0 ||
+		source->sqld > source->sqln) {
+		(void) ib_fail(error, "the prepared SQLDA is invalid");
+		return NULL;
+	}
+	clone = ib_alloc_sqlda(source->sqln);
+	if (clone == NULL) {
+		(void) ib_fail(error, "out of memory copying prepared SQLDA");
+		return NULL;
+	}
+	clone->sqldabc = source->sqldabc;
+	clone->sqld = source->sqld;
+	for (index = 0; index < source->sqln; index++) {
+		clone->sqlvar[index] = source->sqlvar[index];
+		clone->sqlvar[index].sqldata = NULL;
+		clone->sqlvar[index].sqlind = NULL;
+	}
+	return clone;
+}
+
 static int ib_sql_type(const XSQLVAR *variable)
 {
 	return ((int) variable->sqltype) & ~1;
+}
+
+static short ib_text_charset(const XSQLVAR *variable)
+{
+	if (variable == NULL) {
+		return 0;
+	}
+	/* The low byte is the charset; the high byte may carry collation. */
+	return (short) ((unsigned short) variable->sqlsubtype & 0x00ffU);
 }
 
 static int ib_validate_length(short length, size_t extra, size_t *size,
@@ -250,6 +591,9 @@ static int ib_value_buffer_size(const XSQLVAR *variable, size_t *size,
 	case SQL_VARYING:
 		return ib_validate_length(variable->sqllen, sizeof(unsigned short), size,
 			error);
+	case SQL_BLOB:
+		*size = sizeof(ISC_QUAD);
+		return 0;
 	case SQL_SHORT:
 		*size = sizeof(short);
 		return 0;
@@ -263,6 +607,9 @@ static int ib_value_buffer_size(const XSQLVAR *variable, size_t *size,
 		*size = sizeof(float);
 		return 0;
 	case SQL_DOUBLE:
+		*size = sizeof(double);
+		return 0;
+	case SQL_D_FLOAT:
 		*size = sizeof(double);
 		return 0;
 	case SQL_TIMESTAMP:
@@ -385,14 +732,19 @@ static int ib_describe_output(ib_cursor *cursor, char **error)
 	return 0;
 }
 
-static int ib_statement_is_select(ib_cursor *cursor, char **error)
+static int ib_statement_type(ib_cursor *cursor, int *statement_type,
+	char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
 	char request[1];
 	char response[64];
 	ISC_LONG response_length;
-	ISC_LONG statement_type;
+	ISC_LONG server_statement_type;
+
+	if (cursor == NULL || statement_type == NULL || cursor->statement == NULL) {
+		return ib_fail(error, "statement is unavailable");
+	}
 
 	request[0] = (char) isc_info_sql_stmt_type;
 	memset(response, 0, sizeof(response));
@@ -409,36 +761,454 @@ static int ib_statement_is_select(ib_cursor *cursor, char **error)
 	if (response_length <= 0 || response_length > (ISC_LONG) sizeof(response) - 3) {
 		return ib_fail(error, "InterBase returned an invalid statement type");
 	}
-	statement_type = isc_vax_integer(response + 3, (short) response_length);
+	server_statement_type = isc_vax_integer(response + 3,
+		(short) response_length);
+	*statement_type = (int) server_statement_type;
+	cursor->statement_type = *statement_type;
+	return 0;
+}
+
+static int ib_statement_is_select(ib_cursor *cursor, char **error)
+{
+	int statement_type;
+
+	if (ib_statement_type(cursor, &statement_type, error) != 0) {
+		return -1;
+	}
 	if (statement_type != isc_info_sql_stmt_select) {
 		return ib_fail(error, "only SELECT statements are permitted");
 	}
 	return 0;
 }
 
-static int ib_set_varying(XSQLVAR *variable, const char *value, size_t length,
-	short nullable, char **error)
+static int ib_statement_rejects_transaction_control_type(int statement_type,
+	char **error)
 {
-	unsigned short varying_length;
-	size_t size;
-
-	if (length > (size_t) SHRT_MAX) {
-		return ib_fail(error, "string argument exceeds the SQLDA length limit");
+	switch (statement_type) {
+	case isc_info_sql_stmt_start_trans:
+	case isc_info_sql_stmt_commit:
+	case isc_info_sql_stmt_rollback:
+		return ib_fail(error,
+			"transaction-control SQL must use database/sql transaction methods");
+	default:
+		return 0;
 	}
-	variable->sqltype = (short) (SQL_VARYING | nullable);
-	variable->sqlscale = 0;
-	variable->sqlsubtype = 0;
-	variable->sqlprecision = 0;
-	variable->sqllen = (short) length;
-	if (ib_validate_length(variable->sqllen, sizeof(unsigned short), &size, error) != 0 ||
-		ib_allocate_variable(variable, size, error) != 0) {
+}
+
+static int ib_statement_rejects_result(ib_cursor *cursor, char **error)
+{
+	int statement_type;
+
+	if (ib_statement_type(cursor, &statement_type, error) != 0) {
 		return -1;
 	}
-	varying_length = (unsigned short) length;
-	memcpy(variable->sqldata, &varying_length, sizeof(varying_length));
-	if (length != 0U) {
-		memcpy(variable->sqldata + sizeof(varying_length), value, length);
+	if (statement_type == isc_info_sql_stmt_select ||
+		statement_type == isc_info_sql_stmt_select_for_upd ||
+		statement_type == isc_info_sql_stmt_exec_procedure) {
+		return ib_fail(error, "statement produces a result set; use Query instead");
 	}
+	return ib_statement_rejects_transaction_control_type(statement_type, error);
+}
+
+static int ib_statement_rows_affected(ib_cursor *cursor,
+	int64_t *rows_affected, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	const char request[] = { isc_info_sql_records, isc_info_end };
+	char response[64];
+	ISC_LONG response_length;
+	size_t offset;
+	size_t end;
+	int requested_type;
+
+	if (cursor == NULL || rows_affected == NULL || cursor->statement == NULL) {
+		return ib_fail(error, "statement result is unavailable");
+	}
+	*rows_affected = -1;
+	switch (cursor->statement_type) {
+	case isc_info_sql_stmt_insert:
+		requested_type = isc_info_req_insert_count;
+		break;
+	case isc_info_sql_stmt_update:
+		requested_type = isc_info_req_update_count;
+		break;
+	case isc_info_sql_stmt_delete:
+		requested_type = isc_info_req_delete_count;
+		break;
+	default:
+		return 0;
+	}
+
+	memset(response, 0, sizeof(response));
+	memset(status, 0, sizeof(status));
+	result = isc_dsql_sql_info(status, &cursor->statement,
+		(short) sizeof(request), (char *) request, (short) sizeof(response), response);
+	if (result != 0) {
+		return ib_fail_status(error, "inspect affected rows", status);
+	}
+	if ((unsigned char) response[0] == isc_info_truncated) {
+		return ib_fail(error, "InterBase returned a truncated affected-row count");
+	}
+	if ((unsigned char) response[0] != isc_info_sql_records) {
+		return ib_fail(error, "InterBase did not return affected-row information");
+	}
+	response_length = isc_vax_integer(response + 1, 2);
+	if (response_length < 1 || response_length > (ISC_LONG) sizeof(response) - 3) {
+		return ib_fail(error, "InterBase returned an invalid affected-row response");
+	}
+	offset = 3U;
+	end = offset + (size_t) response_length;
+	while (offset < end) {
+		unsigned char item;
+		ISC_LONG item_length;
+		ISC_LONG count;
+
+		item = (unsigned char) response[offset++];
+		if (item == isc_info_end) {
+			break;
+		}
+		if (end - offset < 2U) {
+			return ib_fail(error, "InterBase returned a malformed affected-row response");
+		}
+		item_length = isc_vax_integer(response + offset, 2);
+		offset += 2U;
+		if (item_length < 0 || (size_t) item_length > end - offset ||
+			item_length > (ISC_LONG) sizeof(ISC_LONG)) {
+			return ib_fail(error, "InterBase returned an invalid affected-row item");
+		}
+		if ((int) item == requested_type) {
+			count = isc_vax_integer(response + offset, (short) item_length);
+			if (count < 0) {
+				return ib_fail(error, "InterBase returned a negative affected-row count");
+			}
+			*rows_affected = (int64_t) count;
+		}
+		offset += (size_t) item_length;
+	}
+	return 0;
+}
+
+static int ib_set_varying(XSQLVAR *variable, const char *value, size_t length,
+	short connection_charset, short nullable, char **error)
+{
+	int described_type;
+	int preserve_described;
+	short target_charset;
+	short described_length;
+	int result_type;
+	char *converted;
+	size_t converted_length;
+	size_t extra;
+	size_t size;
+
+	described_type = ib_sql_type(variable);
+	described_length = variable->sqllen;
+	preserve_described = (described_length > 0 &&
+		(described_type == SQL_TEXT || described_type == SQL_VARYING));
+	target_charset = preserve_described ? ib_text_charset(variable) : connection_charset;
+	converted = ib_convert_utf8(value, length, target_charset,
+		&converted_length, error);
+	if (converted == NULL) {
+		return -1;
+	}
+	if (described_length < 0 || converted_length > (size_t) SHRT_MAX) {
+		free(converted);
+		return ib_fail(error, "string argument exceeds the described SQLDA length");
+	}
+	if (preserve_described) {
+		extra = described_type == SQL_VARYING ? sizeof(unsigned short) : 0U;
+		if (converted_length > (size_t) described_length) {
+			free(converted);
+			return ib_fail(error, "string argument exceeds the described SQLDA length");
+		}
+		if ((size_t) described_length > IB_MAX_SQLDA_BUFFER - extra) {
+			free(converted);
+			return ib_fail(error, "string argument exceeds the SQLDA storage limit");
+		}
+		size = (size_t) described_length + extra;
+		if (size == 0U) {
+			size = 1U;
+		}
+		variable->sqltype = (short) (described_type | nullable);
+		variable->sqllen = described_length;
+	} else {
+		if (converted_length > IB_MAX_SQLDA_BUFFER) {
+			free(converted);
+			return ib_fail(error, "string argument exceeds the SQLDA storage limit");
+		}
+		result_type = described_type == SQL_VARYING ? SQL_VARYING : SQL_TEXT;
+		extra = result_type == SQL_VARYING ? sizeof(unsigned short) : 0U;
+		if (converted_length > IB_MAX_SQLDA_BUFFER - extra) {
+			free(converted);
+			return ib_fail(error, "string argument exceeds the SQLDA storage limit");
+		}
+		size = converted_length + extra;
+		if (size == 0U) {
+			size = 1U;
+		}
+		variable->sqltype = (short) (result_type | nullable);
+		variable->sqlsubtype = connection_charset;
+		variable->sqllen = (short) converted_length;
+	}
+	if (ib_allocate_variable(variable, size, error) != 0) {
+		free(converted);
+		return -1;
+	}
+	if (preserve_described && described_type == SQL_TEXT) {
+		memset(variable->sqldata, ' ', size);
+	}
+	if (ib_sql_type(variable) == SQL_VARYING) {
+		unsigned short varying_length = (unsigned short) converted_length;
+		memcpy(variable->sqldata, &varying_length, sizeof(varying_length));
+		if (converted_length != 0U) {
+			memcpy(variable->sqldata + sizeof(varying_length), converted,
+				converted_length);
+		}
+	} else if (converted_length != 0U) {
+		memcpy(variable->sqldata, converted, converted_length);
+	}
+	if (!nullable) {
+		free(variable->sqlind);
+		variable->sqlind = NULL;
+	}
+	free(converted);
+	return 0;
+}
+
+static int ib_blob_cleanup(isc_blob_handle *blob, int cancel, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	char *first_error;
+	int failed;
+
+	/* A native cleanup failure is actionable even when its message cannot be allocated. */
+	if (blob == NULL || *blob == NULL) {
+		return 0;
+	}
+	first_error = NULL;
+	failed = 0;
+	memset(status, 0, sizeof(status));
+	if (cancel) {
+		result = isc_cancel_blob(status, blob);
+		if (result != 0) {
+			failed = 1;
+			(void) ib_fail_status(&first_error, "cancel blob", status);
+			memset(status, 0, sizeof(status));
+			result = isc_close_blob(status, blob);
+			if (result != 0) {
+				char *close_error = NULL;
+
+				failed = 1;
+				(void) ib_fail_status(&close_error, "close blob", status);
+				ib_append_error(&first_error, close_error);
+			}
+		}
+	} else {
+		result = isc_close_blob(status, blob);
+		if (result != 0) {
+			failed = 1;
+			(void) ib_fail_status(&first_error, "close blob", status);
+		}
+	}
+	*blob = NULL;
+	ib_give_error(error, first_error);
+	return failed != 0 ? -1 : 0;
+}
+
+static void ib_blob_descriptor(ISC_BLOB_DESC_V2 *descriptor, short subtype,
+	short charset)
+{
+	memset(descriptor, 0, sizeof(*descriptor));
+	descriptor->blob_desc_version = BLB_DESC_VERSION2;
+	descriptor->blob_desc_subtype = subtype;
+	descriptor->blob_desc_charset = charset;
+	descriptor->blob_desc_segment_size = (short) IB_BLOB_SEGMENT_LENGTH;
+}
+
+static int ib_blob_generate_bpb(short source_charset, short target_charset,
+	unsigned char *bpb, unsigned short *bpb_length, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_BLOB_DESC_V2 source;
+	ISC_BLOB_DESC_V2 target;
+	ISC_STATUS result;
+
+	if (bpb == NULL || bpb_length == NULL) {
+		return ib_fail(error, "BLOB parameter block storage is unavailable");
+	}
+	ib_blob_descriptor(&source, 1, source_charset);
+	ib_blob_descriptor(&target, 1, target_charset);
+	memset(status, 0, sizeof(status));
+	/* isc_blob_gen_bpb2 takes the target descriptor before the source. */
+	result = isc_blob_gen_bpb2(status, &target, &source, IB_BLOB_BPB_LENGTH, bpb,
+		bpb_length);
+	if (result != 0) {
+		return ib_fail_status(error, "generate BLOB parameter block", status);
+	}
+	return 0;
+}
+
+static int ib_blob_lookup_descriptor(ib_cursor *cursor,
+	const XSQLVAR *variable, ISC_BLOB_DESC_V2 *descriptor, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	unsigned char field_name[METADATALENGTH + 1U];
+	unsigned char relation_name[METADATALENGTH + 1U];
+
+	if (cursor == NULL || cursor->connection == NULL ||
+		cursor->connection->database == NULL || cursor->transaction == NULL ||
+		variable == NULL || descriptor == NULL || variable->sqlname_length <= 0 ||
+		variable->relname_length <= 0) {
+		return ib_fail(error, "BLOB column metadata is unavailable");
+	}
+	if ((size_t) variable->sqlname_length > METADATALENGTH ||
+		(size_t) variable->relname_length > METADATALENGTH) {
+		return ib_fail(error, "BLOB column metadata is too long");
+	}
+	memset(field_name, 0, sizeof(field_name));
+	memset(relation_name, 0, sizeof(relation_name));
+	memcpy(field_name, variable->sqlname, (size_t) variable->sqlname_length);
+	memcpy(relation_name, variable->relname,
+		(size_t) variable->relname_length);
+	ib_blob_descriptor(descriptor, 1, 0);
+	memset(status, 0, sizeof(status));
+	result = isc_blob_lookup_desc2(status, &cursor->connection->database,
+		&cursor->transaction, relation_name, field_name, descriptor, NULL);
+	if (result != 0) {
+		return ib_fail_status(error, "lookup BLOB column descriptor", status);
+	}
+	return 0;
+}
+
+static int ib_set_blob(ib_cursor *cursor, XSQLVAR *variable,
+	const char *value, size_t length, short connection_charset, int text,
+	short nullable, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	isc_blob_handle blob;
+	ISC_QUAD blob_id;
+	char *converted;
+	char *first_error;
+	const char *data;
+	size_t data_length;
+	size_t offset;
+	unsigned char bpb[IB_BLOB_BPB_LENGTH];
+	unsigned short bpb_length;
+	int cleanup_failed;
+
+	if (cursor == NULL || cursor->connection == NULL ||
+		cursor->connection->database == NULL || cursor->transaction == NULL) {
+		return ib_fail(error, "BLOB parameter transaction is unavailable");
+	}
+	bpb_length = 0U;
+	converted = NULL;
+	data = value;
+	data_length = length;
+	if (text && connection_charset != 0 && connection_charset != 1 &&
+		connection_charset != IB_CHARSET_UTF8) {
+		converted = ib_convert_utf8(value, length, connection_charset,
+			&data_length, error);
+		if (converted == NULL) {
+			return -1;
+		}
+		data = converted;
+	}
+	variable->sqltype = (short) (SQL_BLOB | nullable);
+	variable->sqllen = (short) sizeof(ISC_QUAD);
+	if (ib_allocate_variable(variable, sizeof(ISC_QUAD), error) != 0) {
+		free(converted);
+		return -1;
+	}
+	blob = NULL;
+	memset(&blob_id, 0, sizeof(blob_id));
+	memset(status, 0, sizeof(status));
+	if (text && connection_charset != 0 && connection_charset != 1) {
+		if (ib_blob_generate_bpb(connection_charset, connection_charset, bpb,
+			&bpb_length, error) != 0) {
+			free(variable->sqldata);
+			free(variable->sqlind);
+			variable->sqldata = NULL;
+			variable->sqlind = NULL;
+			free(converted);
+			return -1;
+		}
+		result = isc_create_blob2(status, &cursor->connection->database,
+			&cursor->transaction, &blob, &blob_id, (short) bpb_length,
+			(char *) bpb);
+	} else {
+		result = isc_create_blob(status, &cursor->connection->database,
+			&cursor->transaction, &blob, &blob_id);
+	}
+	if (result != 0) {
+		first_error = NULL;
+		(void) ib_fail_status(&first_error, "create input BLOB", status);
+		{
+			char *cleanup_error = NULL;
+
+			cleanup_failed = ib_blob_cleanup(&blob, 1, &cleanup_error);
+			if (cleanup_failed != 0) {
+				cursor->connection->broken = 1;
+			}
+			ib_append_error(&first_error, cleanup_error);
+		}
+		free(variable->sqldata);
+		free(variable->sqlind);
+		variable->sqldata = NULL;
+		variable->sqlind = NULL;
+		free(converted);
+		ib_give_error(error, first_error);
+		return -1;
+	}
+	offset = 0U;
+	while (offset < data_length) {
+		size_t remaining = data_length - offset;
+		size_t segment_size = remaining > IB_BLOB_SEGMENT_LENGTH
+			? IB_BLOB_SEGMENT_LENGTH : remaining;
+		unsigned short segment_length = (unsigned short) segment_size;
+		memset(status, 0, sizeof(status));
+		result = isc_put_segment(status, &blob, segment_length,
+			(char *) data + offset);
+		if (result != 0) {
+			first_error = NULL;
+			(void) ib_fail_status(&first_error, "write input BLOB segment", status);
+			{
+				char *cleanup_error = NULL;
+				cleanup_failed = ib_blob_cleanup(&blob, 1, &cleanup_error);
+				if (cleanup_failed != 0) {
+					cursor->connection->broken = 1;
+				}
+				ib_append_error(&first_error, cleanup_error);
+			}
+			free(variable->sqldata);
+			free(variable->sqlind);
+			variable->sqldata = NULL;
+			variable->sqlind = NULL;
+			free(converted);
+			ib_give_error(error, first_error);
+			return -1;
+		}
+		offset += segment_size;
+	}
+	first_error = NULL;
+	cleanup_failed = ib_blob_cleanup(&blob, 0, &first_error);
+	if (cleanup_failed != 0) {
+		cursor->connection->broken = 1;
+	}
+	if (cleanup_failed != 0 || first_error != NULL) {
+		free(variable->sqldata);
+		free(variable->sqlind);
+		variable->sqldata = NULL;
+		variable->sqlind = NULL;
+		free(converted);
+		ib_give_error(error, first_error);
+		return -1;
+	}
+	memcpy(variable->sqldata, &blob_id, sizeof(blob_id));
+	free(converted);
 	return 0;
 }
 
@@ -446,10 +1216,15 @@ static int ib_bind_input(ib_cursor *cursor, const ib_bindings *bindings,
 	char **error)
 {
 	short index;
+	short connection_charset;
 
 	if (bindings == NULL || cursor->input == NULL ||
 		(bindings->count != 0U && bindings->values == NULL)) {
 		return ib_fail(error, "missing input SQLDA");
+	}
+	connection_charset = IB_CHARSET_UTF8;
+	if (cursor->connection != NULL && cursor->connection->charset != 0) {
+		connection_charset = cursor->connection->charset;
 	}
 	if ((size_t) cursor->input->sqld != bindings->count) {
 		return ib_fail(error, "query argument count does not match positional parameters");
@@ -457,13 +1232,13 @@ static int ib_bind_input(ib_cursor *cursor, const ib_bindings *bindings,
 	for (index = 0; index < cursor->input->sqld; index++) {
 		XSQLVAR *variable = &cursor->input->sqlvar[index];
 		const ib_bind_value *value = &bindings->values[index];
-		short nullable = 1;
+		short nullable;
 		size_t size;
 		int described_type = ib_sql_type(variable);
+		nullable = (short) (variable->sqltype & 1);
 
-		if (described_type == SQL_BLOB || described_type == SQL_ARRAY ||
-			described_type == SQL_QUAD) {
-			return ib_fail(error, "array, blob, and quad parameters are unsupported");
+		if (described_type == SQL_ARRAY || described_type == SQL_QUAD) {
+			return ib_fail(error, "array and quad parameters are unsupported");
 		}
 
 		free(variable->sqldata);
@@ -479,10 +1254,30 @@ static int ib_bind_input(ib_cursor *cursor, const ib_bindings *bindings,
 			*variable->sqlind = -1;
 			continue;
 		}
+		if (described_type == SQL_BLOB) {
+			switch (value->kind) {
+			case IB_ARGUMENT_STRING:
+				if (ib_set_blob(cursor, variable, value->bytes, value->length,
+					connection_charset, variable->sqlsubtype == 1, nullable, error) != 0) {
+					return -1;
+				}
+				break;
+			case IB_ARGUMENT_BYTES:
+				if (ib_set_blob(cursor, variable, value->bytes, value->length,
+					connection_charset, 0, nullable, error) != 0) {
+					return -1;
+				}
+				break;
+			default:
+				return ib_fail(error, "only string and byte values can bind to a BLOB");
+			}
+			continue;
+		}
 
 		switch (value->kind) {
 		case IB_ARGUMENT_STRING:
-			if (ib_set_varying(variable, value->bytes, value->length, nullable, error) != 0) {
+			if (ib_set_varying(variable, value->bytes, value->length,
+				connection_charset, nullable, error) != 0) {
 				return -1;
 			}
 			break;
@@ -522,6 +1317,32 @@ static int ib_bind_input(ib_cursor *cursor, const ib_bindings *bindings,
 			memcpy(variable->sqldata, &boolean_value, sizeof(boolean_value));
 			break;
 		}
+		case IB_ARGUMENT_TIMESTAMP:
+		{
+			ISC_TIMESTAMP timestamp;
+			struct tm encoded;
+
+			memset(&encoded, 0, sizeof(encoded));
+			encoded.tm_year = value->year - 1900;
+			encoded.tm_mon = value->month - 1;
+			encoded.tm_mday = value->day;
+			encoded.tm_hour = value->hour;
+			encoded.tm_min = value->minute;
+			encoded.tm_sec = value->second;
+			isc_encode_timestamp(&encoded, &timestamp);
+			timestamp.timestamp_time +=
+				(ISC_TIME) (value->nanosecond / 100000);
+			variable->sqltype = (short) (SQL_TIMESTAMP | nullable);
+			variable->sqlscale = 0;
+			variable->sqlsubtype = 0;
+			variable->sqlprecision = 0;
+			variable->sqllen = (short) sizeof(timestamp);
+			if (ib_allocate_variable(variable, sizeof(timestamp), error) != 0) {
+				return -1;
+			}
+			memcpy(variable->sqldata, &timestamp, sizeof(timestamp));
+			break;
+		}
 		default:
 			return ib_fail(error, "the query argument kind is unsupported");
 		}
@@ -549,12 +1370,11 @@ static int ib_validate_output_types(const XSQLDA *sqlda, char **error)
 		case SQL_TYPE_DATE:
 		case SQL_TYPE_TIME:
 		case SQL_BOOLEAN:
+		case SQL_BLOB:
 			break;
 		case SQL_FLOAT:
 		case SQL_DOUBLE:
-			if (sqlda->sqlvar[index].sqlscale != 0) {
-				return ib_fail(error, "scaled floating-point results are unsupported");
-			}
+		case SQL_D_FLOAT:
 			break;
 		default:
 			return ib_fail(error, "the result contains a type unsupported by the proof of concept");
@@ -575,6 +1395,13 @@ static int ib_allocate_output(ib_cursor *cursor, char **error)
 			ib_allocate_variable(&cursor->output->sqlvar[index], size, error) != 0) {
 			return -1;
 		}
+		if ((cursor->output->sqlvar[index].sqltype & 1) == 0) {
+			free(cursor->output->sqlvar[index].sqlind);
+			cursor->output->sqlvar[index].sqlind = NULL;
+		}
+		if (ib_sql_type(&cursor->output->sqlvar[index]) == SQL_TEXT) {
+			memset(cursor->output->sqlvar[index].sqldata, ' ', size);
+		}
 	}
 	return 0;
 }
@@ -584,6 +1411,10 @@ static void ib_cursor_free_parts(ib_cursor *cursor)
 	if (cursor == NULL) {
 		return;
 	}
+	free(cursor->converted_value);
+	cursor->converted_value = NULL;
+	free(cursor->materialized_value);
+	cursor->materialized_value = NULL;
 	ib_free_sqlda(cursor->input);
 	ib_free_sqlda(cursor->output);
 	cursor->input = NULL;
@@ -602,16 +1433,20 @@ static int ib_cursor_close_internal(ib_cursor *cursor, char **error)
 	}
 	first_error = NULL;
 	failed = 0;
-	if (cursor->statement != NULL) {
+	if (cursor->statement != NULL &&
+		(cursor->prepared == NULL || cursor->server_cursor_open)) {
 		memset(status, 0, sizeof(status));
-		result = isc_dsql_free_statement(status, &cursor->statement, DSQL_drop);
-		cursor->statement = NULL;
+		result = isc_dsql_free_statement(status, &cursor->statement,
+			cursor->server_cursor_open ? DSQL_close : DSQL_drop);
 		if (result != 0) {
 			failed = 1;
-			(void) ib_fail_status(&first_error, "close statement", status);
+			(void) ib_fail_status(&first_error,
+				cursor->server_cursor_open ? "close cursor" : "close statement", status);
 		}
 	}
-	if (cursor->transaction != NULL) {
+	cursor->statement = NULL;
+	cursor->server_cursor_open = 0;
+	if (cursor->owns_transaction && cursor->transaction != NULL) {
 		memset(status, 0, sizeof(status));
 		result = isc_rollback_transaction(status, &cursor->transaction);
 		cursor->transaction = NULL;
@@ -622,6 +1457,8 @@ static int ib_cursor_close_internal(ib_cursor *cursor, char **error)
 			}
 		}
 	}
+	cursor->transaction = NULL;
+	cursor->owns_transaction = 0;
 	if (cursor->connection != NULL && cursor->connection->active_cursor == cursor) {
 		cursor->connection->active_cursor = NULL;
 	}
@@ -666,9 +1503,76 @@ static void ib_failed_query_cleanup(ib_cursor *cursor, char **error)
 	}
 }
 
+static void ib_statement_unregister(ib_statement *statement)
+{
+	ib_statement **current;
+
+	if (statement == NULL || statement->connection == NULL) {
+		return;
+	}
+	current = &statement->connection->statements;
+	while (*current != NULL) {
+		if (*current == statement) {
+			*current = statement->next;
+			statement->next = NULL;
+			return;
+		}
+		current = &(*current)->next;
+	}
+}
+
+static int ib_statement_close_internal(ib_statement *statement, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	char *first_error;
+	char *cursor_error;
+	ib_connection *connection;
+	int failed;
+
+	if (statement == NULL) {
+		return 0;
+	}
+	connection = statement->connection;
+	first_error = NULL;
+	failed = 0;
+	if (connection != NULL && connection->active_cursor != NULL &&
+		connection->active_cursor->prepared == statement) {
+		cursor_error = NULL;
+		if (ib_cursor_close_internal(connection->active_cursor, &cursor_error) != 0) {
+			failed = 1;
+		}
+		ib_append_error(&first_error, cursor_error);
+	}
+	if (statement->statement != NULL) {
+		memset(status, 0, sizeof(status));
+		result = isc_dsql_free_statement(status, &statement->statement, DSQL_drop);
+		statement->statement = NULL;
+		if (result != 0) {
+			failed = 1;
+			cursor_error = NULL;
+			(void) ib_fail_status(&cursor_error, "close prepared statement", status);
+			ib_append_error(&first_error, cursor_error);
+		}
+	}
+	ib_free_sqlda(statement->input);
+	ib_free_sqlda(statement->output);
+	statement->input = NULL;
+	statement->output = NULL;
+	ib_statement_unregister(statement);
+	statement->connection = NULL;
+	free(statement);
+	if (failed && connection != NULL) {
+		connection->broken = 1;
+	}
+	ib_give_error(error, first_error);
+	return failed ? -1 : 0;
+}
+
 ib_connection *ib_connection_open(const char *database, size_t database_length,
 	const char *user, size_t user_length, const char *password,
-	size_t password_length, char **error)
+	size_t password_length, const char *charset, size_t charset_length,
+	char **error)
 {
 	unsigned char *dpb;
 	size_t dpb_length;
@@ -677,7 +1581,9 @@ ib_connection *ib_connection_open(const char *database, size_t database_length,
 	isc_db_handle database_handle;
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
-	const char charset[] = "UTF8";
+	short charset_id;
+	const char *charset_name;
+	size_t charset_name_length;
 	unsigned char length;
 
 	if (database == NULL || database_length == 0U || database_length > (size_t) SHRT_MAX) {
@@ -689,8 +1595,18 @@ ib_connection *ib_connection_open(const char *database, size_t database_length,
 		ib_fail(error, "connection credential length is invalid");
 		return NULL;
 	}
+	if (ib_charset_id(charset, charset_length, &charset_id) != 0) {
+		ib_fail(error, "connection character set is unsupported");
+		return NULL;
+	}
+	charset_name = ib_charset_name(charset_id);
+	if (charset_name == NULL) {
+		ib_fail(error, "connection character set is unsupported");
+		return NULL;
+	}
+	charset_name_length = strlen(charset_name);
 	dpb_length = 1U + 2U + user_length + 2U + password_length +
-		2U + sizeof(charset) - 1U + 2U + 1U;
+		2U + charset_name_length + 2U + 1U;
 	if (dpb_length > (size_t) SHRT_MAX) {
 		ib_fail(error, "connection parameter block is too long");
 		return NULL;
@@ -714,13 +1630,13 @@ ib_connection *ib_connection_open(const char *database, size_t database_length,
 		memcpy(dpb + offset, password, password_length);
 		offset += password_length;
 	}
-	dpb[offset++] = isc_dpb_lc_ctype;
-	dpb[offset++] = (unsigned char) (sizeof(charset) - 1U);
-	memcpy(dpb + offset, charset, sizeof(charset) - 1U);
-	offset += sizeof(charset) - 1U;
 	dpb[offset++] = isc_dpb_sql_dialect;
 	dpb[offset++] = 1U;
 	dpb[offset++] = SQL_DIALECT_V5;
+	dpb[offset++] = isc_dpb_lc_ctype;
+	dpb[offset++] = (unsigned char) charset_name_length;
+	memcpy(dpb + offset, charset_name, charset_name_length);
+	offset += charset_name_length;
 
 	connection = (ib_connection *) calloc(1U, sizeof(*connection));
 	if (connection == NULL) {
@@ -744,6 +1660,7 @@ ib_connection *ib_connection_open(const char *database, size_t database_length,
 		return NULL;
 	}
 	connection->database = database_handle;
+	connection->charset = charset_id;
 	return connection;
 }
 
@@ -765,8 +1682,24 @@ int ib_connection_close(ib_connection *connection, char **error)
 		if (ib_cursor_close_internal(connection->active_cursor, &cursor_error) != 0) {
 			failed = 1;
 		}
-		if (cursor_error != NULL) {
-			first_error = cursor_error;
+		ib_append_error(&first_error, cursor_error);
+	}
+	while (connection->statements != NULL) {
+		cursor_error = NULL;
+		if (ib_statement_close_internal(connection->statements, &cursor_error) != 0) {
+			failed = 1;
+		}
+		ib_append_error(&first_error, cursor_error);
+	}
+	if (connection->transaction != NULL) {
+		memset(status, 0, sizeof(status));
+		result = isc_rollback_transaction(status, &connection->transaction);
+		connection->transaction = NULL;
+		if (result != 0) {
+			failed = 1;
+			cursor_error = NULL;
+			(void) ib_fail_status(&cursor_error, "rollback transaction", status);
+			ib_append_error(&first_error, cursor_error);
 		}
 	}
 	if (connection->database != NULL) {
@@ -788,6 +1721,97 @@ int ib_connection_close(ib_connection *connection, char **error)
 int ib_connection_is_broken(const ib_connection *connection)
 {
 	return connection == NULL || connection->broken;
+}
+
+int ib_connection_begin(ib_connection *connection, int read_only, char **error)
+{
+	if (connection == NULL || connection->database == NULL || connection->broken) {
+		return ib_fail(error, "connection is unavailable");
+	}
+	if (connection->transaction != NULL) {
+		return ib_fail(error, "a transaction is already active");
+	}
+	if (connection->active_cursor != NULL) {
+		return ib_fail(error, "another result cursor is active on this connection");
+	}
+	return ib_start_transaction(connection, &connection->transaction,
+		read_only != 0, "start transaction", error);
+}
+
+int ib_connection_commit(ib_connection *connection, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	char *first_error;
+	char *cursor_error;
+
+	if (connection == NULL || connection->database == NULL || connection->broken) {
+		return ib_fail(error, "connection is unavailable");
+	}
+	if (connection->transaction == NULL) {
+		return ib_fail(error, "no active transaction");
+	}
+	first_error = NULL;
+	if (connection->active_cursor != NULL) {
+		cursor_error = NULL;
+		if (ib_cursor_close_internal(connection->active_cursor, &cursor_error) != 0) {
+			ib_append_error(&first_error, cursor_error);
+			ib_give_error(error, first_error);
+			return -1;
+		}
+		ib_append_error(&first_error, cursor_error);
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_commit_transaction(status, &connection->transaction);
+	if (result != 0) {
+		connection->broken = 1;
+		(void) ib_fail_status(&first_error, "commit transaction", status);
+		ib_give_error(error, first_error);
+		return -1;
+	}
+	connection->transaction = NULL;
+	ib_give_error(error, first_error);
+	return 0;
+}
+
+int ib_connection_rollback(ib_connection *connection, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	char *first_error;
+	char *cursor_error;
+	int failed;
+
+	if (connection == NULL || connection->database == NULL || connection->broken) {
+		return ib_fail(error, "connection is unavailable");
+	}
+	if (connection->transaction == NULL) {
+		return ib_fail(error, "no active transaction");
+	}
+	first_error = NULL;
+	failed = 0;
+	if (connection->active_cursor != NULL) {
+		cursor_error = NULL;
+		if (ib_cursor_close_internal(connection->active_cursor, &cursor_error) != 0) {
+			failed = 1;
+		}
+		ib_append_error(&first_error, cursor_error);
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_rollback_transaction(status, &connection->transaction);
+	connection->transaction = NULL;
+	if (result != 0) {
+		failed = 1;
+		connection->broken = 1;
+		cursor_error = NULL;
+		(void) ib_fail_status(&cursor_error, "rollback transaction", status);
+		ib_append_error(&first_error, cursor_error);
+	}
+	if (failed) {
+		ib_give_error(error, first_error);
+		return -1;
+	}
+	return 0;
 }
 
 ib_bindings *ib_bindings_new(size_t count, char **error)
@@ -876,6 +1900,29 @@ int ib_bindings_set_string(ib_bindings *bindings, size_t index,
 	return 0;
 }
 
+int ib_bindings_set_bytes(ib_bindings *bindings, size_t index,
+	const char *value, size_t length, char **error)
+{
+	char *copy;
+
+	if (ib_binding_index(bindings, index, error) != 0) {
+		return -1;
+	}
+	if (length != 0U && value == NULL) {
+		return ib_fail(error, "byte query argument is missing data");
+	}
+	copy = ib_copy_string(value, length);
+	if (copy == NULL) {
+		return ib_fail(error, "out of memory copying byte query argument");
+	}
+	free(bindings->values[index].bytes);
+	memset(&bindings->values[index], 0, sizeof(bindings->values[index]));
+	bindings->values[index].kind = IB_ARGUMENT_BYTES;
+	bindings->values[index].bytes = copy;
+	bindings->values[index].length = length;
+	return 0;
+}
+
 int ib_bindings_set_int64(ib_bindings *bindings, size_t index,
 	int64_t value, char **error)
 {
@@ -915,19 +1962,34 @@ int ib_bindings_set_bool(ib_bindings *bindings, size_t index, int value,
 	return 0;
 }
 
+int ib_bindings_set_timestamp(ib_bindings *bindings, size_t index,
+	int year, int month, int day, int hour, int minute, int second,
+	int nanosecond, char **error)
+{
+	if (ib_binding_index(bindings, index, error) != 0) {
+		return -1;
+	}
+	free(bindings->values[index].bytes);
+	memset(&bindings->values[index], 0, sizeof(bindings->values[index]));
+	bindings->values[index].kind = IB_ARGUMENT_TIMESTAMP;
+	bindings->values[index].year = year;
+	bindings->values[index].month = month;
+	bindings->values[index].day = day;
+	bindings->values[index].hour = hour;
+	bindings->values[index].minute = minute;
+	bindings->values[index].second = second;
+	bindings->values[index].nanosecond = nanosecond;
+	return 0;
+}
+
 ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	size_t query_length, const ib_bindings *bindings, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
 	ib_cursor *cursor;
-	const char tpb[] = {
-		isc_tpb_version3,
-		isc_tpb_read_committed,
-		isc_tpb_rec_version,
-		isc_tpb_wait,
-		isc_tpb_read
-	};
+	char *prepared_query;
+	size_t prepared_query_length;
 
 	if (connection == NULL || connection->database == NULL || connection->broken) {
 		ib_fail(error, "connection is unavailable");
@@ -945,35 +2007,51 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		ib_fail(error, "another result cursor is active on this connection");
 		return NULL;
 	}
+	prepared_query = ib_convert_utf8(query, query_length, connection->charset,
+		&prepared_query_length, error);
+	if (prepared_query == NULL) {
+		return NULL;
+	}
+	if (prepared_query_length > (size_t) USHRT_MAX) {
+		free(prepared_query);
+		ib_fail(error, "converted query is too long");
+		return NULL;
+	}
 
 	cursor = (ib_cursor *) calloc(1U, sizeof(*cursor));
 	if (cursor == NULL) {
+		free(prepared_query);
 		ib_fail(error, "out of memory allocating cursor state");
 		return NULL;
 	}
 	cursor->connection = connection;
-	memset(status, 0, sizeof(status));
-	result = isc_start_transaction(status, &cursor->transaction, 1,
-		&connection->database, (short) sizeof(tpb), (char *) tpb);
-	if (result != 0) {
-		/* There may be no handle to clean up, so cleanup cannot detect a dead
-		 * attachment. Conservatively retire it on every startup failure. */
-		connection->broken = 1;
-		ib_fail_status(error, "start read-only transaction", status);
+	if (connection->transaction != NULL) {
+		cursor->transaction = connection->transaction;
+		cursor->owns_transaction = 0;
+	} else if (ib_start_transaction(connection, &cursor->transaction, 1,
+		"start read transaction", error) != 0) {
+		free(prepared_query);
+		prepared_query = NULL;
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
+	} else {
+		cursor->owns_transaction = 1;
 	}
 	memset(status, 0, sizeof(status));
 	result = isc_dsql_allocate_statement(status, &connection->database,
 		&cursor->statement);
 	if (result != 0) {
+		free(prepared_query);
+		prepared_query = NULL;
 		ib_fail_status(error, "allocate statement", status);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
 	}
 	memset(status, 0, sizeof(status));
 	result = isc_dsql_prepare(status, &cursor->transaction, &cursor->statement,
-		(unsigned short) query_length, (char *) query, SQL_DIALECT_V5, NULL);
+		(unsigned short) prepared_query_length, prepared_query, SQL_DIALECT_V5, NULL);
+	free(prepared_query);
+	prepared_query = NULL;
 	if (result != 0) {
 		ib_fail_status(error, "prepare statement", status);
 		ib_failed_query_cleanup(cursor, error);
@@ -994,8 +2072,8 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	memset(status, 0, sizeof(status));
 	{
 		XSQLDA *input = cursor->input->sqld == 0 ? NULL : cursor->input;
-		result = isc_dsql_execute(status, &cursor->transaction, &cursor->statement,
-			SQL_DIALECT_V5, input);
+		result = isc_dsql_execute2(status, &cursor->transaction, &cursor->statement,
+			SQL_DIALECT_V5, input, NULL);
 	}
 	if (result != 0) {
 		ib_fail_status(error, "execute SELECT", status);
@@ -1004,6 +2082,504 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	}
 	connection->active_cursor = cursor;
 	return cursor;
+}
+
+int ib_connection_exec(ib_connection *connection, const char *query,
+	size_t query_length, const ib_bindings *bindings, int64_t *rows_affected,
+	char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	ib_cursor *cursor;
+	char *prepared_query;
+	char *cleanup_error;
+	char *rollback_error;
+	char *commit_error;
+	isc_tr_handle implicit_transaction;
+	size_t prepared_query_length;
+	int close_result;
+	int implicit;
+
+	if (rows_affected == NULL) {
+		return ib_fail(error, "affected-row destination is unavailable");
+	}
+	*rows_affected = -1;
+	if (connection == NULL || connection->database == NULL || connection->broken) {
+		return ib_fail(error, "connection is unavailable");
+	}
+	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
+		return ib_fail(error, "query is empty or too long");
+	}
+	if (bindings == NULL || bindings->count > (size_t) SHRT_MAX) {
+		return ib_fail(error, "query arguments are invalid");
+	}
+	if (connection->active_cursor != NULL) {
+		return ib_fail(error, "another result cursor is active on this connection");
+	}
+	prepared_query = ib_convert_utf8(query, query_length, connection->charset,
+		&prepared_query_length, error);
+	if (prepared_query == NULL) {
+		return -1;
+	}
+	if (prepared_query_length > (size_t) USHRT_MAX) {
+		free(prepared_query);
+		return ib_fail(error, "converted query is too long");
+	}
+
+	cursor = (ib_cursor *) calloc(1U, sizeof(*cursor));
+	if (cursor == NULL) {
+		free(prepared_query);
+		return ib_fail(error, "out of memory allocating cursor state");
+	}
+	cursor->connection = connection;
+	implicit = 0;
+	if (connection->transaction != NULL) {
+		cursor->transaction = connection->transaction;
+		cursor->owns_transaction = 0;
+	} else {
+		if (ib_start_transaction(connection, &cursor->transaction, 0,
+			"start write transaction", error) != 0) {
+			free(prepared_query);
+			prepared_query = NULL;
+			ib_failed_query_cleanup(cursor, error);
+			return -1;
+		}
+		cursor->owns_transaction = 1;
+		implicit = 1;
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_dsql_allocate_statement(status, &connection->database,
+		&cursor->statement);
+	if (result != 0) {
+		free(prepared_query);
+		prepared_query = NULL;
+		ib_fail_status(error, "allocate statement", status);
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_dsql_prepare(status, &cursor->transaction, &cursor->statement,
+		(unsigned short) prepared_query_length, prepared_query, SQL_DIALECT_V5, NULL);
+	free(prepared_query);
+	prepared_query = NULL;
+	if (result != 0) {
+		ib_fail_status(error, "prepare statement", status);
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	if (ib_statement_rejects_result(cursor, error) != 0 ||
+		ib_describe_bind(cursor, error) != 0 ||
+		ib_bind_input(cursor, bindings, error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	memset(status, 0, sizeof(status));
+	{
+		XSQLDA *input = cursor->input->sqld == 0 ? NULL : cursor->input;
+		result = isc_dsql_execute(status, &cursor->transaction, &cursor->statement,
+			SQL_DIALECT_V5, input);
+	}
+	if (result != 0) {
+		ib_fail_status(error, "execute statement", status);
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	if (ib_statement_rows_affected(cursor, rows_affected, error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+
+	implicit_transaction = NULL;
+	if (implicit) {
+		implicit_transaction = cursor->transaction;
+		cursor->owns_transaction = 0;
+	}
+	cleanup_error = NULL;
+	close_result = ib_cursor_close_internal(cursor, &cleanup_error);
+	cursor = NULL;
+	if (close_result != 0) {
+		if (implicit_transaction != NULL) {
+			ISC_STATUS rollback_status[IB_STATUS_VECTOR_LENGTH];
+
+			rollback_error = NULL;
+			memset(rollback_status, 0, sizeof(rollback_status));
+			if (isc_rollback_transaction(rollback_status, &implicit_transaction) != 0) {
+				(void) ib_fail_status(&rollback_error, "rollback failed write", rollback_status);
+			}
+			ib_append_error(&cleanup_error, rollback_error);
+		}
+		ib_give_error(error, cleanup_error);
+		return -1;
+	}
+	if (implicit_transaction == NULL) {
+		ib_give_error(error, cleanup_error);
+		return 0;
+	}
+
+	memset(status, 0, sizeof(status));
+	result = isc_commit_transaction(status, &implicit_transaction);
+	if (result != 0) {
+		connection->broken = 1;
+		commit_error = NULL;
+		(void) ib_fail_status(&commit_error, "commit write transaction", status);
+		if (implicit_transaction != NULL) {
+			ISC_STATUS rollback_status[IB_STATUS_VECTOR_LENGTH];
+
+			rollback_error = NULL;
+			memset(rollback_status, 0, sizeof(rollback_status));
+			if (isc_rollback_transaction(rollback_status, &implicit_transaction) != 0) {
+				(void) ib_fail_status(&rollback_error, "rollback failed write", rollback_status);
+			}
+			ib_append_error(&commit_error, rollback_error);
+		}
+		ib_append_error(&commit_error, cleanup_error);
+		ib_give_error(error, commit_error);
+		return -1;
+	}
+	ib_give_error(error, cleanup_error);
+	return 0;
+}
+
+ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
+	size_t query_length, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	ib_statement *statement;
+	ib_cursor descriptor;
+	char *prepared_query;
+	char *failure_error;
+	char *cleanup_error;
+	char *rollback_error;
+	isc_tr_handle prepare_transaction;
+	size_t prepared_query_length;
+	int owns_transaction;
+	int statement_type;
+
+	if (connection == NULL || connection->database == NULL || connection->broken) {
+		ib_fail(error, "connection is unavailable");
+		return NULL;
+	}
+	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
+		ib_fail(error, "query is empty or too long");
+		return NULL;
+	}
+	if (connection->active_cursor != NULL) {
+		ib_fail(error, "another result cursor is active on this connection");
+		return NULL;
+	}
+	prepared_query = ib_convert_utf8(query, query_length, connection->charset,
+		&prepared_query_length, error);
+	if (prepared_query == NULL) {
+		return NULL;
+	}
+	if (prepared_query_length > (size_t) USHRT_MAX) {
+		free(prepared_query);
+		ib_fail(error, "converted query is too long");
+		return NULL;
+	}
+	statement = (ib_statement *) calloc(1U, sizeof(*statement));
+	if (statement == NULL) {
+		free(prepared_query);
+		ib_fail(error, "out of memory allocating prepared statement");
+		return NULL;
+	}
+	statement->connection = connection;
+	prepare_transaction = NULL;
+	owns_transaction = 0;
+	failure_error = NULL;
+	cleanup_error = NULL;
+	rollback_error = NULL;
+	memset(&descriptor, 0, sizeof(descriptor));
+	if (connection->transaction != NULL) {
+		prepare_transaction = connection->transaction;
+	} else {
+		if (ib_start_transaction(connection, &prepare_transaction, 1,
+			"start prepare transaction", &failure_error) != 0) {
+			goto fail;
+		}
+		owns_transaction = 1;
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_dsql_allocate_statement(status, &connection->database,
+		&statement->statement);
+	if (result != 0) {
+		(void) ib_fail_status(&failure_error, "allocate statement", status);
+		goto fail;
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_dsql_prepare(status, &prepare_transaction, &statement->statement,
+		(unsigned short) prepared_query_length, prepared_query, SQL_DIALECT_V5, NULL);
+	free(prepared_query);
+	prepared_query = NULL;
+	if (result != 0) {
+		(void) ib_fail_status(&failure_error, "prepare statement", status);
+		goto fail;
+	}
+	descriptor.connection = connection;
+	descriptor.transaction = prepare_transaction;
+	descriptor.statement = statement->statement;
+	if (ib_describe_bind(&descriptor, &failure_error) != 0) {
+		goto fail;
+	}
+	statement->input = descriptor.input;
+	descriptor.input = NULL;
+	if (ib_statement_type(&descriptor, &statement_type, &failure_error) != 0) {
+		goto fail;
+	}
+	statement->statement_type = statement_type;
+	if (statement_type == isc_info_sql_stmt_select) {
+		if (ib_describe_output(&descriptor, &failure_error) != 0 ||
+			ib_validate_output_types(descriptor.output, &failure_error) != 0) {
+			goto fail;
+		}
+		statement->output = descriptor.output;
+		descriptor.output = NULL;
+	}
+	if (owns_transaction) {
+		memset(status, 0, sizeof(status));
+		result = isc_commit_transaction(status, &prepare_transaction);
+		if (result != 0) {
+			connection->broken = 1;
+			(void) ib_fail_status(&failure_error, "commit prepare transaction", status);
+			goto fail;
+		}
+	}
+	statement->next = connection->statements;
+	connection->statements = statement;
+	ib_free_sqlda(descriptor.input);
+	ib_free_sqlda(descriptor.output);
+	return statement;
+
+fail:
+	free(prepared_query);
+	ib_free_sqlda(descriptor.input);
+	ib_free_sqlda(descriptor.output);
+	if (statement != NULL) {
+		if (ib_statement_close_internal(statement, &cleanup_error) != 0) {
+			connection->broken = 1;
+		}
+	}
+	if (owns_transaction && prepare_transaction != NULL) {
+		memset(status, 0, sizeof(status));
+		result = isc_rollback_transaction(status, &prepare_transaction);
+		if (result != 0) {
+			connection->broken = 1;
+			(void) ib_fail_status(&rollback_error, "rollback prepare transaction", status);
+		}
+	}
+	ib_append_error(&failure_error, cleanup_error);
+	ib_append_error(&failure_error, rollback_error);
+	ib_give_error(error, failure_error);
+	return NULL;
+}
+
+int ib_statement_num_input(const ib_statement *statement)
+{
+	if (statement == NULL || statement->input == NULL || statement->input->sqld < 0) {
+		return 0;
+	}
+	return (int) statement->input->sqld;
+}
+
+int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
+	int64_t *rows_affected, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	ib_cursor *cursor;
+	char *cleanup_error;
+	char *rollback_error;
+	char *commit_error;
+	isc_tr_handle implicit_transaction;
+	int close_result;
+
+	if (rows_affected == NULL) {
+		return ib_fail(error, "affected-row destination is unavailable");
+	}
+	*rows_affected = -1;
+	if (statement == NULL || statement->connection == NULL ||
+		statement->statement == NULL || statement->connection->database == NULL ||
+		statement->connection->broken) {
+		return ib_fail(error, "prepared statement is unavailable");
+	}
+	if (bindings == NULL || bindings->count > (size_t) SHRT_MAX) {
+		return ib_fail(error, "query arguments are invalid");
+	}
+	if (statement->connection->active_cursor != NULL) {
+		return ib_fail(error, "another result cursor is active on this connection");
+	}
+	if (statement->statement_type == isc_info_sql_stmt_select ||
+		statement->statement_type == isc_info_sql_stmt_select_for_upd ||
+		statement->statement_type == isc_info_sql_stmt_exec_procedure) {
+		return ib_fail(error, "statement produces a result set; use Query instead");
+	}
+	if (ib_statement_rejects_transaction_control_type(statement->statement_type,
+		error) != 0) {
+		return -1;
+	}
+	cursor = (ib_cursor *) calloc(1U, sizeof(*cursor));
+	if (cursor == NULL) {
+		return ib_fail(error, "out of memory allocating prepared execution state");
+	}
+	cursor->connection = statement->connection;
+	cursor->prepared = statement;
+	cursor->statement = statement->statement;
+	cursor->statement_type = statement->statement_type;
+	if (statement->connection->transaction != NULL) {
+		cursor->transaction = statement->connection->transaction;
+		cursor->owns_transaction = 0;
+	} else if (ib_start_transaction(statement->connection, &cursor->transaction, 0,
+		"start write transaction", error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	} else {
+		cursor->owns_transaction = 1;
+	}
+	cursor->input = ib_clone_sqlda(statement->input, error);
+	if (cursor->input == NULL || ib_bind_input(cursor, bindings, error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	memset(status, 0, sizeof(status));
+	{
+		XSQLDA *input = cursor->input->sqld == 0 ? NULL : cursor->input;
+		result = isc_dsql_execute(status, &cursor->transaction, &cursor->statement,
+			SQL_DIALECT_V5, input);
+	}
+	if (result != 0) {
+		(void) ib_fail_status(error, "execute prepared statement", status);
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	if (ib_statement_rows_affected(cursor, rows_affected, error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	implicit_transaction = NULL;
+	if (cursor->owns_transaction) {
+		implicit_transaction = cursor->transaction;
+		cursor->owns_transaction = 0;
+	}
+	cleanup_error = NULL;
+	close_result = ib_cursor_close_internal(cursor, &cleanup_error);
+	cursor = NULL;
+	if (close_result != 0) {
+		if (implicit_transaction != NULL) {
+			ISC_STATUS rollback_status[IB_STATUS_VECTOR_LENGTH];
+
+			rollback_error = NULL;
+			memset(rollback_status, 0, sizeof(rollback_status));
+			if (isc_rollback_transaction(rollback_status, &implicit_transaction) != 0) {
+				(void) ib_fail_status(&rollback_error, "rollback failed prepared write", rollback_status);
+			}
+			ib_append_error(&cleanup_error, rollback_error);
+		}
+		ib_give_error(error, cleanup_error);
+		return -1;
+	}
+	if (implicit_transaction == NULL) {
+		ib_give_error(error, cleanup_error);
+		return 0;
+	}
+	memset(status, 0, sizeof(status));
+	result = isc_commit_transaction(status, &implicit_transaction);
+	if (result != 0) {
+		commit_error = NULL;
+		statement->connection->broken = 1;
+		(void) ib_fail_status(&commit_error, "commit prepared write transaction", status);
+		if (implicit_transaction != NULL) {
+			ISC_STATUS rollback_status[IB_STATUS_VECTOR_LENGTH];
+
+			rollback_error = NULL;
+			memset(rollback_status, 0, sizeof(rollback_status));
+			if (isc_rollback_transaction(rollback_status, &implicit_transaction) != 0) {
+				(void) ib_fail_status(&rollback_error, "rollback failed prepared write", rollback_status);
+			}
+			ib_append_error(&commit_error, rollback_error);
+		}
+		ib_append_error(&commit_error, cleanup_error);
+		ib_give_error(error, commit_error);
+		return -1;
+	}
+	ib_give_error(error, cleanup_error);
+	return 0;
+}
+
+ib_cursor *ib_statement_query(ib_statement *statement,
+	const ib_bindings *bindings, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	ib_cursor *cursor;
+
+	if (statement == NULL || statement->connection == NULL ||
+		statement->statement == NULL || statement->connection->database == NULL ||
+		statement->connection->broken) {
+		ib_fail(error, "prepared statement is unavailable");
+		return NULL;
+	}
+	if (bindings == NULL || bindings->count > (size_t) SHRT_MAX) {
+		ib_fail(error, "query arguments are invalid");
+		return NULL;
+	}
+	if (statement->connection->active_cursor != NULL) {
+		ib_fail(error, "another result cursor is active on this connection");
+		return NULL;
+	}
+	if (statement->statement_type != isc_info_sql_stmt_select) {
+		ib_fail(error, "only SELECT statements are permitted");
+		return NULL;
+	}
+	cursor = (ib_cursor *) calloc(1U, sizeof(*cursor));
+	if (cursor == NULL) {
+		ib_fail(error, "out of memory allocating prepared cursor state");
+		return NULL;
+	}
+	cursor->connection = statement->connection;
+	cursor->prepared = statement;
+	cursor->statement = statement->statement;
+	cursor->statement_type = statement->statement_type;
+	if (statement->connection->transaction != NULL) {
+		cursor->transaction = statement->connection->transaction;
+		cursor->owns_transaction = 0;
+	} else if (ib_start_transaction(statement->connection, &cursor->transaction, 1,
+		"start read transaction", error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return NULL;
+	} else {
+		cursor->owns_transaction = 1;
+	}
+	cursor->input = ib_clone_sqlda(statement->input, error);
+	if (cursor->input == NULL || ib_bind_input(cursor, bindings, error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return NULL;
+	}
+	cursor->output = ib_clone_sqlda(statement->output, error);
+	if (cursor->output == NULL || ib_validate_output_types(cursor->output, error) != 0 ||
+		ib_allocate_output(cursor, error) != 0) {
+		ib_failed_query_cleanup(cursor, error);
+		return NULL;
+	}
+	memset(status, 0, sizeof(status));
+	{
+		XSQLDA *input = cursor->input->sqld == 0 ? NULL : cursor->input;
+		result = isc_dsql_execute2(status, &cursor->transaction, &cursor->statement,
+			SQL_DIALECT_V5, input, NULL);
+	}
+	if (result != 0) {
+		(void) ib_fail_status(error, "execute prepared SELECT", status);
+		ib_failed_query_cleanup(cursor, error);
+		return NULL;
+	}
+	cursor->server_cursor_open = 1;
+	statement->connection->active_cursor = cursor;
+	return cursor;
+}
+
+int ib_statement_close(ib_statement *statement, char **error)
+{
+	return ib_statement_close_internal(statement, error);
 }
 
 int ib_cursor_next(ib_cursor *cursor, char **error)
@@ -1122,6 +2698,241 @@ static int ib_fill_timestamp(ib_value_view *view, int type, const char *data,
 	return 0;
 }
 
+static size_t ib_utf8_prefix_length(const char *data, size_t length,
+	size_t character_count)
+{
+	size_t offset;
+	size_t count;
+
+	offset = 0U;
+	count = 0U;
+	while (offset < length && count < character_count) {
+		unsigned char first = (unsigned char) data[offset];
+		size_t width = 1U;
+
+		if (first < 0x80U) {
+			width = 1U;
+		} else if ((first & 0xe0U) == 0xc0U) {
+			width = 2U;
+		} else if ((first & 0xf0U) == 0xe0U) {
+			width = 3U;
+		} else if ((first & 0xf8U) == 0xf0U) {
+			width = 4U;
+		}
+		if (width > length - offset) {
+			width = 1U;
+		} else if (width > 1U) {
+			size_t continuation;
+			for (continuation = 1U; continuation < width; continuation++) {
+				if ((((unsigned char) data[offset + continuation]) & 0xc0U) != 0x80U) {
+					width = 1U;
+					break;
+				}
+			}
+		}
+		offset += width;
+		count++;
+	}
+	return offset;
+}
+
+static size_t ib_text_character_count(const XSQLVAR *variable)
+{
+	size_t length;
+
+	if (variable == NULL || variable->sqllen < 0) {
+		return 0U;
+	}
+	length = (size_t) variable->sqllen;
+	switch (variable->sqlsubtype) {
+	case 3:  /* UNICODE_FSS */
+		return length / 3U;
+	case 5:  /* SJIS_0208 */
+	case 6:  /* EUCJ_0208 */
+	case 8:  /* UNICODE_BE */
+	case 44: /* KSC_5601 */
+	case 56: /* BIG_5 */
+	case 57: /* GB_2312 */
+	case 64: /* UNICODE_LE */
+		return length / 2U;
+	case IB_CHARSET_UTF8:
+		return length / 4U;
+	default:
+		return length;
+	}
+}
+
+static int ib_append_blob_data(char **data, size_t *length, size_t *capacity,
+	const char *segment, size_t segment_length, char **error)
+{
+	char *resized;
+	size_t needed;
+	size_t new_capacity;
+
+	if (data == NULL || length == NULL || capacity == NULL ||
+		(segment_length != 0U && segment == NULL)) {
+		return ib_fail(error, "BLOB result storage is unavailable");
+	}
+	if (*length > IB_MAX_BLOB_BUFFER ||
+		segment_length > IB_MAX_BLOB_BUFFER - *length) {
+		return ib_fail(error, "BLOB result exceeds the materialization limit");
+	}
+	needed = *length + segment_length;
+	if (needed > *capacity) {
+		new_capacity = *capacity == 0U ? IB_BLOB_SEGMENT_LENGTH : *capacity;
+		while (new_capacity < needed) {
+			if (new_capacity > IB_MAX_BLOB_BUFFER / 2U) {
+				new_capacity = IB_MAX_BLOB_BUFFER;
+				break;
+			}
+			new_capacity *= 2U;
+		}
+		if (new_capacity > IB_MAX_BLOB_BUFFER) {
+			new_capacity = IB_MAX_BLOB_BUFFER;
+		}
+		resized = (char *) realloc(*data, new_capacity);
+		if (resized == NULL) {
+			return ib_fail(error, "out of memory materializing BLOB result");
+		}
+		*data = resized;
+		*capacity = new_capacity;
+	}
+	if (segment_length != 0U) {
+		memcpy(*data + *length, segment, segment_length);
+		*length = needed;
+	}
+	return 0;
+}
+
+static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
+	size_t *length, int *is_utf8, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	ISC_QUAD blob_id;
+	isc_blob_handle blob;
+	ISC_BLOB_DESC_V2 source_descriptor;
+	ISC_BLOB_DESC_V2 target_descriptor;
+	unsigned char bpb[IB_BLOB_BPB_LENGTH];
+	unsigned short bpb_length;
+	char segment[IB_BLOB_SEGMENT_LENGTH];
+	char *data;
+	char *first_error;
+	char *cleanup_error;
+	size_t data_length;
+	size_t capacity;
+	int cleanup_failed;
+	int use_bpb;
+
+	if (length == NULL || cursor == NULL || cursor->connection == NULL ||
+		cursor->connection->database == NULL || cursor->transaction == NULL ||
+		variable == NULL || variable->sqldata == NULL || is_utf8 == NULL) {
+		(void) ib_fail(error, "BLOB result storage is unavailable");
+		return NULL;
+	}
+	memcpy(&blob_id, variable->sqldata, sizeof(blob_id));
+	*is_utf8 = 0;
+	bpb_length = 0U;
+	use_bpb = 0;
+	if (variable->sqlsubtype == 1 && variable->sqlname_length > 0 &&
+		variable->relname_length > 0) {
+		if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
+			error) != 0) {
+			return NULL;
+		}
+		if (source_descriptor.blob_desc_charset != 0 &&
+			source_descriptor.blob_desc_charset != 1) {
+			ib_blob_descriptor(&target_descriptor, 1, IB_CHARSET_UTF8);
+			memset(status, 0, sizeof(status));
+			/* Read through the column's charset and expose UTF-8 to Go. */
+			result = isc_blob_gen_bpb2(status, &target_descriptor,
+				&source_descriptor, (unsigned short) sizeof(bpb), bpb,
+				&bpb_length);
+			if (result != 0) {
+				(void) ib_fail_status(error, "generate output BLOB parameter block",
+					status);
+				return NULL;
+			}
+			use_bpb = 1;
+			*is_utf8 = 1;
+		}
+	}
+	blob = NULL;
+	memset(status, 0, sizeof(status));
+	if (use_bpb) {
+		result = isc_open_blob2(status, &cursor->connection->database,
+			&cursor->transaction, &blob, &blob_id, (short) bpb_length,
+			(char *) bpb);
+	} else {
+		result = isc_open_blob(status, &cursor->connection->database,
+			&cursor->transaction, &blob, &blob_id);
+	}
+	if (result != 0) {
+		(void) ib_fail_status(error, "open output BLOB", status);
+		return NULL;
+	}
+	data = NULL;
+	data_length = 0U;
+	capacity = 0U;
+	for (;;) {
+		unsigned short segment_length;
+
+		segment_length = 0U;
+		memset(status, 0, sizeof(status));
+		result = isc_get_segment(status, &blob, &segment_length,
+			(unsigned short) sizeof(segment), segment);
+		if (result == isc_segstr_eof) {
+			break;
+		}
+		if (result != 0 && result != isc_segment) {
+			first_error = NULL;
+			(void) ib_fail_status(&first_error, "read output BLOB segment", status);
+			cleanup_error = NULL;
+			cleanup_failed = ib_blob_cleanup(&blob, 1, &cleanup_error);
+			if (cleanup_failed != 0) {
+				cursor->connection->broken = 1;
+			}
+			ib_append_error(&first_error, cleanup_error);
+			free(data);
+			ib_give_error(error, first_error);
+			return NULL;
+		}
+		first_error = NULL;
+		if (ib_append_blob_data(&data, &data_length, &capacity, segment,
+			(size_t) segment_length, &first_error) != 0) {
+			cleanup_error = NULL;
+			cleanup_failed = ib_blob_cleanup(&blob, 1, &cleanup_error);
+			if (cleanup_failed != 0) {
+				cursor->connection->broken = 1;
+			}
+			ib_append_error(&first_error, cleanup_error);
+			free(data);
+			ib_give_error(error, first_error);
+			return NULL;
+		}
+	}
+	cleanup_error = NULL;
+	cleanup_failed = ib_blob_cleanup(&blob, 0, &cleanup_error);
+	if (cleanup_failed != 0) {
+		cursor->connection->broken = 1;
+	}
+	if (cleanup_failed != 0 || cleanup_error != NULL) {
+		free(data);
+		ib_give_error(error, cleanup_error);
+		return NULL;
+	}
+	if (data == NULL) {
+		data = (char *) malloc(1U);
+		if (data == NULL) {
+			(void) ib_fail(error, "out of memory materializing empty BLOB result");
+			return NULL;
+		}
+		data[0] = '\0';
+	}
+	*length = data_length;
+	return data;
+}
+
 int ib_cursor_column(const ib_cursor *cursor, size_t index,
 	ib_value_view *view, char **error)
 {
@@ -1134,6 +2945,11 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 	double double_value;
 	ISC_BOOLEAN boolean_value;
 	unsigned short varying_length;
+	short connection_charset;
+	size_t source_length;
+	size_t character_count;
+	size_t converted_length;
+	char *converted;
 
 	if (cursor == NULL || cursor->output == NULL || !cursor->fetched ||
 		index >= (size_t) cursor->output->sqld || view == NULL) {
@@ -1141,19 +2957,52 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 	}
 	memset(view, 0, sizeof(*view));
 	variable = &cursor->output->sqlvar[index];
-	if (variable->sqlind == NULL || variable->sqldata == NULL) {
+	if (variable->sqldata == NULL ||
+		((variable->sqltype & 1) != 0 && variable->sqlind == NULL)) {
 		return ib_fail(error, "result column storage is unavailable");
 	}
-	if (*variable->sqlind < 0) {
+	free(((ib_cursor *) cursor)->converted_value);
+	((ib_cursor *) cursor)->converted_value = NULL;
+	free(((ib_cursor *) cursor)->materialized_value);
+	((ib_cursor *) cursor)->materialized_value = NULL;
+	connection_charset = IB_CHARSET_UTF8;
+	if (cursor->connection != NULL && cursor->connection->charset != 0) {
+		connection_charset = cursor->connection->charset;
+	}
+	if (variable->sqlind != NULL && *variable->sqlind < 0) {
 		view->kind = IB_VALUE_NULL;
 		return 0;
 	}
 	type = ib_sql_type(variable);
 	switch (type) {
 	case SQL_TEXT:
+		source_length = (size_t) variable->sqllen;
+		if (connection_charset == IB_CHARSET_UTF8) {
+			character_count = ib_text_character_count(variable);
+			source_length = ib_utf8_prefix_length(variable->sqldata,
+				source_length, character_count);
+		} else if (connection_charset != 0 && connection_charset != 1 &&
+			variable->sqlsubtype != 1) {
+			character_count = ib_text_character_count(variable);
+			if (character_count < source_length) {
+				source_length = character_count;
+			}
+		}
+		if (connection_charset != 0 && connection_charset != IB_CHARSET_UTF8 &&
+			variable->sqlsubtype != 1) {
+			converted = ib_convert_to_utf8(variable->sqldata, source_length,
+				connection_charset, &converted_length, error);
+			if (converted == NULL) {
+				return -1;
+			}
+			((ib_cursor *) cursor)->converted_value = converted;
+			view->bytes = converted;
+			view->length = converted_length;
+		} else {
+			view->bytes = variable->sqldata;
+			view->length = source_length;
+		}
 		view->kind = IB_VALUE_STRING;
-		view->bytes = variable->sqldata;
-		view->length = (size_t) variable->sqllen;
 		return 0;
 	case SQL_VARYING:
 		memcpy(&varying_length, variable->sqldata, sizeof(varying_length));
@@ -1161,9 +3010,53 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 			return ib_fail(error, "InterBase returned an invalid varying value length");
 		}
 		view->kind = IB_VALUE_STRING;
-		view->bytes = variable->sqldata + sizeof(varying_length);
-		view->length = (size_t) varying_length;
+		source_length = (size_t) varying_length;
+		if (connection_charset != 0 && connection_charset != IB_CHARSET_UTF8 &&
+			variable->sqlsubtype != 1) {
+			converted = ib_convert_to_utf8(variable->sqldata + sizeof(varying_length),
+				source_length, connection_charset, &converted_length, error);
+			if (converted == NULL) {
+				return -1;
+			}
+			((ib_cursor *) cursor)->converted_value = converted;
+			view->bytes = converted;
+			view->length = converted_length;
+		} else {
+			view->bytes = variable->sqldata + sizeof(varying_length);
+			view->length = source_length;
+		}
 		return 0;
+	case SQL_BLOB:
+	{
+		char *blob_data;
+		size_t blob_length;
+		int blob_is_utf8;
+
+		blob_data = ib_read_blob((ib_cursor *) cursor, variable, &blob_length,
+			&blob_is_utf8, error);
+		if (blob_data == NULL) {
+			return -1;
+		}
+		((ib_cursor *) cursor)->materialized_value = blob_data;
+		if (!blob_is_utf8 && variable->sqlsubtype == 1 && connection_charset != 0 &&
+			connection_charset != 1 && connection_charset != IB_CHARSET_UTF8) {
+			converted = ib_convert_to_utf8(blob_data, blob_length,
+				connection_charset, &converted_length, error);
+			if (converted == NULL) {
+				return -1;
+			}
+			free(((ib_cursor *) cursor)->materialized_value);
+			((ib_cursor *) cursor)->materialized_value = NULL;
+			((ib_cursor *) cursor)->converted_value = converted;
+			view->bytes = converted;
+			view->length = converted_length;
+		} else {
+			view->bytes = ((ib_cursor *) cursor)->materialized_value;
+			view->length = blob_length;
+		}
+		view->kind = variable->sqlsubtype == 1 ? IB_VALUE_STRING : IB_VALUE_BYTES;
+		return 0;
+	}
 	case SQL_SHORT:
 		memcpy(&short_value, variable->sqldata, sizeof(short_value));
 		view->int64_value = (int64_t) short_value;
@@ -1200,6 +3093,11 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 		view->float64_value = (double) float_value;
 		return 0;
 	case SQL_DOUBLE:
+		memcpy(&double_value, variable->sqldata, sizeof(double_value));
+		view->kind = IB_VALUE_FLOAT64;
+		view->float64_value = double_value;
+		return 0;
+	case SQL_D_FLOAT:
 		memcpy(&double_value, variable->sqldata, sizeof(double_value));
 		view->kind = IB_VALUE_FLOAT64;
 		view->float64_value = double_value;

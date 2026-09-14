@@ -34,6 +34,9 @@ static void test_positional_bind_values(void)
 	memset(&cursor, 0, sizeof(cursor));
 	cursor.input = ib_alloc_sqlda(5);
 	require_condition(cursor.input != NULL, "input SQLDA allocation failed");
+	require_condition(cursor.input->sqldabc ==
+		(ISC_LONG) (sizeof(XSQLDA) + 4U * sizeof(XSQLVAR)),
+		"input SQLDA byte capacity is wrong");
 	cursor.input->sqld = 5;
 	cursor.input->sqlvar[0].sqltype = SQL_VARYING | 1;
 	cursor.input->sqlvar[1].sqltype = SQL_INT64 | 1;
@@ -126,6 +129,220 @@ static void test_column_decoding(void)
 	ib_free_sqlda(cursor.output);
 }
 
+static void test_utf8_fixed_text_and_scaled_float_decoding(void)
+{
+	static const char padded_text[] = "AA                  ";
+	ib_cursor cursor;
+	ib_value_view view;
+	double floating = 100.11;
+	char *error;
+
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.output = ib_alloc_sqlda(2);
+	require_condition(cursor.output != NULL, "UTF8 output SQLDA allocation failed");
+	cursor.output->sqld = 2;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = 59; /* InterBase UTF8 charset. */
+	cursor.output->sqlvar[0].sqllen = (short) (sizeof(padded_text) - 1U);
+	cursor.output->sqlvar[1].sqltype = SQL_DOUBLE | 1;
+	cursor.output->sqlvar[1].sqlscale = -2;
+	error = NULL;
+	require_success(ib_validate_output_types(cursor.output, &error), error,
+		"Dialect 1 scaled floating output was rejected");
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"UTF8/scaled floating output storage failed");
+	memcpy(cursor.output->sqlvar[0].sqldata, padded_text, sizeof(padded_text) - 1U);
+	memcpy(cursor.output->sqlvar[1].sqldata, &floating, sizeof(floating));
+	cursor.fetched = 1;
+
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"UTF8 CHAR decode failed");
+	require_condition(view.kind == IB_VALUE_STRING && view.length == 5U &&
+		memcmp(view.bytes, "AA   ", 5U) == 0,
+		"UTF8 CHAR padding was measured in bytes instead of characters");
+	require_success(ib_cursor_column(&cursor, 1, &view, &error), error,
+		"scaled floating decode failed");
+	require_condition(view.kind == IB_VALUE_FLOAT64 && view.float64_value == floating,
+		"scaled floating value was not decoded as a float");
+	ib_free_sqlda(cursor.output);
+}
+
+static void test_fixed_text_output_is_space_initialized(void)
+{
+	ib_cursor cursor;
+	char *error;
+
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "fixed text SQLDA allocation failed");
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqllen = 5;
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"fixed text output storage failed");
+	require_condition(memcmp(cursor.output->sqlvar[0].sqldata, "     ", 5U) == 0,
+		"fixed text output storage was not space initialized");
+	ib_free_sqlda(cursor.output);
+}
+
+static void test_text_binding_converts_to_described_charset(void)
+{
+	ib_cursor cursor;
+	ib_connection connection;
+	ib_bindings *bindings;
+	char *error;
+	static const char win1250[] = "\xec\x9a\xe8";
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.input = ib_alloc_sqlda(1);
+	require_condition(cursor.input != NULL, "metadata input SQLDA allocation failed");
+	cursor.input->sqld = 1;
+	cursor.input->sqlvar[0].sqltype = SQL_VARYING | 1;
+	cursor.input->sqlvar[0].sqlsubtype = 51; /* InterBase WIN1250 charset. */
+	cursor.input->sqlvar[0].sqllen = 20;
+	error = NULL;
+	bindings = ib_bindings_new(1, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"metadata binding allocation failed");
+	require_success(ib_bindings_set_string(bindings, 0, "\xc4\x9b\xc5\xa1\xc4\x8d", 6U, &error),
+		error, "metadata string binding setup failed");
+	require_success(ib_bind_input(&cursor, bindings, &error), error,
+		"metadata string binding failed");
+	require_condition(cursor.input->sqlvar[0].sqltype == (SQL_VARYING | 1) &&
+		cursor.input->sqlvar[0].sqlsubtype == 51 &&
+		cursor.input->sqlvar[0].sqllen == 20,
+		"text binding discarded described charset/type metadata or capacity");
+	{
+		unsigned short varying_length;
+		memcpy(&varying_length, cursor.input->sqlvar[0].sqldata,
+			sizeof(varying_length));
+		require_condition(varying_length == sizeof(win1250) - 1U &&
+			memcmp(cursor.input->sqlvar[0].sqldata + sizeof(varying_length),
+				win1250, sizeof(win1250) - 1U) == 0,
+			"text binding was not converted to the described charset");
+	}
+	ib_bindings_free(bindings);
+	ib_free_sqlda(cursor.input);
+}
+
+static void test_binding_converts_to_described_charset_capacity(void)
+{
+	static const char utf8[] =
+		"ěščřžýáíéúůďťňóĚŠČŘŽÝÁÍÉÚŮĎŤŇÓ";
+	static const char win1250[] =
+		"\xec\x9a\xe8\xf8\x9e\xfd\xe1\xed\xe9\xfa\xf9\xef\x9d\xf2\xf3\xcc\x8a\xc8\xd8\x8e\xdd\xc1\xcd\xc9\xda\xd9\xcf\x8d\xd2\xd3";
+	ib_cursor cursor;
+	ib_connection connection;
+	ib_bindings *bindings;
+	unsigned short varying_length;
+	char *error;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.input = ib_alloc_sqlda(1);
+	require_condition(cursor.input != NULL, "UTF8 capacity input SQLDA allocation failed");
+	cursor.input->sqld = 1;
+	cursor.input->sqlvar[0].sqltype = SQL_VARYING | 1;
+	cursor.input->sqlvar[0].sqlsubtype = 51; /* Server-described WIN1250 parameter. */
+	cursor.input->sqlvar[0].sqllen = 40; /* Described WIN1250 character capacity. */
+	error = NULL;
+	bindings = ib_bindings_new(1, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"UTF8 capacity binding allocation failed");
+	require_success(ib_bindings_set_string(bindings, 0, utf8, sizeof(utf8) - 1U,
+		&error), error, "UTF8 capacity string setup failed");
+	require_success(ib_bind_input(&cursor, bindings, &error), error,
+		"UTF8 capacity string binding failed");
+	require_condition(cursor.input->sqlvar[0].sqltype == (SQL_VARYING | 1) &&
+		cursor.input->sqlvar[0].sqlsubtype == 51 &&
+		cursor.input->sqlvar[0].sqllen == 40,
+		"UTF8 binding did not preserve the described byte capacity");
+	memcpy(&varying_length, cursor.input->sqlvar[0].sqldata,
+		sizeof(varying_length));
+	require_condition(varying_length == sizeof(win1250) - 1U &&
+		memcmp(cursor.input->sqlvar[0].sqldata + sizeof(varying_length), win1250,
+			sizeof(win1250) - 1U) == 0,
+		"UTF8 varying buffer is not in the described charset");
+	ib_bindings_free(bindings);
+	ib_free_sqlda(cursor.input);
+}
+
+static void test_configured_charset_conversion(void)
+{
+	static const char utf8[] = "\xc4\x9b\xc5\xa1\xc4\x8d";
+	static const char win1250[] = "\xec\x9a\xe8";
+	ib_connection connection;
+	ib_cursor cursor;
+	ib_bindings *bindings;
+	ib_value_view view;
+	unsigned short varying_length;
+	char *error;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = 51; /* InterBase WIN1250. */
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.input = ib_alloc_sqlda(1);
+	require_condition(cursor.input != NULL, "charset input SQLDA allocation failed");
+	cursor.input->sqld = 1;
+	cursor.input->sqlvar[0].sqltype = SQL_VARYING | 1;
+	cursor.input->sqlvar[0].sqlsubtype = 51;
+	cursor.input->sqlvar[0].sqllen = 40;
+	error = NULL;
+	bindings = ib_bindings_new(1, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"charset binding allocation failed");
+	require_success(ib_bindings_set_string(bindings, 0, utf8, sizeof(utf8) - 1U,
+		&error), error, "charset string setup failed");
+	require_success(ib_bind_input(&cursor, bindings, &error), error,
+		"charset input conversion failed");
+	require_condition(cursor.input->sqlvar[0].sqltype == (SQL_VARYING | 1) &&
+		cursor.input->sqlvar[0].sqlsubtype == 51 &&
+		cursor.input->sqlvar[0].sqllen == 40,
+		"charset input conversion changed the value or described capacity");
+	{
+		unsigned short varying_length;
+		memcpy(&varying_length, cursor.input->sqlvar[0].sqldata,
+			sizeof(varying_length));
+		require_condition(varying_length == sizeof(win1250) - 1U &&
+			memcmp(cursor.input->sqlvar[0].sqldata + sizeof(varying_length),
+				win1250, sizeof(win1250) - 1U) == 0,
+			"charset input conversion changed the value");
+	}
+	ib_bindings_free(bindings);
+	ib_free_sqlda(cursor.input);
+	cursor.input = NULL;
+
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "charset output SQLDA allocation failed");
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_VARYING | 1;
+	cursor.output->sqlvar[0].sqlsubtype = 51;
+	cursor.output->sqlvar[0].sqllen = 40;
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"charset output allocation failed");
+	varying_length = (unsigned short) (sizeof(win1250) - 1U);
+	memcpy(cursor.output->sqlvar[0].sqldata, &varying_length,
+		sizeof(varying_length));
+	memcpy(cursor.output->sqlvar[0].sqldata + sizeof(varying_length),
+		win1250, sizeof(win1250) - 1U);
+	cursor.fetched = 1;
+	error = NULL;
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"charset output conversion failed");
+	require_condition(view.kind == IB_VALUE_STRING && view.length == sizeof(utf8) - 1U &&
+		memcmp(view.bytes, utf8, sizeof(utf8) - 1U) == 0,
+		"charset output conversion changed the value");
+	ib_cursor_free_parts(&cursor);
+}
+
 static void test_output_nullability(void)
 {
 	ib_cursor cursor;
@@ -154,7 +371,7 @@ static void test_timestamp_and_rejections(void)
 	ib_value_view view;
 	struct tm encoded;
 	ISC_TIMESTAMP timestamp;
-	unsigned short invalid_length = 7;
+	unsigned short invalid_length = 25;
 	char *error;
 
 	memset(&cursor, 0, sizeof(cursor));
@@ -186,15 +403,17 @@ static void test_timestamp_and_rejections(void)
 	cursor.output->sqld = 1;
 	cursor.output->sqlvar[0].sqltype = SQL_BLOB | 1;
 	error = NULL;
-	require_condition(ib_validate_output_types(cursor.output, &error) == -1 && error != NULL,
-		"BLOB output was accepted");
-	ib_error_free(error);
+	require_success(ib_validate_output_types(cursor.output, &error), error,
+		"BLOB output was rejected");
+	ib_free_sqlda(cursor.output);
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "rejection SQLDA reallocation failed");
+	cursor.output->sqld = 1;
 	cursor.output->sqlvar[0].sqltype = SQL_DOUBLE | 1;
 	cursor.output->sqlvar[0].sqlscale = -1;
 	error = NULL;
-	require_condition(ib_validate_output_types(cursor.output, &error) == -1 && error != NULL,
-		"scaled double output was accepted");
-	ib_error_free(error);
+	require_success(ib_validate_output_types(cursor.output, &error), error,
+		"scaled double output was rejected");
 	cursor.output->sqlvar[0].sqltype = SQL_VARYING | 1;
 	cursor.output->sqlvar[0].sqlscale = 0;
 	cursor.output->sqlvar[0].sqllen = 6;
@@ -212,6 +431,11 @@ int main(void)
 {
 	test_positional_bind_values();
 	test_column_decoding();
+	test_utf8_fixed_text_and_scaled_float_decoding();
+	test_fixed_text_output_is_space_initialized();
+	test_text_binding_converts_to_described_charset();
+	test_binding_converts_to_described_charset_capacity();
+	test_configured_charset_conversion();
 	test_output_nullability();
 	test_timestamp_and_rejections();
 	(void) puts("native values tests passed");

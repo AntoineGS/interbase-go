@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -307,7 +308,10 @@ func runISQL(ctx context.Context, cfg Config, script, operation, marker string) 
 
 	command := exec.CommandContext(commandContext, cfg.ISQL, "-q", "-s", "1", "-names", "UTF8")
 	command.Env = fixtureEnvironment()
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid:   true,
+		Pdeathsig: syscall.SIGKILL,
+	}
 	command.Cancel = func() error {
 		return terminateProcessGroup(command)
 	}
@@ -328,6 +332,11 @@ func runISQL(ctx context.Context, cfg Config, script, operation, marker string) 
 	command.Stdout = writer
 	command.Stderr = writer
 	command.Stdin = strings.NewReader(script)
+	// Linux ties Pdeathsig to the OS thread that creates the child, rather than
+	// to the lifetime of the Go process. Keep that thread alive through Start,
+	// Wait, and the output/process-group cleanup below.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	startErr := command.Start()
 	_ = writer.Close()
 	if startErr != nil {

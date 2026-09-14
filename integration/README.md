@@ -111,6 +111,47 @@ dedicated container instead of its normal Compose deployment, which mounts
 persistent databases, backups and logs. Set `IMAGE` to an existing local image;
 these commands do not build, pull or publish a licensed image:
 
+### Automated runner
+
+The repository runner owns the container and a unique private temporary root.
+It binds only `127.0.0.1:3050`, mounts that same absolute host path into the
+container, uses tmpfs for `/var/lib/interbase`, and disables automatic backups.
+It copies the image's matching `libgds.so` and `isql` into that temporary root;
+the host `/opt/interbase` installation is never modified. The runner first runs
+`TestReadFixtureSmoke` with isolated `SYSDBA`/`masterkey` credentials. It
+retries that startup check for at most five attempts or 30 seconds, with a
+one-second delay, and prints only the final error after sanitizing it. It then
+requires the same smoke check to fail with an invalid password before running
+the requested Go arguments once. Invalid-password readiness accepts only the
+specific InterBase authentication diagnostic (SQLSTATE 28000, status
+335544472, or the standard `Your user name and password are not defined`
+message); generic connection failures and SQLCODE -902 alone are rejected.
+
+```sh
+# Use an image that is already present in the local Docker daemon.
+IMAGE='sha256:2787b636c0c39d3eeab23d9365d30292e45015704cbd9cdee42510d21a043f73' \
+  make test-integration-docker
+
+# Run a focused contract selection; the runner still performs readiness checks.
+IMAGE='sha256:2787b636c0c39d3eeab23d9365d30292e45015704cbd9cdee42510d21a043f73' \
+  ./scripts/test-integration-docker.sh -run '^TestReadFixtureSmoke$'
+```
+
+With no extra Go arguments, the requested run defaults to `-count=1` and
+`-timeout=10m`. Pass `GO_TEST_ARGS='-run ^TestRead'` to the Make target or pass
+arguments directly to the script; all arguments are forwarded to `go test`.
+`make test-runner` runs the orchestration tests with Bats and controlled
+`docker`/`go` executable doubles. A pinned local Bats checkout can be used
+without a global install with `make BATS=/path/to/bats/bin/bats test-runner`.
+
+Operational `INTERBASE_DATABASE`, `INTERBASE_USER`, and
+`INTERBASE_PASSWORD`, plus test fixture overrides, are removed before the Go
+smoke and contract commands. The runner prints no Docker logs or credential
+values. On failure or interruption it stops and removes only the container ID
+it started, removes only its copied files, and uses nonrecursive directory
+cleanup. If fixture artifacts remain, their directory is reported and retained
+for inspection rather than recursively deleted.
+
 ```sh
 TEST_ROOT=$(mktemp -d /tmp/interbase-go-docker.XXXXXX)
 TEST_CONTAINER="interbase-go-test-${TEST_ROOT##*.}"
@@ -176,7 +217,8 @@ checks (contexts, pool reuse, `sql.ErrTxDone`) supplement the Python behavior.
 | `TestReadCHARPadding`, `TestReadIntegerBoundaries`, `TestReadTimestampFraction` | `TestInsertData.test_insert_char_varchar`, `.test_insert_integers`, `.test_insert_datetime` | Preseeded decoding independent of driver writes |
 | `TestReadNumeric9ExactStrings`, `TestReadWideDecimalDialectOneFloatTolerance` | `TestInsertData.test_insert_numeric_decimal` | Exact scaled-integer strings versus Dialect-1 approximate wide numerics |
 | `TestReadSelectableBudgetProcedure` | `TestStoredProc.test_callproc` | SQL SELECT from a selectable procedure, four original aggregate values; no `callproc` API or integer-to-CHAR extension assertion |
-| `TestReadWIN1250UTF8RoundTrip` | `TestCharsetConversion.test_utf82win1250` | Nested charset casts on a UTF8 attachment, not a configurable WIN1250 connection |
+| `TestCharsetUTF8InsertReadAcrossAttachments` | `TestCharsetConversion.test_utf82win1250` | Original five-field T4 row inserted and committed through UTF8, then read through WIN1250 and UTF8 attachments to the same database; exact original values, column lengths and charsets |
+| `TestReadWIN1250UTF8RoundTrip` | Go-specific regression inspired by `TestCharsetConversion.test_utf82win1250` | Explicit UTF8 input cast followed by WIN1250 and UTF8 conversions on a UTF8 attachment; this SQL does not appear in the upstream test and is not a substitute for its persisted-row contract |
 | `TestReadVarcharParameterLengths`, `TestReadVarchar5000Cast` | `TestBugs.test_pyib_22`, `.test_pyib_25` | Read-side parameter regressions; does not claim the original insert loop |
 | `TestWriteDMLRowsAffected`, `TestWriteDMLRoundTrip`, `TestWriteDuplicateKeyRecovery` | `DatabaseAPI20Test.test_rowcount`, `.test_execute`, `.test_executemany`; `TestConnection.test_connection` | Exec, exact counts and persisted rows, zero-row operations and constraint recovery; no batch API |
 | `TestWritePreparedSelectReuseAndArgumentCounts`, `TestWritePreparedExecRepeated`, `TestWritePreparedCloseRejectsUse` | `TestPreparedStatement.test_execution`; `DatabaseAPI20Test.test_execute`, `.test_executemany` | `sql.Stmt` reuse and closure, not Python cursor ownership |
@@ -209,11 +251,68 @@ checks (contexts, pool reuse, `sql.ErrTxDone`) supplement the Python behavior.
 
 ## Interpreting Results
 
-The baseline driver intentionally rejects Exec, public Prepare, BeginTx,
+The original read-only baseline intentionally rejected Exec, public Prepare, BeginTx,
 `time.Time`/`[]byte` arguments, ordinary Go numeric argument conversions, BLOB
-results and scaled floating-point results. Those contracts are expected to
-remain red until implemented; there are no feature skips or expected-failure
-wrappers. A driver defect can also make a read-side contract fail.
+results and scaled floating-point results. The implementation now supports
+those capabilities. There are no feature skips or expected-failure wrappers;
+any failing contract makes the live test command fail.
+
+### Current implementation
+
+On 2026-09-13 the full suite had **54 passing top-level groups, zero failures
+and zero skips**, against server `LI-V15.1.0.49` and client `LI-V15.1.0.42`.
+All 255 VARCHAR-length subtests passed. New regressions cover actual native
+statement reuse, repeated cursors within an explicit transaction, SQL
+transaction-control rejection, and text BLOB conversion across attachments.
+
+`TestCharsetUTF8InsertReadAcrossAttachments` passed through both WIN1250 and
+UTF8 attachments without a driver change. It faithfully reproduces the upstream
+`test_utf82win1250` insert, explicit commit, and full five-field row comparison.
+Only unused T4 columns are omitted from its isolated schema. This establishes
+the upstream persisted-row behavior independently of the nested-cast test.
+
+`TestReadWIN1250UTF8RoundTrip` now declares its input parameter as UTF8 before
+the WIN1250 and UTF8 conversions. The attachment, input text, exact output
+assertion, and EOF checks are retained; no driver SQL rewriting, feature skips,
+or expected-failure wrappers were added. This corrects the synthetic query's
+parameter typing, not support for the original shorthand on the native stack.
+
+The automated Docker runner now passes the full suite and removes its
+container and private temporary root. Before the SQL correction it reproduced
+the failure, returned nonzero, and completed the same cleanup. The runner's
+controlled Bats suite has 15 tests, including readiness retries, failure
+propagation and interruption cleanup.
+
+### Mixed-character-set parameters
+
+A standalone C probe using matching InterBase 15.1 headers and client, a
+Dialect-1 UTF8 attachment, and the same 30-character Czech input isolated the
+native behavior independently of the Go driver. Input representations were
+30 WIN1250 bytes and 60 UTF8 bytes. All three cases described a UTF8 output
+capacity of 160 bytes, so an undersized output buffer was not the cause.
+
+| Native query/binding | Input descriptor | Result |
+| --- | --- | --- |
+| Original nested cast, described WIN1250 bytes | VARCHAR, charset 51, 40 bytes | Execute succeeds; fetch fails with SQLCODE -802, primary status 335544321 and nested `isc_transliteration_failed` (335544565) |
+| Original nested cast, descriptor overridden to UTF8 | VARCHAR, charset 59, 160 bytes | Execute fails with SQLCODE -303 |
+| Explicit UTF8 input cast, described UTF8 bytes | VARCHAR, charset 59, 160 bytes | Execute and fetch succeed; all 60 returned bytes match the expected UTF8 text |
+
+The supported form tested by the Go regression is:
+
+```sql
+SELECT CAST(
+    CAST(
+        CAST(? AS VARCHAR(40) CHARACTER SET UTF8)
+        AS VARCHAR(40) CHARACTER SET WIN1250
+    ) AS VARCHAR(40) CHARACTER SET UTF8
+) FROM RDB$DATABASE
+```
+
+The original shorthand omitted the innermost UTF8 cast. Its native failure
+remains a limitation of the tested query/binding combination; these results
+do not establish a general server defect or behavior on other versions.
+
+### Migration baseline
 
 The first host-only attempt was blocked by a missing local server. On
 2026-09-12, Docker-backed validation used server `LI-V15.1.0.49` and client

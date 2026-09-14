@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestNewConnectorRejectsIncompleteConfigWithoutLeakingPassword(t *testing.T) {
@@ -44,6 +45,82 @@ func TestNewConnectorRejectsIncompleteConfigWithoutLeakingPassword(t *testing.T)
 				t.Fatalf("error leaked password: %q", err)
 			}
 		})
+	}
+}
+
+func TestConfigCharsetNormalizesSupportedValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "empty defaults to UTF8", input: "", want: "UTF8"},
+		{name: "UTF8", input: "utf8", want: "UTF8"},
+		{name: "WIN1250", input: "win1250", want: "WIN1250"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeCharset(tc.input)
+			if err != nil {
+				t.Fatalf("normalizeCharset(%q) returned error: %v", tc.input, err)
+			}
+			if got != tc.want {
+				t.Fatalf("normalizeCharset(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewConnectorRejectsUnsupportedCharset(t *testing.T) {
+	_, err := NewConnector(Config{
+		Database: "/tmp/example.ib",
+		User:     "alice",
+		Password: "super-secret",
+		Charset:  "NOPE",
+	})
+	if err == nil {
+		t.Fatal("NewConnector accepted unsupported charset")
+	}
+	if strings.Contains(err.Error(), "super-secret") {
+		t.Fatalf("error leaked password: %q", err)
+	}
+}
+
+type countingValuer struct {
+	calls *int
+	value driver.Value
+}
+
+func (v countingValuer) Value() (driver.Value, error) {
+	(*v.calls)++
+	return v.value, nil
+}
+
+func TestCheckNamedValueNormalizesValuerOnce(t *testing.T) {
+	calls := 0
+	named := driver.NamedValue{
+		Ordinal: 1,
+		Value: countingValuer{
+			calls: &calls,
+			value: int64(42),
+		},
+	}
+
+	if err := (&conn{}).CheckNamedValue(&named); err != nil {
+		t.Fatalf("CheckNamedValue returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("Valuer calls after CheckNamedValue = %d, want 1", calls)
+	}
+	if got, ok := named.Value.(int64); !ok || got != 42 {
+		t.Fatalf("normalized NamedValue.Value = %#v, want int64(42)", named.Value)
+	}
+
+	if _, err := convertNamedValues([]driver.NamedValue{named}); err != nil {
+		t.Fatalf("convertNamedValues returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("Valuer calls after conversion = %d, want 1", calls)
 	}
 }
 
@@ -109,6 +186,34 @@ func TestConvertArgumentSupportsPoCBoundaryTypes(t *testing.T) {
 			wantKind: argumentBool,
 			wantBool: true,
 		},
+		{
+			name:      "int converts to int64",
+			input:     int(7),
+			wantKind:  argumentInt64,
+			wantInt64: 7,
+		},
+		{
+			name:      "int32 converts to int64",
+			input:     int32(-8),
+			wantKind:  argumentInt64,
+			wantInt64: -8,
+		},
+		{
+			name:      "float32 converts to float64",
+			input:     float32(1.25),
+			wantKind:  argumentFloat64,
+			wantFloat: float64(float32(1.25)),
+		},
+		{
+			name:     "timestamp",
+			input:    time.Date(2024, time.February, 29, 12, 34, 56, 700000, time.UTC),
+			wantKind: argumentTimestamp,
+		},
+		{
+			name:     "bytes",
+			input:    []byte{0, 1, 2},
+			wantKind: argumentBytes,
+		},
 	}
 
 	for _, tc := range tests {
@@ -132,15 +237,18 @@ func TestConvertArgumentSupportsPoCBoundaryTypes(t *testing.T) {
 			if got.boolValue != tc.wantBool {
 				t.Errorf("boolValue = %t, want %t", got.boolValue, tc.wantBool)
 			}
+			if tc.wantKind == argumentTimestamp && !got.timeValue.Equal(tc.input.(time.Time)) {
+				t.Errorf("timeValue = %v, want %v", got.timeValue, tc.input)
+			}
+			if tc.wantKind == argumentBytes && !strings.EqualFold(string(got.bytesValue), string(tc.input.([]byte))) {
+				t.Errorf("bytesValue = %v, want %v", got.bytesValue, tc.input)
+			}
 		})
 	}
 }
 
 func TestConvertArgumentRejectsTypesOutsidePoCBoundary(t *testing.T) {
 	for _, input := range []any{
-		int(1),
-		float32(1),
-		[]byte("not supported"),
 		struct{}{},
 	} {
 		if _, err := convertArgument(input); err == nil {
@@ -150,8 +258,12 @@ func TestConvertArgumentRejectsTypesOutsidePoCBoundary(t *testing.T) {
 }
 
 func TestConvertArgumentRejectsOversizedString(t *testing.T) {
-	if _, err := convertArgument(strings.Repeat("x", math.MaxInt16+1)); err == nil {
-		t.Fatal("convertArgument accepted a string larger than the SQLDA limit")
+	arg, err := convertArgument(strings.Repeat("x", math.MaxInt16+1))
+	if err != nil {
+		t.Fatalf("convertArgument rejected a large BLOB-capable string: %v", err)
+	}
+	if arg.kind != argumentString || len(arg.stringValue) != math.MaxInt16+1 {
+		t.Fatalf("large string argument = %#v, want string length %d", arg, math.MaxInt16+1)
 	}
 }
 
@@ -210,18 +322,28 @@ func TestSanitizeErrorRedactsConnectionDetails(t *testing.T) {
 	}
 }
 
-func TestConnRejectsStateChangingOperations(t *testing.T) {
+func TestConnRejectsUnavailableStateChangingOperations(t *testing.T) {
 	conn := new(conn)
 	ctx := context.Background()
 
-	if _, err := conn.Prepare("SELECT 1"); err == nil || !strings.Contains(err.Error(), "unsupported") {
-		t.Fatalf("Prepare error = %v, want explicit unsupported error", err)
+	if _, err := conn.Prepare("SELECT 1"); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Prepare error = %v, want driver.ErrBadConn", err)
 	}
-	if _, err := conn.ExecContext(ctx, "DELETE FROM secret", nil); err == nil || !strings.Contains(err.Error(), "unsupported") {
-		t.Fatalf("ExecContext error = %v, want explicit unsupported error", err)
+	if _, err := conn.ExecContext(ctx, "DELETE FROM secret", nil); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("ExecContext error = %v, want driver.ErrBadConn", err)
 	}
-	if _, err := conn.Begin(); err == nil || !strings.Contains(err.Error(), "unsupported") {
-		t.Fatalf("Begin error = %v, want explicit unsupported error", err)
+	if _, err := conn.Begin(); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Begin error = %v, want driver.ErrBadConn", err)
+	}
+}
+
+func TestConnRejectsUnsupportedIsolation(t *testing.T) {
+	conn := new(conn)
+	_, err := conn.BeginTx(context.Background(), driver.TxOptions{
+		Isolation: driver.IsolationLevel(1),
+	})
+	if err == nil || !strings.Contains(err.Error(), "isolation") {
+		t.Fatalf("BeginTx error = %v, want unsupported isolation error", err)
 	}
 }
 
@@ -293,6 +415,41 @@ func TestConnValidatorConcurrentClose(t *testing.T) {
 	wg.Wait()
 	if validator.IsValid() {
 		t.Fatal("closed connection is eligible for pooling")
+	}
+}
+
+func TestConnCloseInvalidatesReachablePreparedStatements(t *testing.T) {
+	c := &conn{statements: make(map[*stmt]struct{})}
+	s := &stmt{conn: c, native: &nativeStatement{}}
+	c.statements[s] = struct{}{}
+
+	if err := c.Close(); err != nil {
+		t.Fatalf("connection close: %v", err)
+	}
+	if !s.closed || s.native != nil {
+		t.Fatalf("prepared statement remained usable after connection close: closed=%t native=%v", s.closed, s.native)
+	}
+	if _, err := s.ExecContext(context.Background(), nil); !errors.Is(err, errStatementClosed) {
+		t.Fatalf("statement execution after connection close = %v, want closed-statement error", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second statement close: %v", err)
+	}
+}
+
+func TestStmtCloseIsIdempotent(t *testing.T) {
+	c := &conn{statements: make(map[*stmt]struct{})}
+	s := &stmt{conn: c, native: &nativeStatement{}}
+	c.statements[s] = struct{}{}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("first statement close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second statement close: %v", err)
+	}
+	if !s.closed || s.native != nil {
+		t.Fatalf("statement close did not clear native ownership: closed=%t native=%v", s.closed, s.native)
 	}
 }
 

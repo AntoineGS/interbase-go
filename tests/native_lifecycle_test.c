@@ -127,6 +127,7 @@ static ib_cursor *new_cursor(ib_connection *connection)
 	}
 	cursor->connection = connection;
 	cursor->transaction = &handle_token;
+	cursor->owns_transaction = 1;
 	connection->active_cursor = cursor;
 	return cursor;
 }
@@ -226,6 +227,26 @@ static void test_connection_cleanup(int rollback_failure, int detach_failure)
 	fail_rollback = fail_detach = 0;
 }
 
+static void test_explicit_rollback_reports_failure_without_diagnostic(void)
+{
+	ib_connection connection = {0};
+	char *error = NULL;
+	int result;
+
+	connection.database = &handle_token;
+	connection.transaction = &handle_token;
+	fail_rollback = 1;
+	fail_message_allocation = 1;
+	result = ib_connection_rollback(&connection, &error);
+	fail_message_allocation = 0;
+	check(result == -1, "rollback failure was hidden by diagnostic allocation failure");
+	check(connection.broken, "rollback failure did not invalidate the connection");
+	check(connection.transaction == NULL, "rollback failure retained a stale transaction handle");
+	check(error == NULL, "diagnostic allocation unexpectedly succeeded during rollback failure");
+	ib_error_free(error);
+	fail_rollback = 0;
+}
+
 static void test_select_gate(void)
 {
 	const unsigned char types[] = { isc_info_sql_stmt_select,
@@ -234,6 +255,7 @@ static void test_select_gate(void)
 		isc_info_sql_stmt_exec_procedure, isc_info_sql_stmt_select_for_upd };
 	ib_cursor cursor = {0};
 	size_t i;
+	cursor.statement = &handle_token;
 	for (i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
 		char *error = NULL;
 		int result;
@@ -256,6 +278,7 @@ int main(void)
 	test_connection_cleanup(1, 0);
 	test_connection_cleanup(1, 1);
 	test_connection_cleanup(0, 0);
+	test_explicit_rollback_reports_failure_without_diagnostic();
 	test_select_gate();
 	if (failures != 0) {
 		return EXIT_FAILURE;

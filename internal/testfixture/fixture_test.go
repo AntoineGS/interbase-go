@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,6 +25,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv("INTERBASE_FIXTURE_DESCENDANT") == "1" {
 		time.Sleep(5 * time.Second)
 		os.Exit(0)
+	}
+	if os.Getenv("INTERBASE_FIXTURE_PARENT_DEATH_HELPER") == "1" {
+		parentDeathHelperProcess()
 	}
 	if mode := os.Getenv("INTERBASE_FIXTURE_HELPER"); mode != "" {
 		helperProcess(mode)
@@ -121,6 +125,24 @@ func helperProcess(mode string) {
 		if create {
 			helperCreateDatabase(path, &exitCode)
 			time.Sleep(10 * time.Second)
+		}
+	case "parent-death-isql":
+		if create {
+			helperCreateDatabase(path, &exitCode)
+			readyFile := os.Getenv("INTERBASE_FIXTURE_PARENT_DEATH_READY")
+			if exitCode == 0 && readyFile != "" {
+				ready := fmt.Sprintf("%d\n%s\n", os.Getpid(), path)
+				if err := os.WriteFile(readyFile, []byte(ready), 0o600); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					exitCode = 1
+				}
+			}
+			if exitCode == 0 {
+				fmt.Fprintln(os.Stdout, helperCreateCompletionMarker)
+				for {
+					time.Sleep(time.Hour)
+				}
+			}
 		}
 	case "excessive-output":
 		if create {
@@ -226,6 +248,35 @@ func helperProcess(mode string) {
 		helperDropDatabase(path, &exitCode)
 	}
 	os.Exit(exitCode)
+}
+
+func parentDeathHelperProcess() {
+	readyFile := os.Getenv("INTERBASE_FIXTURE_PARENT_DEATH_READY")
+	_ = os.Unsetenv("INTERBASE_FIXTURE_PARENT_DEATH_HELPER")
+	if err := os.Setenv("INTERBASE_FIXTURE_HELPER", "parent-death-isql"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	isql, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	db, err := Create(context.Background(), Config{
+		ISQL:     isql,
+		User:     "SYSDBA",
+		Password: "masterkey",
+	}, "")
+	if db != nil {
+		_ = db.Close()
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	if readyFile == "" {
+		fmt.Fprintln(os.Stderr, "missing parent-death readiness file")
+	}
+	os.Exit(1)
 }
 
 func helperCreateDatabase(path string, exitCode *int) {
@@ -878,6 +929,107 @@ func TestCreateKillsDescendantWhenWrapperFailsBeforeContextDeadline(t *testing.T
 	}
 }
 
+func TestCreateISQLDiesWhenOwningGoHelperIsKilled(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("parent-death signals are Linux-specific")
+	}
+
+	readyFile := filepath.Join(t.TempDir(), "parent-death.ready")
+	helper := exec.Command(os.Args[0], "-test.run", "^TestFixtureParentDeathHelper$")
+	helper.Env = append(os.Environ(),
+		"INTERBASE_FIXTURE_PARENT_DEATH_HELPER=1",
+		"INTERBASE_FIXTURE_PARENT_DEATH_READY="+readyFile,
+		"INTERBASE_FIXTURE_HELPER=",
+	)
+	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	helper.Stdout = io.Discard
+	helper.Stderr = io.Discard
+	if err := helper.Start(); err != nil {
+		t.Fatalf("start parent-death helper: %v", err)
+	}
+
+	var ready parentDeathReady
+	helperWaited := false
+	t.Cleanup(func() {
+		if !helperWaited && helper.Process != nil {
+			_ = helper.Process.Kill()
+			_ = helper.Wait()
+		}
+		if ready.pid > 0 {
+			if running, _ := processRunning(ready.pid); running {
+				_ = syscall.Kill(-ready.pid, syscall.SIGKILL)
+			}
+		}
+		if ready.path != "" {
+			_ = os.Remove(ready.path)
+			_ = os.Remove(filepath.Dir(ready.path))
+		}
+	})
+
+	var err error
+	ready, err = waitForParentDeathReady(readyFile, 5*time.Second)
+	if err != nil {
+		t.Fatalf("wait for parent-death helper readiness: %v", err)
+	}
+	running, err := processRunning(ready.pid)
+	if err != nil {
+		t.Fatalf("inspect isql test double %d: %v", ready.pid, err)
+	}
+	if !running {
+		t.Fatalf("isql test double %d exited before its Go owner was killed", ready.pid)
+	}
+
+	helperGroup, err := syscall.Getpgid(helper.Process.Pid)
+	if err != nil {
+		t.Fatalf("get parent-death helper process group: %v", err)
+	}
+	isqlGroup, err := syscall.Getpgid(ready.pid)
+	if err != nil {
+		t.Fatalf("get isql test-double process group: %v", err)
+	}
+	if helperGroup == isqlGroup {
+		t.Fatalf("isql test double remained in the Go helper process group %d", helperGroup)
+	}
+
+	if err := syscall.Kill(-helper.Process.Pid, syscall.SIGTERM); err != nil {
+		t.Fatalf("kill parent-death helper process group: %v", err)
+	}
+	if err := helper.Wait(); err == nil {
+		t.Fatal("parent-death helper exited successfully after SIGTERM")
+	}
+	helperWaited = true
+
+	if err := waitForProcessExit(ready.pid, 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(ready.path); err != nil {
+		t.Fatalf("owned database file after helper death: %v", err)
+	}
+	directory := filepath.Dir(ready.path)
+	if _, err := os.Stat(directory); err != nil {
+		t.Fatalf("owned fixture directory after helper death: %v", err)
+	}
+
+	cfg := helperConfig(t, "success")
+	db := &Database{
+		Path:           ready.path,
+		config:         cfg,
+		directory:      directory,
+		ownedPath:      ready.path,
+		databaseExists: true,
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close fixture after helper death: %v", err)
+	}
+	if _, err := os.Stat(ready.path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned database file remains after cleanup: %v", err)
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned fixture directory remains after cleanup: %v", err)
+	}
+}
+
 func TestCreateOmitsAllOutputWhenCaptureLimitIsExceeded(t *testing.T) {
 	password := "boundary-secret'password"
 	escaped := strings.ReplaceAll(password, "'", "''")
@@ -980,4 +1132,79 @@ func helperConfig(t *testing.T, mode string) Config {
 	}
 	t.Setenv("INTERBASE_FIXTURE_HELPER", mode)
 	return Config{ISQL: isql, User: "SYSDBA", Password: "masterkey"}
+}
+
+type parentDeathReady struct {
+	pid  int
+	path string
+}
+
+func waitForParentDeathReady(path string, timeout time.Duration) (parentDeathReady, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		contents, err := os.ReadFile(path)
+		if err == nil {
+			lines := strings.Split(strings.TrimSpace(string(contents)), "\n")
+			if len(lines) == 2 {
+				pid, parseErr := strconv.Atoi(strings.TrimSpace(lines[0]))
+				if parseErr == nil && pid > 0 && filepath.IsAbs(lines[1]) {
+					return parentDeathReady{pid: pid, path: lines[1]}, nil
+				}
+				lastErr = fmt.Errorf("invalid readiness contents %q", contents)
+			} else {
+				lastErr = fmt.Errorf("incomplete readiness contents %q", contents)
+			}
+		} else {
+			lastErr = err
+		}
+		if !time.Now().Before(deadline) {
+			return parentDeathReady{}, fmt.Errorf("readiness did not become valid before timeout: %w", lastErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForProcessExit(pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		running, err := processRunning(pid)
+		if err != nil {
+			return fmt.Errorf("inspect process %d while waiting for exit: %w", pid, err)
+		}
+		if !running {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("process %d remained alive for %s after its Go owner was killed", pid, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func processRunning(pid int) (bool, error) {
+	err := syscall.Kill(pid, 0)
+	if errors.Is(err, syscall.ESRCH) {
+		return false, nil
+	}
+	if err != nil && !errors.Is(err, syscall.EPERM) {
+		return false, err
+	}
+
+	contents, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
+	}
+	closeParen := strings.LastIndexByte(string(contents), ')')
+	if closeParen < 0 || closeParen+2 >= len(contents) {
+		return false, fmt.Errorf("malformed /proc/%d/stat", pid)
+	}
+	fields := strings.Fields(string(contents[closeParen+2:]))
+	if len(fields) == 0 {
+		return false, fmt.Errorf("malformed /proc/%d/stat state", pid)
+	}
+	return fields[0] != "Z", nil
 }

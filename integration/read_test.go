@@ -714,15 +714,21 @@ func TestReadSelectableBudgetProcedure(t *testing.T) {
 	finishReadRows(t, rows)
 }
 
-// Source mapping: TestCharsetConversion.test_utf82win1250.
+// Go-specific cast regression; the upstream persisted-row contract is covered
+// by TestCharsetUTF8InsertReadAcrossAttachments.
 func TestReadWIN1250UTF8RoundTrip(t *testing.T) {
 	db := newDatabase(t)
 	ctx := readContext(t)
 
 	want := "\u011b\u0161\u010d\u0159\u017e\u00fd\u00e1\u00ed\u00e9\u00fa\u016f\u010f\u0165\u0148\u00f3\u011a\u0160\u010c\u0158\u017d\u00dd\u00c1\u00cd\u00c9\u00da\u016e\u010e\u0164\u0147\u00d3"
+	// Declare the UTF8 input before converting it to WIN1250. Inferring a
+	// WIN1250 parameter on this UTF8 attachment fails in the native API too.
 	rows, err := db.QueryContext(ctx, `
 		SELECT CAST(
-			CAST(? AS VARCHAR(40) CHARACTER SET WIN1250)
+			CAST(
+				CAST(? AS VARCHAR(40) CHARACTER SET UTF8)
+				AS VARCHAR(40) CHARACTER SET WIN1250
+			)
 			AS VARCHAR(40) CHARACTER SET UTF8
 		) FROM RDB$DATABASE`, want)
 	if err != nil {
@@ -740,6 +746,37 @@ func TestReadWIN1250UTF8RoundTrip(t *testing.T) {
 		t.Fatalf("WIN1250/UTF8 round trip = %q, want %q", got, want)
 	}
 	finishReadRows(t, rows)
+}
+
+func TestReadWIN1250UTF8FixedCharPadding(t *testing.T) {
+	db := newDatabaseWithCharset(t, "WIN1250")
+	ctx := readContext(t)
+
+	var got string
+	err := db.QueryRowContext(ctx,
+		"SELECT CAST(? AS CHAR(5) CHARACTER SET WIN1250) FROM RDB$DATABASE", "ě").Scan(&got)
+	if err != nil {
+		t.Fatalf("WIN1250 fixed CHAR query: %v", err)
+	}
+	if got != "ě    " {
+		t.Fatalf("WIN1250 fixed CHAR = %q, want %q", got, "ě    ")
+	}
+}
+
+func TestReadWIN1250UTF8SQLLiteral(t *testing.T) {
+	db := newDatabaseWithCharset(t, "WIN1250")
+	ctx := readContext(t)
+	want := "ěščřž"
+
+	var got string
+	err := db.QueryRowContext(ctx,
+		"SELECT 'ěščřž' FROM RDB$DATABASE").Scan(&got)
+	if err != nil {
+		t.Fatalf("WIN1250 SQL literal query: %v", err)
+	}
+	if got != want {
+		t.Fatalf("WIN1250 SQL literal = %q, want %q", got, want)
+	}
 }
 
 // Source mapping: TestBugs.test_pyib_25. This is a read-side cast contract;

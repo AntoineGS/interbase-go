@@ -6,6 +6,7 @@
 package integration_test
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"reflect"
@@ -248,6 +249,50 @@ func TestTransactionReadOnlyOption(t *testing.T) {
 	}
 }
 
+func TestTransactionRejectsSQLControlAndRollbackUndoesInsert(t *testing.T) {
+	db := newDatabase(t)
+	ctx := readContext(t)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	registerTransactionRollback(t, tx)
+
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT go_allowed"); err != nil {
+		t.Fatalf("savepoint should remain executable: %v", err)
+	}
+	if result, err := tx.ExecContext(ctx,
+		"INSERT INTO GO_WRITE (ID, WRITE_VALUE, LABEL) VALUES (?, ?, ?)",
+		int64(10), int64(99), "must roll back"); err != nil {
+		t.Fatalf("transaction insert: %v", err)
+	} else {
+		requireRowsAffected(t, result, 1)
+	}
+
+	for _, query := range []string{"COMMIT", "ROLLBACK", "START TRANSACTION"} {
+		if _, err := tx.ExecContext(ctx, query); err == nil {
+			t.Fatalf("transaction-control SQL %q unexpectedly succeeded", query)
+		}
+	}
+	stmt, err := tx.PrepareContext(ctx, "COMMIT")
+	if err != nil {
+		t.Fatalf("prepare transaction-control SQL: %v", err)
+	}
+	if _, err := stmt.ExecContext(ctx); err == nil {
+		t.Fatal("prepared transaction-control SQL unexpectedly succeeded")
+	}
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("close transaction-control statement: %v", err)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback transaction: %v", err)
+	}
+	if got := queryWriteRows(t, db, ctx); len(got) != 0 {
+		t.Fatalf("rows after rejected SQL control and rollback = %#v, want no rows", got)
+	}
+}
+
 // Source mapping: TestTransaction.test_cursor and
 // TestPreparedStatement.test_execution.
 func TestTransactionPrepareContextCommit(t *testing.T) {
@@ -348,6 +393,121 @@ func TestTransactionStmtContextRollback(t *testing.T) {
 	}
 	if got := queryWriteRows(t, db, ctx); len(got) != 0 {
 		t.Fatalf("rows after prepared rollback = %#v, want no rows", got)
+	}
+}
+
+func TestTransactionCompletionClosesPreparedCursorSafely(t *testing.T) {
+	db := newDatabase(t)
+	ctx := readContext(t)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	registerTransactionRollback(t, tx)
+	stmt, err := tx.PrepareContext(ctx,
+		"SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?")
+	if err != nil {
+		t.Fatalf("prepare transaction SELECT: %v", err)
+	}
+	t.Cleanup(func() { _ = stmt.Close() })
+	rows, err := stmt.QueryContext(ctx, int64(1))
+	if err != nil {
+		t.Fatalf("open prepared cursor: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit with active prepared cursor: %v", err)
+	}
+	if rows.Next() {
+		t.Fatal("prepared cursor returned a row after its transaction completed")
+	}
+	if err := rows.Err(); err != nil && !errors.Is(err, sql.ErrTxDone) &&
+		!errors.Is(err, context.Canceled) {
+		t.Fatalf("prepared cursor error after transaction completion: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close completed prepared cursor: %v", err)
+	}
+}
+
+func TestTransactionPreparedQueryReusesCursorBeforeCompletion(t *testing.T) {
+	db := newDatabase(t)
+	ctx := readContext(t)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin transaction: %v", err)
+	}
+	registerTransactionRollback(t, tx)
+	stmt, err := tx.PrepareContext(ctx,
+		"SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?")
+	if err != nil {
+		t.Fatalf("prepare transaction SELECT: %v", err)
+	}
+	t.Cleanup(func() { _ = stmt.Close() })
+
+	for iteration := 0; iteration < 3; iteration++ {
+		rows, err := stmt.QueryContext(ctx, int64(1))
+		if err != nil {
+			t.Fatalf("early-close query %d: %v", iteration, err)
+		}
+		if !rows.Next() {
+			t.Fatalf("early-close query %d returned no row: %v", iteration, rows.Err())
+		}
+		var country string
+		if err := rows.Scan(&country); err != nil {
+			t.Fatalf("early-close scan %d: %v", iteration, err)
+		}
+		if country != "USA" {
+			t.Fatalf("early-close country %d = %q, want %q", iteration, country, "USA")
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("early-close rows.Close %d: %v", iteration, err)
+		}
+	}
+
+	rows, err := stmt.QueryContext(ctx, int64(1))
+	if err != nil {
+		t.Fatalf("EOF query: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("EOF query returned no row: %v", rows.Err())
+	}
+	var country string
+	if err := rows.Scan(&country); err != nil {
+		t.Fatalf("EOF scan: %v", err)
+	}
+	if country != "USA" {
+		t.Fatalf("EOF country = %q, want %q", country, "USA")
+	}
+	if rows.Next() {
+		t.Fatal("EOF query returned more than one row")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("EOF query error: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("EOF rows.Close: %v", err)
+	}
+
+	rows, err = stmt.QueryContext(ctx, int64(1))
+	if err != nil {
+		t.Fatalf("post-EOF query before transaction completion: %v", err)
+	}
+	if !rows.Next() {
+		t.Fatalf("post-EOF query returned no row: %v", rows.Err())
+	}
+	if err := rows.Scan(&country); err != nil {
+		t.Fatalf("post-EOF scan: %v", err)
+	}
+	if country != "USA" {
+		t.Fatalf("post-EOF country = %q, want %q", country, "USA")
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("post-EOF rows.Close: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit after prepared cursor reuse: %v", err)
 	}
 }
 

@@ -35,6 +35,11 @@ func cleanupDatabaseAndFixture(closeDatabase, closeFixture func() error, fixture
 
 func newDatabase(t *testing.T) *sql.DB {
 	t.Helper()
+	return newDatabaseWithCharset(t, "")
+}
+
+func newDatabaseWithCharset(t *testing.T, charset string) *sql.DB {
+	t.Helper()
 
 	cfg, err := testfixture.FromEnv()
 	if err != nil {
@@ -65,6 +70,7 @@ func newDatabase(t *testing.T) *sql.DB {
 		Database: fixture.Path,
 		User:     cfg.User,
 		Password: cfg.Password,
+		Charset:  charset,
 	})
 	if err != nil {
 		t.Fatalf("fixture connector: %v", err)
