@@ -138,6 +138,7 @@ static void test_start_failure(void)
 	ib_bindings bindings = {0};
 	const char query[] = "SELECT 1 FROM RDB$DATABASE";
 	char *error = NULL;
+	connection.dialect = SQL_DIALECT_V5;
 	connection.database = &handle_token;
 	rollback_calls = 0;
 	check(ib_connection_query(&connection, query, sizeof(query) - 1U,
@@ -152,9 +153,11 @@ static void test_start_failure(void)
 static void test_cursor_cleanup(int drop_failure)
 {
 	ib_connection connection = {0};
-	ib_cursor *cursor = new_cursor(&connection);
+	ib_cursor *cursor;
 	char *error = NULL;
 	int result;
+	connection.dialect = SQL_DIALECT_V5;
+	cursor = new_cursor(&connection);
 	cursor->statement = &handle_token;
 	fail_drop = drop_failure;
 	fail_rollback = !drop_failure;
@@ -174,8 +177,10 @@ static void test_cursor_cleanup(int drop_failure)
 static void test_failed_query_cleanup(int preserve_primary)
 {
 	ib_connection connection = {0};
-	ib_cursor *cursor = new_cursor(&connection);
+	ib_cursor *cursor;
 	char *error = NULL;
+	connection.dialect = SQL_DIALECT_V5;
+	cursor = new_cursor(&connection);
 	if (preserve_primary) {
 		(void) ib_fail(&error, "original query failure");
 		if (error == NULL) {
@@ -209,6 +214,7 @@ static void test_connection_cleanup(int rollback_failure, int detach_failure)
 	if (connection == NULL) {
 		abort();
 	}
+	connection->dialect = SQL_DIALECT_V5;
 	connection->database = &handle_token;
 	if (rollback_failure) {
 		(void) new_cursor(connection);
@@ -233,6 +239,7 @@ static void test_explicit_rollback_reports_failure_without_diagnostic(void)
 	char *error = NULL;
 	int result;
 
+	connection.dialect = SQL_DIALECT_V5;
 	connection.database = &handle_token;
 	connection.transaction = &handle_token;
 	fail_rollback = 1;

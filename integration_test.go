@@ -24,6 +24,7 @@ func liveDB(t *testing.T) *sql.DB {
 	}
 	connector, err := interbase.NewConnector(interbase.Config{
 		Database: database, User: os.Getenv("INTERBASE_USER"), Password: password,
+		Dialect: 1,
 	})
 	if err != nil {
 		t.Fatal(err)

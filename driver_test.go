@@ -6,6 +6,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"math"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -66,6 +68,54 @@ func TestConfigCharsetNormalizesSupportedValues(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("normalizeCharset(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfigDialectDefaultsAndValidation(t *testing.T) {
+	field, ok := reflect.TypeOf(Config{}).FieldByName("Dialect")
+	if !ok {
+		t.Fatal("Config.Dialect is missing")
+	}
+	if field.Type != reflect.TypeOf(int(0)) {
+		t.Fatalf("Config.Dialect type = %v, want int", field.Type)
+	}
+
+	base := Config{
+		Database: "/tmp/example.ib",
+		User:     "alice",
+		Password: "super-secret",
+	}
+	for _, test := range []struct {
+		name  string
+		value int
+		want  int
+	}{
+		{name: "zero selects dialect three", value: 0, want: 3},
+		{name: "explicit dialect one", value: 1, want: 1},
+		{name: "explicit dialect three", value: 3, want: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base
+			reflect.ValueOf(&cfg).Elem().FieldByName("Dialect").SetInt(int64(test.value))
+			opened, err := NewConnector(cfg)
+			if err != nil {
+				t.Fatalf("NewConnector returned error: %v", err)
+			}
+			got := int(reflect.ValueOf(opened.(*connector).cfg).FieldByName("Dialect").Int())
+			if got != test.want {
+				t.Fatalf("resolved dialect = %d, want %d", got, test.want)
+			}
+		})
+	}
+
+	for _, value := range []int{-1, 2, 4, 99} {
+		t.Run("reject-"+strconv.Itoa(value), func(t *testing.T) {
+			cfg := base
+			reflect.ValueOf(&cfg).Elem().FieldByName("Dialect").SetInt(int64(value))
+			if connector, err := NewConnector(cfg); connector != nil || err == nil {
+				t.Fatalf("NewConnector(%d) = (%v, %v), want upfront validation error", value, connector, err)
 			}
 		})
 	}

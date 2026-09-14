@@ -35,16 +35,29 @@ func cleanupDatabaseAndFixture(closeDatabase, closeFixture func() error, fixture
 
 func newDatabase(t *testing.T) *sql.DB {
 	t.Helper()
-	return newDatabaseWithCharset(t, "")
+	// Existing contracts are Dialect 1 contracts; pass it explicitly so the
+	// public zero-value default can be exercised through newDatabaseWithDialect.
+	return newDatabaseWithDialectAndCharset(t, 1, "")
 }
 
 func newDatabaseWithCharset(t *testing.T, charset string) *sql.DB {
+	t.Helper()
+	return newDatabaseWithDialectAndCharset(t, 1, charset)
+}
+
+func newDatabaseWithDialect(t *testing.T, dialect int) *sql.DB {
+	t.Helper()
+	return newDatabaseWithDialectAndCharset(t, dialect, "")
+}
+
+func newDatabaseWithDialectAndCharset(t *testing.T, dialect int, charset string) *sql.DB {
 	t.Helper()
 
 	cfg, err := testfixture.FromEnv()
 	if err != nil {
 		t.Fatalf("fixture configuration: %v", err)
 	}
+	cfg.Dialect = dialect
 
 	ctx, cancel := context.WithTimeout(context.Background(), fixtureSetupTimeout)
 	defer cancel()
@@ -71,6 +84,7 @@ func newDatabaseWithCharset(t *testing.T, charset string) *sql.DB {
 		User:     cfg.User,
 		Password: cfg.Password,
 		Charset:  charset,
+		Dialect:  dialect,
 	})
 	if err != nil {
 		t.Fatalf("fixture connector: %v", err)
@@ -93,6 +107,7 @@ func TestPingDatabaseUsesProvidedContext(t *testing.T) {
 	connector, err := interbase.NewConnector(interbase.Config{
 		Database: "/tmp/testfixture-no-database.ib",
 		User:     "SYSDBA",
+		Dialect:  1,
 	})
 	if err != nil {
 		t.Fatal(err)

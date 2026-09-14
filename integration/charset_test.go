@@ -22,6 +22,7 @@ func TestCharsetUTF8InsertReadAcrossAttachments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fixture configuration: %v", err)
 	}
+	cfg.Dialect = 1
 	setupContext, cancel := context.WithTimeout(context.Background(), fixtureSetupTimeout)
 	defer cancel()
 	// Only the five columns used by the upstream test are needed here; their
@@ -60,6 +61,7 @@ func TestCharsetUTF8InsertReadAcrossAttachments(t *testing.T) {
 			User:     cfg.User,
 			Password: cfg.Password,
 			Charset:  charset,
+			Dialect:  1,
 		})
 		if err != nil {
 			t.Fatalf("%s connector: %v", charset, err)

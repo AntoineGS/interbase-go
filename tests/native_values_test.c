@@ -186,6 +186,189 @@ static void test_fixed_text_output_is_space_initialized(void)
 	ib_free_sqlda(cursor.output);
 }
 
+static void test_octets_bind_and_decode_as_bytes(void)
+{
+	static const char payload[] = { 0, 1, 127, (char) 0x80, (char) 0xff };
+	ib_connection connection;
+	ib_cursor cursor;
+	ib_bindings *bindings;
+	ib_value_view view;
+	unsigned short varying_length;
+	char *error;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	connection.dialect = SQL_DIALECT_V5;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.input = ib_alloc_sqlda(2);
+	require_condition(cursor.input != NULL, "OCTETS input SQLDA allocation failed");
+	cursor.input->sqld = 2;
+	cursor.input->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.input->sqlvar[0].sqlsubtype = 1; /* InterBase OCTETS charset. */
+	cursor.input->sqlvar[0].sqllen = sizeof(payload);
+	cursor.input->sqlvar[1].sqltype = SQL_VARYING | 1;
+	cursor.input->sqlvar[1].sqlsubtype = 1;
+	cursor.input->sqlvar[1].sqllen = sizeof(payload);
+	error = NULL;
+	bindings = ib_bindings_new(2, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"OCTETS binding allocation failed");
+	require_success(ib_bindings_set_bytes(bindings, 0, payload, sizeof(payload), &error),
+		error, "OCTETS fixed binding setup failed");
+	require_success(ib_bindings_set_bytes(bindings, 1, payload, sizeof(payload), &error),
+		error, "OCTETS varying binding setup failed");
+	require_success(ib_bind_input(&cursor, bindings, &error), error,
+		"OCTETS byte binding failed");
+	require_condition(*cursor.input->sqlvar[0].sqlind == 0 &&
+		memcmp(cursor.input->sqlvar[0].sqldata, payload, sizeof(payload)) == 0,
+		"OCTETS fixed binding changed bytes");
+	memcpy(&varying_length, cursor.input->sqlvar[1].sqldata, sizeof(varying_length));
+	require_condition(varying_length == sizeof(payload) &&
+		memcmp(cursor.input->sqlvar[1].sqldata + sizeof(varying_length), payload,
+			sizeof(payload)) == 0, "OCTETS varying binding changed bytes");
+	ib_bindings_free(bindings);
+	ib_free_sqlda(cursor.input);
+	cursor.input = NULL;
+
+	cursor.output = ib_alloc_sqlda(2);
+	require_condition(cursor.output != NULL, "OCTETS output SQLDA allocation failed");
+	cursor.output->sqld = 2;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = 1;
+	cursor.output->sqlvar[0].sqllen = sizeof(payload);
+	cursor.output->sqlvar[1].sqltype = SQL_VARYING | 1;
+	cursor.output->sqlvar[1].sqlsubtype = 1;
+	cursor.output->sqlvar[1].sqllen = sizeof(payload);
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"OCTETS output storage allocation failed");
+	memcpy(cursor.output->sqlvar[0].sqldata, payload, sizeof(payload));
+	varying_length = sizeof(payload);
+	memcpy(cursor.output->sqlvar[1].sqldata, &varying_length, sizeof(varying_length));
+	memcpy(cursor.output->sqlvar[1].sqldata + sizeof(varying_length), payload,
+		sizeof(payload));
+	cursor.fetched = 1;
+	error = NULL;
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"OCTETS fixed decode failed");
+	require_condition(view.kind == IB_VALUE_BYTES && view.length == sizeof(payload) &&
+		memcmp(view.bytes, payload, sizeof(payload)) == 0,
+		"OCTETS fixed value was not returned as unchanged bytes");
+	error = NULL;
+	require_success(ib_cursor_column(&cursor, 1, &view, &error), error,
+		"OCTETS varying decode failed");
+	require_condition(view.kind == IB_VALUE_BYTES && view.length == sizeof(payload) &&
+		memcmp(view.bytes, payload, sizeof(payload)) == 0,
+		"OCTETS varying value was not returned as unchanged bytes");
+	ib_free_sqlda(cursor.output);
+}
+
+static int bind_scaled_string(const char *text, short scale, short precision,
+	int64_t *raw, char **error)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	ib_bindings *bindings;
+	int result;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.dialect = SQL_DIALECT_V6;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.input = ib_alloc_sqlda(1);
+	if (cursor.input == NULL) {
+		return -1;
+	}
+	cursor.input->sqld = 1;
+	cursor.input->sqlvar[0].sqltype = SQL_INT64 | 1;
+	cursor.input->sqlvar[0].sqlsubtype = 1;
+	cursor.input->sqlvar[0].sqlscale = scale;
+	cursor.input->sqlvar[0].sqlprecision = precision;
+	cursor.input->sqlvar[0].sqllen = (short) sizeof(ISC_INT64);
+	bindings = ib_bindings_new(1, error);
+	if (bindings == NULL) {
+		ib_free_sqlda(cursor.input);
+		return -1;
+	}
+	result = ib_bindings_set_string(bindings, 0, text, strlen(text), error);
+	if (result == 0) {
+		result = ib_bind_input(&cursor, bindings, error);
+	}
+	if (result == 0 && raw != NULL) {
+		memcpy(raw, cursor.input->sqlvar[0].sqldata, sizeof(*raw));
+	}
+	ib_bindings_free(bindings);
+	ib_free_sqlda(cursor.input);
+	return result;
+}
+
+static void test_exact_scaled_integer_binding(void)
+{
+	static const int64_t wide_raw = INT64_C(123456789012345678);
+	static const struct {
+		const char *name;
+		const char *text;
+		short scale;
+		short precision;
+		int64_t want;
+	} accepted[] = {
+		{"wide positive", "12345678901234.5678", -4, 18, wide_raw},
+		{"wide negative", "-12345678901234.5678", -4, 18, -wide_raw},
+		{"trailing zeroes", "1.230000", -2, 18, 123},
+		{"precision maximum", "999999999999999999", 0, 18,
+			INT64_C(999999999999999999)},
+		{"precision negative maximum", "-999999999999999999", 0, 18,
+			-INT64_C(999999999999999999)},
+		{"int64 maximum", "9223372036854775807", 0, 0, INT64_MAX},
+		{"int64 minimum", "-9223372036854775808", 0, 0, INT64_MIN},
+		{"positive scaled maximum", "922337203685477580.7", -1, 0, INT64_MAX},
+		{"negative scaled minimum", "-922337203685477580.8", -1, 0, INT64_MIN},
+		{"positive scaled final digit", "922337203685477580.6", -1, 0,
+			INT64_MAX - INT64_C(1)},
+		{"negative scaled final digit", "-922337203685477580.7", -1, 0,
+			INT64_MIN + INT64_C(1)}
+	};
+	static const struct {
+		const char *name;
+		const char *text;
+		short scale;
+		short precision;
+	} rejected[] = {
+		{"positive int64 overflow", "9223372036854775808", 0, 0},
+		{"negative int64 overflow", "-9223372036854775809", 0, 0},
+		{"positive scaled final digit overflow", "922337203685477580.8", -1, 0},
+		{"negative scaled final digit overflow", "-922337203685477580.9", -1, 0},
+		{"positive scale padding overflow", "9223372036854775807", -1, 0},
+		{"negative scale padding overflow", "-9223372036854775808", -1, 0},
+		{"positive precision overflow", "1000000000000000000", 0, 18},
+		{"negative precision overflow", "-1000000000000000000", 0, 18},
+		{"nonzero excess fraction", "1.001", -2, 18},
+		{"scientific notation", "1e2", 0, 0}
+	};
+	size_t index;
+
+	for (index = 0U; index < sizeof(accepted) / sizeof(accepted[0]); index++) {
+		char *error = NULL;
+		int64_t raw = 0;
+		int result = bind_scaled_string(accepted[index].text, accepted[index].scale,
+			accepted[index].precision, &raw, &error);
+
+		require_condition(result == 0 && error == NULL && raw == accepted[index].want,
+			accepted[index].name);
+		ib_error_free(error);
+	}
+	for (index = 0U; index < sizeof(rejected) / sizeof(rejected[0]); index++) {
+		char *error = NULL;
+		int64_t raw = 0;
+		int result = bind_scaled_string(rejected[index].text, rejected[index].scale,
+			rejected[index].precision, &raw, &error);
+
+		require_condition(result != 0 && error != NULL, rejected[index].name);
+		ib_error_free(error);
+	}
+}
+
 static void test_text_binding_converts_to_described_charset(void)
 {
 	ib_cursor cursor;
@@ -196,6 +379,7 @@ static void test_text_binding_converts_to_described_charset(void)
 
 	memset(&connection, 0, sizeof(connection));
 	connection.charset = IB_CHARSET_UTF8;
+	connection.dialect = SQL_DIALECT_V5;
 	memset(&cursor, 0, sizeof(cursor));
 	cursor.connection = &connection;
 	cursor.input = ib_alloc_sqlda(1);
@@ -243,6 +427,7 @@ static void test_binding_converts_to_described_charset_capacity(void)
 
 	memset(&connection, 0, sizeof(connection));
 	connection.charset = IB_CHARSET_UTF8;
+	connection.dialect = SQL_DIALECT_V5;
 	memset(&cursor, 0, sizeof(cursor));
 	cursor.connection = &connection;
 	cursor.input = ib_alloc_sqlda(1);
@@ -286,6 +471,7 @@ static void test_configured_charset_conversion(void)
 
 	memset(&connection, 0, sizeof(connection));
 	connection.charset = 51; /* InterBase WIN1250. */
+	connection.dialect = SQL_DIALECT_V5;
 	memset(&cursor, 0, sizeof(cursor));
 	cursor.connection = &connection;
 	cursor.input = ib_alloc_sqlda(1);
@@ -427,12 +613,88 @@ static void test_timestamp_and_rejections(void)
 	ib_free_sqlda(cursor.output);
 }
 
+static int bind_temporal_for_type(short type, int64_t year, char **error)
+{
+	ib_cursor cursor;
+	ib_bindings *bindings;
+	int result;
+
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.input = ib_alloc_sqlda(1);
+	if (cursor.input == NULL) {
+		return -1;
+	}
+	cursor.input->sqld = 1;
+	cursor.input->sqlvar[0].sqltype = (short) (type | 1);
+	bindings = ib_bindings_new(1, error);
+	if (bindings == NULL) {
+		ib_free_sqlda(cursor.input);
+		return -1;
+	}
+	result = ib_bindings_set_timestamp(bindings, 0, year, 1, 1, 23, 59, 59, 0,
+		error);
+	if (result == 0) {
+		result = ib_bind_input(&cursor, bindings, error);
+	}
+	ib_bindings_free(bindings);
+	ib_free_sqlda(cursor.input);
+	return result;
+}
+
+static void test_temporal_binding_target_validation(void)
+{
+	ib_bindings *bindings;
+	char *error = NULL;
+	int result;
+
+	result = bind_temporal_for_type(SQL_TYPE_TIME, 0, &error);
+	require_condition(result == 0 && error == NULL,
+		"year-zero TIME binding was rejected");
+	ib_error_free(error);
+
+	error = NULL;
+	result = bind_temporal_for_type(SQL_TYPE_TIME, INT64_C(3000000000), &error);
+	require_condition(result == 0 && error == NULL,
+		"large-year TIME binding was rejected or truncated");
+	ib_error_free(error);
+
+	error = NULL;
+	bindings = ib_bindings_new(1, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"large-year timestamp binding allocation failed");
+	if (bindings != NULL) {
+		result = ib_bindings_set_timestamp(bindings, 0, INT64_C(3000000000),
+			1, 1, 23, 59, 59, 0, &error);
+		require_condition(result == 0 && error == NULL,
+			"large-year timestamp binding setup failed");
+		require_condition(bindings->values[0].year == INT64_C(3000000000),
+			"large-year timestamp binding was narrowed before native validation");
+	}
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+
+	error = NULL;
+	result = bind_temporal_for_type(SQL_TYPE_DATE, 0, &error);
+	require_condition(result != 0 && error != NULL,
+		"year-zero DATE binding was accepted");
+	ib_error_free(error);
+
+	error = NULL;
+	result = bind_temporal_for_type(SQL_TIMESTAMP, 0, &error);
+	require_condition(result != 0 && error != NULL,
+		"year-zero TIMESTAMP binding was accepted");
+	ib_error_free(error);
+}
+
 int main(void)
 {
 	test_positional_bind_values();
 	test_column_decoding();
 	test_utf8_fixed_text_and_scaled_float_decoding();
 	test_fixed_text_output_is_space_initialized();
+	test_octets_bind_and_decode_as_bytes();
+	test_exact_scaled_integer_binding();
+	test_temporal_binding_target_validation();
 	test_text_binding_converts_to_described_charset();
 	test_binding_converts_to_described_charset_capacity();
 	test_configured_charset_conversion();

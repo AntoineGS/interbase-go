@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,15 +16,18 @@ import (
 
 // Config contains the connection settings for an InterBase attachment.
 //
-// The driver uses Dialect 1. Charset is the InterBase attachment character
-// set; an empty value selects UTF8. Passwords are sent only while opening an
-// attachment (and are retained only for error redaction); they are never
-// included in driver errors.
+// Dialect selects the SQL dialect for the attachment. Zero selects Dialect 3;
+// Dialects 1 and 3 are supported. Set Dialect to 1 to opt into Dialect 1.
+// Charset is the InterBase attachment
+// character set; an empty value selects UTF8. Passwords are sent only while
+// opening an attachment (and are retained only for error redaction); they are
+// never included in driver errors.
 type Config struct {
 	Database string
 	User     string
 	Password string
 	Charset  string
+	Dialect  int
 }
 
 var (
@@ -38,15 +42,23 @@ func NewConnector(cfg Config) (driver.Connector, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
+	dialect, err := normalizeDialect(cfg.Dialect)
+	if err != nil {
+		return nil, err
+	}
 	charset, err := normalizeCharset(cfg.Charset)
 	if err != nil {
 		return nil, err
 	}
+	cfg.Dialect = dialect
 	cfg.Charset = charset
 	return &connector{cfg: cfg}, nil
 }
 
 func validateConfig(cfg Config) error {
+	if _, err := normalizeDialect(cfg.Dialect); err != nil {
+		return err
+	}
 	if cfg.Database == "" {
 		return errors.New("interbase: database is required")
 	}
@@ -66,6 +78,17 @@ func validateConfig(cfg Config) error {
 		return err
 	}
 	return nil
+}
+
+func normalizeDialect(dialect int) (int, error) {
+	switch dialect {
+	case 0, 3:
+		return 3, nil
+	case 1:
+		return 1, nil
+	default:
+		return 0, fmt.Errorf("interbase: unsupported SQL dialect %d; want 1 or 3", dialect)
+	}
 }
 
 func normalizeCharset(charset string) (string, error) {
@@ -434,14 +457,15 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 		return nil, sanitizeError("query prepared statement", err, conn.database, conn.password)
 	}
 	result := &rows{
-		conn:    conn,
-		native:  nativeRows,
-		ctx:     ctx,
-		columns: columns,
+		conn:     conn,
+		native:   nativeRows,
+		ctx:      ctx,
+		columns:  columns,
+		metadata: append([]columnMetadata(nil), nativeRows.metadata...),
 	}
 	conn.activeRows = result
 	if err := contextError(ctx); err != nil {
-		closeErr := result.closeLocked()
+		closeErr := result.abortLocked()
 		if closeErr != nil {
 			return nil, errors.Join(err, closeErr)
 		}
@@ -716,14 +740,15 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 		return nil, sanitizeError("query", err, c.database, c.password)
 	}
 	result := &rows{
-		conn:    c,
-		native:  nativeRows,
-		ctx:     ctx,
-		columns: columns,
+		conn:     c,
+		native:   nativeRows,
+		ctx:      ctx,
+		columns:  columns,
+		metadata: append([]columnMetadata(nil), nativeRows.metadata...),
 	}
 	c.activeRows = result
 	if err := contextError(ctx); err != nil {
-		closeErr := result.closeLocked()
+		closeErr := result.abortLocked()
 		if closeErr != nil {
 			return nil, errors.Join(err, closeErr)
 		}
@@ -795,15 +820,54 @@ func (c *conn) invalidateLocked() {
 }
 
 type rows struct {
-	conn    *conn
-	native  *nativeCursor
-	ctx     context.Context
-	columns []string
-	closed  bool
+	conn     *conn
+	native   *nativeCursor
+	ctx      context.Context
+	columns  []string
+	metadata []columnMetadata
+	closed   bool
 }
 
 func (r *rows) Columns() []string {
 	return append([]string(nil), r.columns...)
+}
+
+func (r *rows) ColumnTypeDatabaseTypeName(index int) string {
+	if r == nil || index < 0 || index >= len(r.metadata) {
+		return ""
+	}
+	return r.metadata[index].databaseTypeName
+}
+
+func (r *rows) ColumnTypeLength(index int) (int64, bool) {
+	if r == nil || index < 0 || index >= len(r.metadata) {
+		return 0, false
+	}
+	metadata := r.metadata[index]
+	return metadata.length, metadata.hasLength
+}
+
+func (r *rows) ColumnTypeNullable(index int) (bool, bool) {
+	if r == nil || index < 0 || index >= len(r.metadata) {
+		return false, false
+	}
+	metadata := r.metadata[index]
+	return metadata.nullable, metadata.hasNullable
+}
+
+func (r *rows) ColumnTypePrecisionScale(index int) (int64, int64, bool) {
+	if r == nil || index < 0 || index >= len(r.metadata) {
+		return 0, 0, false
+	}
+	metadata := r.metadata[index]
+	return metadata.precision, metadata.scale, metadata.hasPrecision
+}
+
+func (r *rows) ColumnTypeScanType(index int) reflect.Type {
+	if r == nil || index < 0 || index >= len(r.metadata) {
+		return reflect.TypeOf((*any)(nil)).Elem()
+	}
+	return r.metadata[index].scanType
 }
 
 func (r *rows) Next(dest []driver.Value) error {
@@ -819,19 +883,20 @@ func (r *rows) Next(dest []driver.Value) error {
 		return driver.ErrBadConn
 	}
 	if err := contextError(r.ctx); err != nil {
-		return errors.Join(err, r.closeLocked())
+		return errors.Join(err, r.abortLocked())
 	}
 	if len(dest) < len(r.columns) {
-		return errors.New("interbase: destination has fewer values than result columns")
+		err := errors.New("interbase: destination has fewer values than result columns")
+		return errors.Join(err, r.abortLocked())
 	}
 
 	hasRow, err := r.native.next()
 	if err != nil {
 		operationErr := sanitizeError("fetch", err, r.conn.database, r.conn.password)
-		return errors.Join(operationErr, r.closeLocked())
+		return errors.Join(operationErr, r.abortLocked())
 	}
 	if err := contextError(r.ctx); err != nil {
-		return errors.Join(err, r.closeLocked())
+		return errors.Join(err, r.abortLocked())
 	}
 	if !hasRow {
 		if err := r.closeLocked(); err != nil {
@@ -844,12 +909,12 @@ func (r *rows) Next(dest []driver.Value) error {
 		value, err := r.native.value(i)
 		if err != nil {
 			operationErr := sanitizeError("decode result", err, r.conn.database, r.conn.password)
-			return errors.Join(operationErr, r.closeLocked())
+			return errors.Join(operationErr, r.abortLocked())
 		}
 		dest[i] = value
 	}
 	if err := contextError(r.ctx); err != nil {
-		return errors.Join(err, r.closeLocked())
+		return errors.Join(err, r.abortLocked())
 	}
 	return nil
 }
@@ -857,10 +922,21 @@ func (r *rows) Next(dest []driver.Value) error {
 func (r *rows) Close() error {
 	r.conn.mu.Lock()
 	defer r.conn.mu.Unlock()
+	if r.ctx != nil && r.ctx.Err() != nil {
+		return r.abortLocked()
+	}
 	return r.closeLocked()
 }
 
 func (r *rows) closeLocked() error {
+	return r.finishLocked(false)
+}
+
+func (r *rows) abortLocked() error {
+	return r.finishLocked(true)
+}
+
+func (r *rows) finishLocked(abort bool) error {
 	if r.closed {
 		if r.conn.activeRows == r {
 			r.conn.activeRows = nil
@@ -880,7 +956,11 @@ func (r *rows) closeLocked() error {
 	if native == nil {
 		return nil
 	}
-	if err := native.close(); err != nil {
+	close := native.close
+	if abort {
+		close = native.abort
+	}
+	if err := close(); err != nil {
 		r.conn.invalidateLocked()
 		return sanitizeError("close cursor", err, r.conn.database, r.conn.password)
 	}
@@ -911,15 +991,20 @@ func sanitizeError(operation string, err error, secrets ...string) error {
 }
 
 var (
-	_ driver.Driver             = driverInstance
-	_ driver.DriverContext      = driverInstance
-	_ driver.Conn               = (*conn)(nil)
-	_ driver.Pinger             = (*conn)(nil)
-	_ driver.Validator          = (*conn)(nil)
-	_ driver.ExecerContext      = (*conn)(nil)
-	_ driver.QueryerContext     = (*conn)(nil)
-	_ driver.NamedValueChecker  = (*conn)(nil)
-	_ driver.ConnPrepareContext = (*conn)(nil)
-	_ driver.ConnBeginTx        = (*conn)(nil)
-	_ driver.Rows               = (*rows)(nil)
+	_ driver.Driver                         = driverInstance
+	_ driver.DriverContext                  = driverInstance
+	_ driver.Conn                           = (*conn)(nil)
+	_ driver.Pinger                         = (*conn)(nil)
+	_ driver.Validator                      = (*conn)(nil)
+	_ driver.ExecerContext                  = (*conn)(nil)
+	_ driver.QueryerContext                 = (*conn)(nil)
+	_ driver.NamedValueChecker              = (*conn)(nil)
+	_ driver.ConnPrepareContext             = (*conn)(nil)
+	_ driver.ConnBeginTx                    = (*conn)(nil)
+	_ driver.Rows                           = (*rows)(nil)
+	_ driver.RowsColumnTypeDatabaseTypeName = (*rows)(nil)
+	_ driver.RowsColumnTypeLength           = (*rows)(nil)
+	_ driver.RowsColumnTypeNullable         = (*rows)(nil)
+	_ driver.RowsColumnTypePrecisionScale   = (*rows)(nil)
+	_ driver.RowsColumnTypeScanType         = (*rows)(nil)
 )

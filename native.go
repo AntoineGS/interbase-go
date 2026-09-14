@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"time"
 	"unsafe"
 )
@@ -29,7 +30,8 @@ const (
 )
 
 type nativeConnection struct {
-	ptr *C.ib_connection
+	ptr     *C.ib_connection
+	dialect int
 }
 
 type nativeStatement struct {
@@ -39,9 +41,26 @@ type nativeStatement struct {
 type nativeCursor struct {
 	ptr       *C.ib_cursor
 	statement *nativeStatement
+	metadata  []columnMetadata
+}
+
+type columnMetadata struct {
+	databaseTypeName string
+	scanType         reflect.Type
+	length           int64
+	hasLength        bool
+	nullable         bool
+	hasNullable      bool
+	precision        int64
+	scale            int64
+	hasPrecision     bool
 }
 
 func openNative(cfg Config) (*nativeConnection, error) {
+	dialect, err := normalizeDialect(cfg.Dialect)
+	if err != nil {
+		return nil, err
+	}
 	database := C.CString(cfg.Database)
 	defer C.free(unsafe.Pointer(database))
 	user := C.CString(cfg.User)
@@ -65,12 +84,13 @@ func openNative(cfg Config) (*nativeConnection, error) {
 		C.size_t(len(cfg.Password)),
 		charsetPointer,
 		C.size_t(len(charset)),
+		C.int(dialect),
 		&errorPointer,
 	)
 	if connection == nil {
 		return nil, takeNativeError(errorPointer)
 	}
-	return &nativeConnection{ptr: connection}, nil
+	return &nativeConnection{ptr: connection, dialect: dialect}, nil
 }
 
 func (c *nativeConnection) close() error {
@@ -162,7 +182,128 @@ func (s *nativeStatement) query(args []argument) (*nativeCursor, []string, error
 		}
 		columns[index] = string(C.GoBytes(unsafe.Pointer(name), C.int(nameLength)))
 	}
+	if _, err := nativeRows.columnMetadata(); err != nil {
+		return nil, nil, nativeCursorQueryError(nativeRows, err)
+	}
 	return nativeRows, columns, nil
+}
+
+func scaledIntegerDatabaseTypeName(subtype int) string {
+	if subtype == 2 {
+		return "DECIMAL"
+	}
+	return "NUMERIC"
+}
+
+func columnMetadataFromNative(value C.ib_column_metadata) columnMetadata {
+	metadata := columnMetadata{
+		scanType:     reflect.TypeOf((*any)(nil)).Elem(),
+		length:       int64(value.length),
+		precision:    int64(value.precision),
+		scale:        int64(value.scale),
+		hasLength:    value.has_length != 0,
+		hasNullable:  value.has_nullable != 0,
+		nullable:     value.nullable != 0,
+		hasPrecision: value.has_precision_scale != 0,
+	}
+	if metadata.scale < 0 {
+		metadata.scale = -metadata.scale
+	}
+
+	switch int(value.sql_type) {
+	case int(C.IB_METADATA_CHAR):
+		metadata.databaseTypeName = "CHAR"
+		if int(value.sql_subtype) == 1 {
+			metadata.scanType = reflect.TypeOf([]byte(nil))
+		} else {
+			metadata.scanType = reflect.TypeOf("")
+		}
+	case int(C.IB_METADATA_VARCHAR):
+		metadata.databaseTypeName = "VARCHAR"
+		if int(value.sql_subtype) == 1 {
+			metadata.scanType = reflect.TypeOf([]byte(nil))
+		} else {
+			metadata.scanType = reflect.TypeOf("")
+		}
+	case int(C.IB_METADATA_SMALLINT):
+		metadata.databaseTypeName = "SMALLINT"
+		if value.sql_scale != 0 || value.sql_subtype == 1 || value.sql_subtype == 2 || metadata.hasPrecision {
+			metadata.databaseTypeName = scaledIntegerDatabaseTypeName(int(value.sql_subtype))
+		}
+		if value.sql_scale != 0 {
+			metadata.scanType = reflect.TypeOf("")
+		} else {
+			metadata.scanType = reflect.TypeOf(int64(0))
+		}
+	case int(C.IB_METADATA_INTEGER):
+		metadata.databaseTypeName = "INTEGER"
+		if value.sql_scale != 0 || value.sql_subtype == 1 || value.sql_subtype == 2 || metadata.hasPrecision {
+			metadata.databaseTypeName = scaledIntegerDatabaseTypeName(int(value.sql_subtype))
+		}
+		if value.sql_scale != 0 {
+			metadata.scanType = reflect.TypeOf("")
+		} else {
+			metadata.scanType = reflect.TypeOf(int64(0))
+		}
+	case int(C.IB_METADATA_BIGINT):
+		metadata.databaseTypeName = "BIGINT"
+		if value.sql_scale != 0 || value.sql_subtype == 1 || value.sql_subtype == 2 || metadata.hasPrecision {
+			metadata.databaseTypeName = scaledIntegerDatabaseTypeName(int(value.sql_subtype))
+		}
+		if value.sql_scale != 0 {
+			metadata.scanType = reflect.TypeOf("")
+		} else {
+			metadata.scanType = reflect.TypeOf(int64(0))
+		}
+	case int(C.IB_METADATA_FLOAT):
+		metadata.databaseTypeName = "FLOAT"
+		metadata.scanType = reflect.TypeOf(float64(0))
+	case int(C.IB_METADATA_DOUBLE):
+		metadata.databaseTypeName = "DOUBLE PRECISION"
+		metadata.scanType = reflect.TypeOf(float64(0))
+	case int(C.IB_METADATA_TIMESTAMP):
+		metadata.databaseTypeName = "TIMESTAMP"
+		metadata.scanType = reflect.TypeOf(time.Time{})
+	case int(C.IB_METADATA_DATE):
+		metadata.databaseTypeName = "DATE"
+		metadata.scanType = reflect.TypeOf(time.Time{})
+	case int(C.IB_METADATA_TIME):
+		metadata.databaseTypeName = "TIME"
+		metadata.scanType = reflect.TypeOf(time.Time{})
+	case int(C.IB_METADATA_BOOLEAN):
+		metadata.databaseTypeName = "BOOLEAN"
+		metadata.scanType = reflect.TypeOf(false)
+	case int(C.IB_METADATA_BLOB):
+		metadata.databaseTypeName = "BLOB"
+		if int(value.sql_subtype) == 1 {
+			metadata.scanType = reflect.TypeOf("")
+		} else {
+			metadata.scanType = reflect.TypeOf([]byte(nil))
+		}
+	}
+	return metadata
+}
+
+func (c *nativeCursor) columnMetadata() ([]columnMetadata, error) {
+	if c == nil || c.ptr == nil {
+		return nil, errors.New("native cursor is unavailable")
+	}
+	count := C.ib_cursor_column_count(c.ptr)
+	if uint64(count) > uint64(maxInt()) {
+		return nil, errors.New("result has too many columns")
+	}
+	metadata := make([]columnMetadata, int(count))
+	for index := range metadata {
+		var nativeMetadata C.ib_column_metadata
+		var errorPointer *C.char
+		if result := C.ib_cursor_column_metadata(c.ptr, C.size_t(index),
+			&nativeMetadata, &errorPointer); result != 0 {
+			return nil, takeNativeError(errorPointer)
+		}
+		metadata[index] = columnMetadataFromNative(nativeMetadata)
+	}
+	c.metadata = metadata
+	return metadata, nil
 }
 
 func (s *nativeStatement) close() error {
@@ -220,6 +361,9 @@ func (c *nativeConnection) query(query string, args []argument) (*nativeCursor, 
 			return nil, nil, nativeCursorQueryError(nativeRows, errors.New("result column name is too long"))
 		}
 		columns[index] = string(C.GoBytes(unsafe.Pointer(name), C.int(nameLength)))
+	}
+	if _, err := nativeRows.columnMetadata(); err != nil {
+		return nil, nil, nativeCursorQueryError(nativeRows, err)
 	}
 	return nativeRows, columns, nil
 }
@@ -352,7 +496,7 @@ func setNativeBinding(bindings *C.ib_bindings, index int, arg argument) error {
 		result = C.ib_bindings_set_timestamp(
 			bindings,
 			C.size_t(index),
-			C.int(year), C.int(month), C.int(day),
+			C.int64_t(year), C.int(month), C.int(day),
 			C.int(hour), C.int(minute), C.int(second),
 			C.int(arg.timeValue.Nanosecond()),
 			&errorPointer,
@@ -367,9 +511,9 @@ func setNativeBinding(bindings *C.ib_bindings, index int, arg argument) error {
 }
 
 func nativeCursorQueryError(cursor *nativeCursor, primary error) error {
-	closeErr := cursor.close()
-	if closeErr != nil {
-		return errors.Join(primary, closeErr)
+	abortErr := cursor.abort()
+	if abortErr != nil {
+		return errors.Join(primary, abortErr)
 	}
 	return primary
 }
@@ -398,6 +542,19 @@ func (c *nativeCursor) close() error {
 	c.ptr = nil
 	var errorPointer *C.char
 	if result := C.ib_cursor_close(cursor, &errorPointer); result != 0 {
+		return takeNativeError(errorPointer)
+	}
+	return nil
+}
+
+func (c *nativeCursor) abort() error {
+	if c == nil || c.ptr == nil {
+		return nil
+	}
+	cursor := c.ptr
+	c.ptr = nil
+	var errorPointer *C.char
+	if result := C.ib_cursor_abort(cursor, &errorPointer); result != 0 {
 		return takeNativeError(errorPointer)
 	}
 	return nil

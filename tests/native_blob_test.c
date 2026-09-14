@@ -125,6 +125,7 @@ static void test_large_segment_materialization(void)
 
 	memset(&connection, 0, sizeof(connection));
 	connection.database = &handle_token;
+	connection.dialect = SQL_DIALECT_V5;
 	memset(&cursor, 0, sizeof(cursor));
 	cursor.connection = &connection;
 	cursor.transaction = &handle_token;

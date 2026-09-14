@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -48,6 +49,9 @@ type Config struct {
 	ISQL     string
 	User     string
 	Password string
+	// Dialect selects the SQL dialect used by isql. Zero selects Dialect 3.
+	// Set Dialect to 1 to opt into Dialect 1.
+	Dialect int
 }
 
 // FromEnv reads the optional test-only fixture overrides.
@@ -84,6 +88,9 @@ func configFromLookup(lookup func(string) (string, bool)) (Config, error) {
 }
 
 func validateConfig(cfg Config) error {
+	if _, err := normalizeDialect(cfg.Dialect); err != nil {
+		return err
+	}
 	if cfg.ISQL == "" {
 		return errors.New("interbase fixture: isql path is required")
 	}
@@ -103,6 +110,17 @@ func validateConfig(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+func normalizeDialect(dialect int) (int, error) {
+	switch dialect {
+	case 0, 3:
+		return 3, nil
+	case 1:
+		return 1, nil
+	default:
+		return 0, fmt.Errorf("interbase fixture: unsupported SQL dialect %d; want 1 or 3", dialect)
+	}
 }
 
 func hasControlCharacter(value string) bool {
@@ -151,6 +169,11 @@ func Create(ctx context.Context, cfg Config, schema string) (*Database, error) {
 	if err := validateConfig(cfg); err != nil {
 		return nil, err
 	}
+	dialect, err := normalizeDialect(cfg.Dialect)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Dialect = dialect
 
 	root := filepath.Clean(os.TempDir())
 	if err := validateLocalPath(root); err != nil {
@@ -306,7 +329,11 @@ func runISQL(ctx context.Context, cfg Config, script, operation, marker string) 
 	commandContext, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	command := exec.CommandContext(commandContext, cfg.ISQL, "-q", "-s", "1", "-names", "UTF8")
+	dialect, err := normalizeDialect(cfg.Dialect)
+	if err != nil {
+		return fmt.Errorf("interbase fixture: %s: %w", operation, err)
+	}
+	command := exec.CommandContext(commandContext, cfg.ISQL, "-q", "-s", strconv.Itoa(dialect), "-names", "UTF8")
 	command.Env = fixtureEnvironment()
 	command.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid:   true,
@@ -628,6 +655,7 @@ func redact(output string, secrets ...string) string {
 
 func createScript(path string, cfg Config, schema string) string {
 	var script strings.Builder
+	fmt.Fprintf(&script, "SET SQL DIALECT %d;\n", scriptDialect(cfg))
 	fmt.Fprintf(&script, "CREATE DATABASE %s USER %s PASSWORD %s DEFAULT CHARACTER SET UTF8;\n",
 		quoteSQLString(path), quoteSQLString(cfg.User), quoteSQLString(cfg.Password))
 	script.WriteString(schema)
@@ -640,8 +668,17 @@ func createScript(path string, cfg Config, schema string) string {
 }
 
 func dropScript(path string, cfg Config) string {
-	return fmt.Sprintf("CONNECT %s USER %s PASSWORD %s;\nSELECT %s FROM RDB$DATABASE;\nDROP DATABASE;\n",
+	return fmt.Sprintf("SET SQL DIALECT %d;\nCONNECT %s USER %s PASSWORD %s;\nSELECT %s FROM RDB$DATABASE;\nDROP DATABASE;\n",
+		scriptDialect(cfg),
 		quoteSQLString(path), quoteSQLString(cfg.User), quoteSQLString(cfg.Password), quoteSQLString(dropMarker))
+}
+
+func scriptDialect(cfg Config) int {
+	dialect, err := normalizeDialect(cfg.Dialect)
+	if err != nil {
+		return 3
+	}
+	return dialect
 }
 
 func quoteSQLString(value string) string {

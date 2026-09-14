@@ -81,13 +81,33 @@ static int free_statement_calls;
 static int close_calls;
 static int detach_calls;
 static int fail_execute_once;
+static int fail_execute2_once;
+static int fail_commit;
+static int fail_start_on_call;
 static int fail_prepare;
+static int fail_prepare_on_call;
 static int fail_rollback;
+static int fail_drop;
+static int fail_sql_info_on_call;
+static int sql_info_calls;
 static int statement_type = isc_info_sql_stmt_insert;
+static int procedure_output_count = 1;
+static int rollback_saw_live_transaction;
+static int catalog_close_calls;
+static int catalog_drop_calls;
+static int catalog_fetch_rows_remaining;
+static int catalog_statement_open;
+static int fail_catalog_drop;
+static int catalog_drop_left_handle;
+static int failed_drop_left_handle;
+static int describe_user_column_relation;
+static int user_execute2_calls;
 static int64_t last_execute_value;
 static char database_token;
 static char transaction_tokens[32];
 static char statement_tokens[32];
+static isc_stmt_handle catalog_statement;
+static unsigned short expected_dialect;
 
 static void check(int condition, const char *message)
 {
@@ -95,6 +115,34 @@ static void check(int condition, const char *message)
 		(void) fprintf(stderr, "native prepared test failed: %s\n", message);
 		failures++;
 	}
+}
+
+static int is_catalog_statement(const isc_stmt_handle *statement)
+{
+	return statement != NULL && *statement != NULL && *statement == catalog_statement;
+}
+
+static void set_catalog_text(XSQLVAR *variable, const char *value)
+{
+	size_t length = strlen(value);
+
+	memset(variable->sqldata, ' ', (size_t) variable->sqllen);
+	if (length > (size_t) variable->sqllen) {
+		length = (size_t) variable->sqllen;
+	}
+	memcpy(variable->sqldata, value, length);
+	*variable->sqlind = 0;
+}
+
+static void set_catalog_integer(XSQLVAR *variable, ISC_LONG value)
+{
+	memcpy(variable->sqldata, &value, sizeof(value));
+	*variable->sqlind = 0;
+}
+
+static void set_catalog_null(XSQLVAR *variable)
+{
+	*variable->sqlind = -1;
 }
 
 static ISC_STATUS status_result(ISC_STATUS *status, int failed)
@@ -123,11 +171,31 @@ static void reset_mocks(void)
 	close_calls = 0;
 	detach_calls = 0;
 	fail_execute_once = 0;
+	fail_execute2_once = 0;
+	fail_commit = 0;
+	fail_start_on_call = 0;
 	fail_prepare = 0;
+	fail_prepare_on_call = 0;
 	fail_rollback = 0;
+	fail_drop = 0;
+	fail_sql_info_on_call = 0;
+	sql_info_calls = 0;
 	fail_message_allocation = 0;
+	rollback_saw_live_transaction = 0;
+	catalog_close_calls = 0;
+	catalog_drop_calls = 0;
+	catalog_fetch_rows_remaining = 0;
+	catalog_statement_open = 0;
+	fail_catalog_drop = 0;
+	catalog_drop_left_handle = 0;
+	failed_drop_left_handle = 0;
+	describe_user_column_relation = 0;
+	user_execute2_calls = 0;
+	catalog_statement = NULL;
+	expected_dialect = SQL_DIALECT_V5;
 	last_execute_value = 0;
 	statement_type = isc_info_sql_stmt_insert;
+	procedure_output_count = 1;
 }
 
 static ib_connection *new_connection(void)
@@ -137,6 +205,7 @@ static ib_connection *new_connection(void)
 		abort();
 	}
 	connection->database = &database_token;
+	connection->dialect = SQL_DIALECT_V5;
 	return connection;
 }
 
@@ -168,28 +237,94 @@ static struct ib_statement *prepare_statement(ib_connection *connection, int typ
 	return statement;
 }
 
+static void test_dialect_arguments_are_propagated(void)
+{
+	ib_connection *connection;
+	struct ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+	int64_t rows_affected;
+
+	reset_mocks();
+	expected_dialect = SQL_DIALECT_V6;
+	connection = new_connection();
+	connection->dialect = SQL_DIALECT_V6;
+	statement_type = isc_info_sql_stmt_select;
+	statement = prepare_statement(connection, statement_type);
+	check(statement != NULL, "Dialect 3 prepared statement was not created");
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	bindings = new_integer_binding(7);
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL, "Dialect 3 prepared query failed");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_next(cursor, &error) == 1 && error == NULL,
+			"Dialect 3 prepared query did not fetch a row");
+		ib_error_free(error);
+		error = NULL;
+		check(ib_cursor_close(cursor, &error) == 0 && error == NULL,
+			"Dialect 3 prepared query close failed");
+		ib_error_free(error);
+	}
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"Dialect 3 prepared query statement close failed");
+	ib_error_free(error);
+
+	statement_type = isc_info_sql_stmt_insert;
+	statement = prepare_statement(connection, statement_type);
+	check(statement != NULL, "Dialect 3 prepared execute statement was not created");
+	if (statement != NULL) {
+		bindings = new_integer_binding(8);
+		error = NULL;
+		rows_affected = -1;
+		check(ib_statement_exec(statement, bindings, &rows_affected, &error) == 0 &&
+			error == NULL, "Dialect 3 prepared execute failed");
+		ib_error_free(error);
+		ib_bindings_free(bindings);
+		error = NULL;
+		check(ib_statement_close(statement, &error) == 0 && error == NULL,
+			"Dialect 3 prepared execute statement close failed");
+		ib_error_free(error);
+	}
+	free(connection);
+}
+
 ISC_STATUS ISC_EXPORT_VARARG test_start_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction, short count, ...)
 {
 	(void) count;
 	start_calls++;
 	*transaction = &transaction_tokens[start_calls % sizeof(transaction_tokens)];
-	return status_result(status, 0);
+	return status_result(status, start_calls == fail_start_on_call);
 }
 
 ISC_STATUS ISC_EXPORT test_commit_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction)
 {
 	commit_calls++;
-	*transaction = NULL;
-	return status_result(status, 0);
+	if (!fail_commit) {
+		*transaction = NULL;
+	}
+	return status_result(status, fail_commit);
 }
 
 ISC_STATUS ISC_EXPORT test_rollback_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction)
 {
 	rollback_calls++;
-	*transaction = NULL;
+	if (*transaction != NULL) {
+		rollback_saw_live_transaction = 1;
+	}
+	if (!fail_rollback) {
+		*transaction = NULL;
+	}
 	return status_result(status, fail_rollback);
 }
 
@@ -211,20 +346,25 @@ ISC_STATUS ISC_EXPORT test_dsql_prepare(ISC_STATUS *status,
 	(void) statement;
 	(void) query_length;
 	(void) query;
-	(void) dialect;
 	(void) output;
+	check(dialect == expected_dialect, "prepare used the wrong SQL dialect");
 	prepare_calls++;
-	if (fail_prepare && fail_rollback) {
+	if (query != NULL && strstr(query, "RDB$RELATION_FIELDS") != NULL) {
+		catalog_statement = *statement;
+	}
+	if ((fail_prepare || (fail_prepare_on_call != 0 &&
+		prepare_calls == fail_prepare_on_call)) && fail_rollback) {
 		fail_message_allocation = 1;
 	}
-	return status_result(status, fail_prepare);
+	return status_result(status, fail_prepare ||
+		(fail_prepare_on_call != 0 && prepare_calls == fail_prepare_on_call));
 }
 
 ISC_STATUS ISC_EXPORT test_dsql_describe_bind(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short dialect, XSQLDA *input)
 {
 	(void) statement;
-	(void) dialect;
+	check(dialect == expected_dialect, "describe bind used the wrong SQL dialect");
 	describe_bind_calls++;
 	input->sqld = 1;
 	input->sqlvar[0].sqltype = SQL_INT64 | 1;
@@ -238,15 +378,40 @@ ISC_STATUS ISC_EXPORT test_dsql_describe_bind(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_dsql_describe(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short dialect, XSQLDA *output)
 {
-	(void) statement;
-	(void) dialect;
+	check(dialect == expected_dialect, "describe used the wrong SQL dialect");
 	describe_calls++;
-	output->sqld = 1;
+	if (is_catalog_statement(statement)) {
+		short index;
+
+		output->sqld = 10;
+		for (index = 0; index < output->sqln && index < output->sqld; index++) {
+			if (index < 2) {
+				output->sqlvar[index].sqltype = SQL_TEXT | 1;
+				output->sqlvar[index].sqllen = 32;
+			} else {
+				output->sqlvar[index].sqltype = SQL_LONG | 1;
+				output->sqlvar[index].sqllen = (short) sizeof(ISC_LONG);
+			}
+		}
+		return status_result(status, 0);
+	}
+	output->sqld = statement_type == isc_info_sql_stmt_exec_procedure
+		? (short) procedure_output_count : 1;
+	if (output->sqld == 0) {
+		return status_result(status, 0);
+	}
 	output->sqlvar[0].sqltype = SQL_INT64 | 1;
 	output->sqlvar[0].sqlscale = 0;
 	output->sqlvar[0].sqlsubtype = 0;
 	output->sqlvar[0].sqlprecision = 0;
 	output->sqlvar[0].sqllen = (short) sizeof(ISC_INT64);
+	if (describe_user_column_relation && statement_type == isc_info_sql_stmt_select) {
+		output->sqlvar[0].relname_length = 1;
+		output->sqlvar[0].relname[0] = 'T';
+		output->sqlvar[0].sqlname_length = 2;
+		output->sqlvar[0].sqlname[0] = 'I';
+		output->sqlvar[0].sqlname[1] = 'D';
+	}
 	return status_result(status, 0);
 }
 
@@ -254,14 +419,18 @@ ISC_STATUS ISC_EXPORT test_dsql_sql_info(ISC_STATUS *status,
 	isc_stmt_handle *statement, short request_length, char *request,
 	short response_length, char *response)
 {
-	(void) statement;
+	sql_info_calls++;
+	if (fail_sql_info_on_call != 0 && sql_info_calls == fail_sql_info_on_call) {
+		return status_result(status, 1);
+	}
 	if (request_length == 1 && request[0] == isc_info_sql_stmt_type) {
 		check(response_length >= 8, "statement-type response buffer is too short");
 		if (response_length >= 8) {
 			memset(response, 0, (size_t) response_length);
 			response[0] = isc_info_sql_stmt_type;
 			response[1] = 4;
-			response[3] = (char) statement_type;
+			response[3] = (char) (is_catalog_statement(statement) ?
+				isc_info_sql_stmt_select : statement_type);
 			response[7] = isc_info_end;
 		}
 		return status_result(status, 0);
@@ -285,7 +454,7 @@ ISC_STATUS ISC_EXPORT test_dsql_execute(ISC_STATUS *status,
 {
 	(void) transaction;
 	(void) statement;
-	(void) dialect;
+	check(dialect == expected_dialect, "execute used the wrong SQL dialect");
 	execute_calls++;
 	if (input != NULL && input->sqld == 1 && input->sqlvar[0].sqldata != NULL) {
 		memcpy(&last_execute_value, input->sqlvar[0].sqldata,
@@ -299,11 +468,27 @@ ISC_STATUS ISC_EXPORT test_dsql_execute2(ISC_STATUS *status,
 	unsigned short dialect, XSQLDA *input, XSQLDA *output)
 {
 	(void) transaction;
-	(void) statement;
-	(void) dialect;
+	check(dialect == expected_dialect, "execute2 used the wrong SQL dialect");
 	(void) input;
 	(void) output;
 	execute2_calls++;
+	if (is_catalog_statement(statement)) {
+		catalog_statement_open = 1;
+		catalog_fetch_rows_remaining = 1;
+		return status_result(status, 0);
+	}
+	user_execute2_calls++;
+	if (fail_execute2_once-- > 0) {
+		return status_result(status, 1);
+	}
+	if (statement_type == isc_info_sql_stmt_exec_procedure && output != NULL &&
+		output->sqld == 1 && output->sqlvar[0].sqldata != NULL) {
+		int64_t value = 123;
+		memcpy(output->sqlvar[0].sqldata, &value, sizeof(value));
+	}
+	if (statement_type == isc_info_sql_stmt_exec_procedure) {
+		return status_result(status, 0);
+	}
 	if (execute2_open) {
 		return status_result(status, 1);
 	}
@@ -312,11 +497,391 @@ ISC_STATUS ISC_EXPORT test_dsql_execute2(ISC_STATUS *status,
 	return status_result(status, 0);
 }
 
+static void test_executable_procedure_output_and_reuse(void)
+{
+	ib_connection *connection;
+	struct ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	ib_value_view view;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	procedure_output_count = 1;
+	connection = new_connection();
+	statement = prepare_statement(connection, statement_type);
+	check(statement != NULL && statement->output != NULL && statement->output->sqld == 1,
+		"executable procedure output descriptor was not retained");
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+
+	bindings = new_integer_binding(10);
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL && execute2_calls == 1,
+		"executable procedure query did not execute through execute2");
+	check(fetch_calls == 0, "executable procedure query unexpectedly fetched a row");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_next(cursor, &error) == 1 && error == NULL,
+			"executable procedure did not expose its output row");
+		ib_error_free(error);
+		error = NULL;
+		check(ib_cursor_column(cursor, 0, &view, &error) == 0 && error == NULL &&
+			view.kind == IB_VALUE_INT64 && view.int64_value == 123,
+			"executable procedure output row was not populated");
+		ib_error_free(error);
+		error = NULL;
+		check(ib_cursor_next(cursor, &error) == 0 && error == NULL,
+			"executable procedure returned more than one output row");
+		ib_error_free(error);
+		error = NULL;
+		check(ib_cursor_close(cursor, &error) == 0 && error == NULL,
+			"executable procedure cursor close failed");
+		ib_error_free(error);
+	}
+	check(commit_calls == 2 && rollback_calls == 0,
+		"implicit executable procedure query did not commit its transaction");
+
+	bindings = new_integer_binding(20);
+	error = NULL;
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL && execute2_calls == 2 && fetch_calls == 0,
+		"prepared executable procedure handle was not reusable");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_close(cursor, &error) == 0 && error == NULL,
+			"early-close executable procedure cursor failed");
+		ib_error_free(error);
+	}
+	check(commit_calls == 3 && rollback_calls == 0,
+		"early-close executable procedure did not commit its transaction");
+
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"executable procedure statement close failed");
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_executable_procedure_exec_contracts(void)
+{
+	ib_connection *connection;
+	struct ib_statement *statement;
+	ib_bindings *bindings;
+	char *error = NULL;
+	int64_t affected;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	procedure_output_count = 1;
+	connection = new_connection();
+	statement = prepare_statement(connection, statement_type);
+	check(statement != NULL, "output procedure statement preparation failed");
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	bindings = new_integer_binding(1);
+	check(ib_statement_exec(statement, bindings, &affected, &error) != 0 &&
+		error != NULL && execute_calls == 0,
+		"Exec discarded executable procedure output or executed it");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	error = NULL;
+	(void) ib_statement_close(statement, &error);
+	ib_error_free(error);
+	free(connection);
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	procedure_output_count = 0;
+	connection = new_connection();
+	statement = prepare_statement(connection, statement_type);
+	check(statement != NULL && statement->output != NULL && statement->output->sqld == 0,
+		"zero-output procedure descriptor was not retained");
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	bindings = new_integer_binding(2);
+	error = NULL;
+	check(ib_statement_exec(statement, bindings, &affected, &error) == 0 &&
+		error == NULL && execute_calls == 1 && commit_calls == 2,
+		"zero-output procedure was not executable through Exec");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	error = NULL;
+	(void) ib_statement_close(statement, &error);
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_executable_procedure_failure_and_abort_rollback(void)
+{
+	ib_connection *connection;
+	struct ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	procedure_output_count = 1;
+	connection = new_connection();
+	statement = prepare_statement(connection, statement_type);
+	check(statement != NULL, "failure procedure statement preparation failed");
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	bindings = new_integer_binding(3);
+	fail_execute2_once = 1;
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor == NULL && error != NULL && rollback_calls == 1 && execute2_calls == 1,
+		"failed executable procedure did not roll back without replaying execution");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+
+	bindings = new_integer_binding(4);
+	error = NULL;
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL && execute2_calls == 2,
+		"executable procedure handle did not recover after execution failure");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_abort(cursor, &error) == 0 && error == NULL,
+			"aborting executable procedure output did not clean up");
+		ib_error_free(error);
+	}
+	check(rollback_calls == 2 && commit_calls == 1,
+		"executable procedure output/decode abort did not roll back its transaction");
+
+	error = NULL;
+	(void) ib_statement_close(statement, &error);
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_catalog_metadata_cleanup_drops_owned_statement(void)
+{
+	ib_connection *connection;
+	ib_cursor cursor = {0};
+	char *error = NULL;
+
+	reset_mocks();
+	connection = new_connection();
+	cursor.connection = connection;
+	cursor.transaction = &transaction_tokens[0];
+	cursor.output = ib_alloc_sqlda(1);
+	check(cursor.output != NULL, "catalog metadata test output allocation failed");
+	if (cursor.output == NULL) {
+		free(connection);
+		return;
+	}
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_LONG | 1;
+	cursor.output->sqlvar[0].sqllen = (short) sizeof(ISC_LONG);
+	cursor.output->sqlvar[0].relname_length = 1;
+	cursor.output->sqlvar[0].relname[0] = 'T';
+	cursor.output->sqlvar[0].sqlname_length = 2;
+	cursor.output->sqlvar[0].sqlname[0] = 'I';
+	cursor.output->sqlvar[0].sqlname[1] = 'D';
+
+	check(ib_cursor_describe_metadata(&cursor, &error) == 0 && error == NULL,
+		"catalog metadata lookup failed");
+	check(cursor.metadata != NULL && cursor.metadata[0].sql_type == IB_METADATA_INTEGER,
+		"catalog metadata lookup did not apply the matching field");
+	check(catalog_drop_calls == 1 && catalog_close_calls == 0,
+		"catalog-owned statement was closed instead of dropped");
+	ib_error_free(error);
+	free(cursor.metadata);
+	ib_free_sqlda(cursor.output);
+	free(connection);
+}
+
+static void test_procedure_commit_failure_rolls_back_live_handle(void)
+{
+	ib_connection *connection;
+	ib_cursor *cursor;
+	char *error = NULL;
+	int result;
+
+	reset_mocks();
+	connection = new_connection();
+	cursor = (ib_cursor *) calloc(1U, sizeof(*cursor));
+	check(cursor != NULL, "commit failure cursor allocation failed");
+	if (cursor == NULL) {
+		free(connection);
+		return;
+	}
+	cursor->connection = connection;
+	cursor->transaction = &transaction_tokens[0];
+	cursor->owns_transaction = 1;
+	cursor->procedure = 1;
+	connection->active_cursor = cursor;
+	fail_commit = 1;
+	fail_rollback = 1;
+	result = ib_cursor_close(cursor, &error);
+	check(result == -1 && commit_calls == 1 && rollback_calls == 1 &&
+		rollback_saw_live_transaction, "procedure commit failure did not attempt rollback");
+	check(connection->broken, "procedure commit/rollback failure did not invalidate connection");
+	check(error != NULL && strstr(error, "commit procedure transaction") != NULL &&
+		strstr(error, "rollback failed procedure transaction") != NULL,
+		"procedure commit failure did not preserve cleanup diagnostics");
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_direct_procedure_transition_failures_free_query(void)
+{
+	static const char query[] = "EXECUTE PROCEDURE P(?)";
+	struct {
+		const char *name;
+		int start_failure;
+		int prepare_failure;
+		int rollback_failure;
+		int sql_info_failure;
+	} cases[] = {
+		{"rollback", 0, 0, 1, 0},
+		{"write start", 2, 0, 0, 0},
+		{"second prepare", 0, 2, 0, 0},
+		{"second type lookup", 0, 0, 0, 2}
+	};
+	size_t index;
+
+	for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); index++) {
+		ib_connection *connection;
+		ib_bindings *bindings;
+		ib_cursor *cursor;
+		char *error = NULL;
+
+		reset_mocks();
+		statement_type = isc_info_sql_stmt_exec_procedure;
+		fail_start_on_call = cases[index].start_failure;
+		fail_prepare_on_call = cases[index].prepare_failure;
+		fail_rollback = cases[index].rollback_failure;
+		fail_sql_info_on_call = cases[index].sql_info_failure;
+		connection = new_connection();
+		bindings = new_integer_binding((int64_t) index + 1);
+		cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
+			bindings, &error);
+		check(cursor == NULL && error != NULL && connection->active_cursor == NULL,
+			cases[index].name);
+		ib_error_free(error);
+		ib_bindings_free(bindings);
+		free(connection);
+	}
+}
+
+static void test_procedure_transition_drop_failure_retires_connection(void)
+{
+	static const char query[] = "EXECUTE PROCEDURE P(?)";
+	ib_connection *connection;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+	int prepare_count;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	fail_drop = 1;
+	connection = new_connection();
+	bindings = new_integer_binding(9);
+	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
+		bindings, &error);
+	check(cursor == NULL && error != NULL && rollback_calls == 1 &&
+		failed_drop_left_handle && connection->broken,
+		"procedure transition drop failure did not retire the connection");
+	check(error != NULL && strstr(error, "close statement") != NULL,
+		"procedure transition drop failure lost cleanup diagnostics");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	prepare_count = prepare_calls;
+
+	error = NULL;
+	bindings = new_integer_binding(10);
+	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
+		bindings, &error);
+	check(cursor == NULL && error != NULL && prepare_calls == prepare_count &&
+		execute2_calls == 0,
+		"broken connection reused a live procedure transition handle");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	free(connection);
+}
+
+static void test_catalog_drop_failure_stops_user_execution(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+	ib_connection *connection;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_relation = 1;
+	fail_catalog_drop = 1;
+	connection = new_connection();
+	connection->transaction = &transaction_tokens[0];
+	bindings = new_integer_binding(1);
+	check(bindings != NULL && error == NULL, "catalog drop failure bindings allocation failed");
+	if (bindings == NULL) {
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
+		bindings, &error);
+	check(catalog_drop_calls == 1 && catalog_drop_left_handle,
+		"catalog drop fault injection did not leave its handle live");
+	check(cursor == NULL, "catalog drop failure returned a user cursor");
+	check(connection->broken, "catalog drop failure did not retire the connection");
+	check(user_execute2_calls == 0,
+		"catalog drop failure executed the user statement");
+	check(connection->transaction == &transaction_tokens[0],
+		"catalog drop failure lost the explicit transaction");
+	check(error != NULL && strstr(error, "close statement") != NULL,
+		"catalog drop failure lost its cleanup diagnostic");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	free(connection);
+}
+
 ISC_STATUS ISC_EXPORT test_dsql_fetch(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short dialect, XSQLDA *output)
 {
-	(void) statement;
-	(void) dialect;
+	check(dialect == expected_dialect, "fetch used the wrong SQL dialect");
+	if (is_catalog_statement(statement)) {
+		fetch_calls++;
+		if (!catalog_statement_open) {
+			return status_result(status, 1);
+		}
+		if (catalog_fetch_rows_remaining > 0) {
+			catalog_fetch_rows_remaining--;
+			set_catalog_text(&output->sqlvar[0], "T");
+			set_catalog_text(&output->sqlvar[1], "ID");
+			set_catalog_integer(&output->sqlvar[2], 8);
+			set_catalog_integer(&output->sqlvar[3], 0);
+			set_catalog_integer(&output->sqlvar[4], (ISC_LONG) sizeof(ISC_LONG));
+			set_catalog_integer(&output->sqlvar[5], 0);
+			set_catalog_null(&output->sqlvar[6]);
+			set_catalog_null(&output->sqlvar[7]);
+			set_catalog_null(&output->sqlvar[8]);
+			set_catalog_integer(&output->sqlvar[9], 1);
+			return status_result(status, 0);
+		}
+		return status_result(status, 0) == 0 ? 100 : -1;
+	}
 	(void) output;
 	if (!execute2_open) {
 		return status_result(status, 1);
@@ -332,6 +897,21 @@ ISC_STATUS ISC_EXPORT test_dsql_fetch(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short option)
 {
+	if (*statement == catalog_statement) {
+		if (option == DSQL_close) {
+			catalog_close_calls++;
+		} else {
+			check(option == DSQL_drop, "catalog cleanup used an unexpected option");
+			catalog_drop_calls++;
+			if (fail_catalog_drop) {
+				catalog_drop_left_handle = *statement != NULL;
+				return status_result(status, 1);
+			}
+			*statement = NULL;
+		}
+		catalog_statement_open = 0;
+		return status_result(status, 0);
+	}
 	if (option == DSQL_close) {
 		check(execute2_open, "cursor cleanup must close an open prepared SELECT");
 		close_calls++;
@@ -340,6 +920,10 @@ ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 		check(option == DSQL_drop, "statement cleanup must drop the prepared handle");
 		check(!execute2_open, "statement cleanup dropped an open prepared SELECT");
 		free_statement_calls++;
+		if (fail_drop) {
+			failed_drop_left_handle = *statement != NULL;
+			return status_result(status, 1);
+		}
 		*statement = NULL;
 	}
 	return status_result(status, 0);
@@ -726,6 +1310,15 @@ static void test_connection_close_drains_prepared_statements(void)
 
 int main(void)
 {
+	test_dialect_arguments_are_propagated();
+	test_executable_procedure_output_and_reuse();
+	test_executable_procedure_exec_contracts();
+	test_executable_procedure_failure_and_abort_rollback();
+	test_catalog_metadata_cleanup_drops_owned_statement();
+	test_procedure_commit_failure_rolls_back_live_handle();
+	test_direct_procedure_transition_failures_free_query();
+	test_procedure_transition_drop_failure_retires_connection();
+	test_catalog_drop_failure_stops_user_execution();
 	test_prepare_once_execute_repeated();
 	test_failed_implicit_execution_keeps_handle();
 	test_prepare_failure_releases_handle_and_transaction();

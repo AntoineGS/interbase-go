@@ -61,10 +61,10 @@ timeout 30s go run ./cmd/ibprobe
 go test -v -run '^TestLive' -count=1 -timeout=60s .
 ```
 
-The probe checks native attachment, Dialect 1 double-quoted string literals,
-positional parameter binding, UDF argument metadata, and early cursor close
-followed by connection reuse. It runs only fixed SELECTs. It does not invoke
-UDFs, create a test database, or execute DDL/DML.
+The probe checks a Dialect 1 native attachment, Dialect 1 double-quoted string
+literals, positional parameter binding, UDF argument metadata, and early
+cursor close followed by connection reuse. It runs only fixed SELECTs. It does
+not invoke UDFs, create a test database, or execute DDL/DML.
 
 The live tests also cover UTF-8 parameters, empty strings versus NULL,
 fixed-width padding, integers, doubles, timestamps with fractional seconds,
@@ -78,6 +78,7 @@ connector, err := interbase.NewConnector(interbase.Config{
     Database: os.Getenv("INTERBASE_DATABASE"),
     User:     os.Getenv("INTERBASE_USER"),
     Password: os.Getenv("INTERBASE_PASSWORD"),
+    Dialect:  3,
 })
 if err != nil {
     return err
@@ -96,9 +97,16 @@ err = db.QueryRowContext(ctx,
 Import this module as `interbase "interbase-go"`. It intentionally has no
 registered DSN driver: use `NewConnector` and `sql.OpenDB`.
 
+`Config.Dialect` is an `int`: zero or omission selects Dialect 3; explicit
+values 1 and 3 are supported, and every other value fails before attachment.
+Set `Dialect: 1` to opt into Dialect 1. The example spells out the Dialect 3
+default; it requires no dependency beyond Go's standard `database/sql` package
+and this connector.
+
 ## Supported Boundary
 
-- Client SQL Dialect 1. `Config.Charset` defaults to UTF8; WIN1250 is also
+- Client SQL Dialect 3 by default, or Dialect 1 when selected with
+  `Config.Dialect`. `Config.Charset` defaults to UTF8; WIN1250 is also
   supported. Go strings and SQL text remain UTF8 at the public boundary.
 - Direct `QueryContext`/`QueryRowContext` and `PingContext`.
 - `ExecContext` for DML/DDL, with DML affected-row counts and implicit commit.
@@ -110,28 +118,45 @@ registered DSN driver: use `NewConnector` and `sql.OpenDB`.
 - Positional parameters: `string`, `[]byte`, `int64`, `float64`, `bool`,
   `time.Time`, and `nil`, plus standard `database/sql` numeric and Valuer
   conversions.
-- CHAR/VARCHAR, SMALLINT/INTEGER/INT64, FLOAT/DOUBLE, BOOLEAN, and NULL results.
-- Scaled integer results as exact decimal strings rather than lossy floats.
-- Wide Dialect-1 numerics as approximate floating-point values.
+- CHAR/VARCHAR, OCTETS CHAR/VARCHAR, SMALLINT/INTEGER/INT64, FLOAT/DOUBLE,
+  BOOLEAN, DATE/TIME/TIMESTAMP, and NULL results.
+- OCTETS CHAR/VARCHAR as raw `[]byte`; fixed CHAR values retain space padding,
+  and empty values remain distinct from NULL.
+- Dialect 3 scaled NUMERIC/DECIMAL values as exact decimal strings, including
+  negative values. Checked binding enforces declared precision and native range,
+  rejects scientific notation and excess nonzero fractional digits, and accepts
+  trailing zeroes. Zero-scale NUMERIC/DECIMAL values scan as `int64`.
+- Dialect 1 preserves server-side conversion for numeric text arguments.
+  Scaled integer results remain exact decimal strings; wide Dialect-1 numerics
+  remain approximate floating-point values.
 - Materialized text and binary BLOBs, including empty versus NULL values,
   segmented transfer, and text-column charset conversion.
-- Timestamp values as `time.Time`, preserving wall-clock fields and attaching
-  UTC as a convention, not claiming the stored value has a time zone.
-  Date/time decoding exists but Dialect 1 may reject those distinct SQL types.
+- DATE/TIME/TIMESTAMP values as `time.Time`, preserving wall-clock fields and
+  attaching UTC as a convention, not claiming stored timezone data. DATE uses
+  midnight; TIME uses a `1900-01-01` anchor and accepts Go's year-zero values
+  from `time.Parse`; InterBase precision is 100 microseconds.
+- Standard `Rows.ColumnTypes` metadata: database type, scan type, length,
+  nullability, and decimal precision/scale are immutable execution snapshots.
+  Properties unavailable from the result are reported unknown; expressions do
+  not promise precision or nullability that cannot be established.
+- `EXECUTE PROCEDURE` through `QueryContext`/`QueryRowContext` when it returns
+  output (exactly one row), or `ExecContext` when it has no output. `ExecContext`
+  rejects output-producing procedures. An implicit procedure query commits its
+  write transaction after EOF or early close, and rolls back on execution,
+  cancellation, or completion failure; explicit transactions remain caller-owned.
 - One active cursor per native connection; `database/sql` may pool separate
   connections. Always close rows or consume them to EOF.
 
-Each query cursor borrows an explicit connection transaction or owns a
-read-committed, read-only implicit transaction that is rolled back on
+Each ordinary SELECT cursor borrows an explicit connection transaction or owns
+a read-committed, read-only implicit transaction that is rolled back on
 close/EOF/error. Prepared statement handles remain allocated across executions
 and are released by `Stmt.Close` or connection cleanup; cursor cleanup never
 drops the reusable handle. The connection serializes native access, and
 transaction-start/cleanup failures invalidate it. A Go `driver.Validator`
 prevents broken attachments from returning to the pool. Result descriptors
-always request NULL indicators, including expressions described as
-non-nullable.
+always request NULL indicators, including expressions described as non-nullable.
 
-The server-reported statement type must be plain SELECT before query execution.
+The server-reported statement type must be plain SELECT before ordinary query execution.
 Prepared statements retain the server-side statement handle and reset their
 input/output SQLDA storage for each execution. Prepared writes use the explicit
 connection transaction when present; otherwise each successful write commits
@@ -142,9 +167,10 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 ## Known Limits
 
 - No arrays or standalone QUADs. BLOBs are materialized rather than streamed,
-  with a 64 MiB read limit; subtype and expression metadata limitations still
-  apply. Unsupported descriptors fail explicitly.
-- No named parameters, services, events, or distributed transactions.
+  with a 64 MiB read limit; alternate subtype behavior remains limited.
+  Unsupported descriptors fail explicitly.
+- No named parameters, services, events, change views, roles, or distributed
+  transactions.
 - Mixed-character-set casts may require an explicit source-charset cast on
   the parameter. For a UTF8 attachment, declare `CAST(? AS VARCHAR(40)
   CHARACTER SET UTF8)` before converting to WIN1250 and back. The original
@@ -155,7 +181,8 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 - **Context cancellation cannot interrupt an in-flight native call.** It is
   checked before/after native operations and between rows. A stalled native
   call can outlive its context deadline; use a process timeout for experiments.
-- No TLS configuration API or validated cross-version/platform matrix yet.
+- No advanced TPB API, TLS configuration API, or validated cross-version/platform
+  matrix yet.
   The probe must only be used on a trusted network unless native transport
   security is independently configured and verified.
 - Error reporting uses bounded SQLCODE messages plus a numeric native status.
@@ -166,19 +193,20 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 
 ## Verification Record
 
-On 2026-09-13, using the isolated InterBase 15.1 Docker server and its matching
-client, the expanded integration suite had **54 passing top-level groups,
-zero failures and zero skips**. Writes, transactions, native statement reuse,
-CHAR padding, wide numerics, and BLOB regressions passed. The faithful upstream
-charset test also passed: a five-field row inserted through UTF8 was read back
-identically through both UTF8 and WIN1250 attachments. The additional
-Go-specific nested-cast test now explicitly declares its UTF8 input, following
-a standalone native API comparison; it was a test SQL correction, not a new
-driver binding fix. Offline tests, all
-five ASan/leak-checking native harnesses, race tests, vet, and build passed.
+On 2026-09-14, the full isolated Docker suite passed **80 top-level groups,
+zero failures and zero skips**, covering both Dialect 1 and Dialect 3 against
+server `LI-V15.1.0.49` and matching client `LI-V15.1.0.42`. Offline Go tests,
+all five native ASan/leak harnesses, race tests, integration-tagged vet, build,
+all 15 Bats runner tests, and ShellCheck also passed. Review findings were fixed
+and independently re-reviewed; owned Docker resources were removed.
 
-The following record describes the earlier read-only baseline, not the current
-full integration suite:
+Historical evidence: on 2026-09-13, the then-expanded integration suite had
+**54 passing top-level groups, zero failures and zero skips** against an
+isolated InterBase 15.1 Docker server and matching client. That count predates
+the completed parity, procedure/metadata, and Dialect 3 work; it is not a
+current-suite result.
+
+The following is an earlier read-only baseline, not a current full-suite result:
 
 On 2026-09-11, using the installed InterBase 2020 Linux client/SDK:
 

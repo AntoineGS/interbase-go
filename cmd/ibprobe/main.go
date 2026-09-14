@@ -20,6 +20,7 @@ func run(ctx context.Context, output io.Writer) (result error) {
 	}
 	connector, err := interbase.NewConnector(interbase.Config{
 		Database: os.Getenv("INTERBASE_DATABASE"), User: os.Getenv("INTERBASE_USER"), Password: password,
+		Dialect: 1,
 	})
 	if err != nil {
 		return err

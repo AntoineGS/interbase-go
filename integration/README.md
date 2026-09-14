@@ -5,10 +5,10 @@ This is a test-first migration of selected behavior from
 source commit `f2dcefccd1a3fcf0f06d72849a615aba4214106c`.
 It targets the Go `database/sql` API, not a Python cursor compatibility layer.
 
-There are 44 contract test functions, a live fixture smoke test, and offline
-helper tests. Table-driven subtests cover additional cases, including each
-VARCHAR parameter length from 0 through 254. These counts are Go test groups,
-not a claim that 44 entire Python test methods have been ported unchanged.
+The suite includes a live fixture smoke test, offline helper tests, and
+table-driven contracts, including every VARCHAR parameter length from 0 through
+254. Source mappings identify adapted assertions rather than whole Python
+methods ported unchanged.
 
 ## Run
 
@@ -27,7 +27,7 @@ go test -tags=integration ./integration -run '^TestReadFixtureSmoke$' -v -count=
 # Read-side contracts, including regressions that may expose driver bugs.
 go test -tags=integration ./integration -run '^TestRead' -v -count=1 -timeout=5m
 
-# Full contract suite, including unfinished write/transaction capabilities.
+# Full contract suite.
 go test -tags=integration ./integration -v -count=1 -timeout=10m
 ```
 
@@ -54,13 +54,16 @@ go vet -tags=integration ./...
   are insufficient; the harness does not install, start, or reconfigure services.
 - Default executable: `/opt/interbase/bin/isql`.
 - Default test credentials: `SYSDBA` / `masterkey`.
-- Client/database SQL Dialect 1 and UTF8, matching the current connector.
+- Fixture dialect defaults to 3 and can be selected as 1 or 3 by the test
+  configuration. Existing Dialect 1 contracts opt in explicitly. Fixture
+  create/drop scripts and `isql` use that same selected dialect; dialect
+  selection is not an environment configuration option.
 
 Optional overrides are `INTERBASE_TEST_ISQL`, `INTERBASE_TEST_USER`, and
 `INTERBASE_TEST_PASSWORD`. An unset password selects `masterkey`; an explicitly
-empty password remains empty. Defaults are confined to this test helper, not
-the driver or CLI. Use your normal secure environment tooling for custom
-credentials; no credential files are loaded automatically.
+empty password remains empty. Credential defaults are confined to this test
+helper, not the driver or CLI. Use your normal secure environment tooling for
+custom credentials; no credential files are loaded automatically.
 
 The temporary root is the platform temporary directory (`TMPDIR` when set).
 It must be an absolute local path without colons or control characters. The
@@ -73,9 +76,9 @@ attachment string**, and ignores the application's `INTERBASE_DATABASE`,
 
 `internal/testfixture` runs InterBase `isql` directly, with SQL on standard
 input and no shell or credential command-line arguments. It creates the small
-schema in `testdata/schema.sql`, independent of the driver's unfinished write
-support. It does not run the original fixture's security-user or encryption
-administration statements.
+schema in `testdata/schema.sql` and selects the configured dialect for both
+creation and cleanup. It does not run the original fixture's security-user or
+encryption administration statements.
 
 Each top-level database test gets a fresh fixture; independently writable
 subtests also create separate fixtures. Read-only subtests may share their
@@ -204,8 +207,10 @@ Never commit the temporary vendor binaries or license files.
 ## Coverage Map
 
 Source methods below are selected/adapted assertions, not whole-method parity.
-Each contract file also carries source-method comments. Go-specific lifecycle
-checks (contexts, pool reuse, `sql.ErrTxDone`) supplement the Python behavior.
+The completed additions are in `parity_test.go`, `procedure_test.go`,
+`metadata_test.go`, and `dialect_test.go`; their rows below retain their source
+mapping. Go-specific lifecycle checks (contexts, pool reuse, `sql.ErrTxDone`)
+supplement the Python behavior.
 
 | Go groups | Python source | Adaptation |
 | --- | --- | --- |
@@ -216,7 +221,11 @@ checks (contexts, pool reuse, `sql.ErrTxDone`) supplement the Python behavior.
 | `TestReadRecoveryAfterInvalidQuery`, `TestReadRecoveryAfterArgumentCountError`, `TestReadPreCancelledQuery` | `DatabaseAPI20Test.test_execute`, `.test_fetchone`; `TestBugs.test_pyib_35` | Go query-error recovery and added cancellation checks, not exact Python exception strings |
 | `TestReadCHARPadding`, `TestReadIntegerBoundaries`, `TestReadTimestampFraction` | `TestInsertData.test_insert_char_varchar`, `.test_insert_integers`, `.test_insert_datetime` | Preseeded decoding independent of driver writes |
 | `TestReadNumeric9ExactStrings`, `TestReadWideDecimalDialectOneFloatTolerance` | `TestInsertData.test_insert_numeric_decimal` | Exact scaled-integer strings versus Dialect-1 approximate wide numerics |
-| `TestReadSelectableBudgetProcedure` | `TestStoredProc.test_callproc` | SQL SELECT from a selectable procedure, four original aggregate values; no `callproc` API or integer-to-CHAR extension assertion |
+| `procedure_test.go`: `TestProcedureDirectQueryReturnsOneOutputRowAndEOF`, `TestProcedurePreparedQueryReusesHandleForStringAndIntegerInputs` | `TestStoredProc.test_callproc` | Executable procedure output with both CHAR and integer inputs, one output row, EOF, and prepared reuse |
+| `procedure_test.go`: `TestProcedureExecRunsZeroOutputProcedureAndPersistsSideEffect`, `TestProcedureExecRejectsOutputWithoutExecutingIt`, `TestProcedureQuery*` | `TestStoredProc.test_callproc` | Executable-procedure write, output-discard protection, implicit completion/rollback behavior, recovery, and caller-owned explicit transactions |
+| `metadata_test.go`: `TestMetadata*` | `TestCursor.test_description`; `DatabaseAPI20Test.test_description` | Go `ColumnTypes` adaptation: names, types, scan types, lengths, nullable state, and precision/scale; aliases and attributable columns are described conservatively, while expressions and uncertain properties remain unknown |
+| `dialect_test.go`: `TestDialect*` | `TestInsertData.test_insert_datetime`, `.test_insert_numeric_decimal` | Dialect 3 attachment/fixture selection, DATE/TIME/TIMESTAMP, exact scaled NUMERIC/DECIMAL strings, and Dialect-1 server-conversion preservation; Go returns strings for scaled Dialect-3 values rather than Python `Decimal` objects |
+| `parity_test.go`: `TestParityTriggerDefault`, `TestParityVarcharInsertLengths`, `TestParityOctets` | `TestBugs.test_pyib_17`, `.test_pyib_22`; `TestCharsetConversion.test_octets` | Trigger/default, writable VARCHAR lengths, and raw OCTETS CHAR/VARCHAR bytes, including fixed padding, NULL/empty, and direct/prepared paths |
 | `TestCharsetUTF8InsertReadAcrossAttachments` | `TestCharsetConversion.test_utf82win1250` | Original five-field T4 row inserted and committed through UTF8, then read through WIN1250 and UTF8 attachments to the same database; exact original values, column lengths and charsets |
 | `TestReadWIN1250UTF8RoundTrip` | Go-specific regression inspired by `TestCharsetConversion.test_utf82win1250` | Explicit UTF8 input cast followed by WIN1250 and UTF8 conversions on a UTF8 attachment; this SQL does not appear in the upstream test and is not a substitute for its persisted-row contract |
 | `TestReadVarcharParameterLengths`, `TestReadVarchar5000Cast` | `TestBugs.test_pyib_22`, `.test_pyib_25` | Read-side parameter regressions; does not claim the original insert loop |
@@ -229,25 +238,24 @@ checks (contexts, pool reuse, `sql.ErrTxDone`) supplement the Python behavior.
 | `TestTypesIntegerBounds`, `TestTypesCharVarcharUTF8RoundTrip`, `TestTypesUTF8OverlengthRecovery` | `TestInsertData.test_insert_integers`, `.test_insert_char_varchar`; `TestCharsetConversion.testCharVarchar` | Insert/readback, padding, UTF8 character capacity and recovery without truncation |
 | `TestTypesFloatTolerance`, `TestTypesNumericDecimalBindings` | `TestInsertData.test_insert_float_double`, `.test_insert_numeric_decimal` | NaN-safe tolerances, decimal strings/float inputs; no Python Decimal library |
 | `TestTypesTimestampPrecisionAndMidnight`, `TestTypesBooleanRoundTrip` | `TestInsertData.test_insert_datetime`, `.test_insert_boolean`; `TestBugs.test_pyib_44` | `time.Time` fractional/midnight values and boolean readback; no distinct Python date object |
-| `TestTypesTextAndBinaryBlobRoundTrips`, `TestTypesEmptyBytesDistinguishNull` | `TestInsertData.test_insert_blob`; `TestCharsetConversion.testBlob`; `TestBugs.test_pyib_30`; `DatabaseAPI20Test.test_Binary`, `.test_None` | Text/binary BLOB content, UTF8, embedded NUL, 90,000-byte segments and empty versus NULL; no stream reader, OCTETS column or subtype-2 coverage |
+| `TestTypesTextAndBinaryBlobRoundTrips`, `TestTypesEmptyBytesDistinguishNull` | `TestInsertData.test_insert_blob`; `TestCharsetConversion.testBlob`; `TestBugs.test_pyib_30`; `DatabaseAPI20Test.test_Binary`, `.test_None` | Text/binary BLOB content, UTF8, embedded NUL, 90,000-byte segments and empty versus NULL; no stream reader or alternate subtype coverage |
 | `TestTypesVarchar5000Insert` | `TestBugs.test_pyib_25` | Actual DDL/insert/readback for lengths 0, 1 and 5000 |
 
 ## Deferred Coverage
 
-- Dialect-3-only DATE/TIME and high-precision exact decimal semantics await a
-  public dialect selection API. Wide Dialect-1 numerics use float tolerances.
 - Python module attributes, exception hierarchy, cursor fetch/map APIs,
   description tuples, `arraysize`, and input/output sizing do not map directly
   to `database/sql`.
 - Private DPB/SQLDA fields, exact execution plans, version-specific catalog
   counts, role configuration, transaction-info bytes, retaining transactions,
   and explicit TPB objects are not part of this migration.
-- Arrays, stream-BLOB seek/read APIs, events, change views, distributed
-  transactions, schema object models, services, backup/restore and encryption
-  administration remain separate extension suites.
-- This is not exhaustive bug-suite parity. Trigger-default regression
-  `test_pyib_17`, stream and alternate BLOB subtype behavior in `test_pyib_30`,
-  and the original writable `test_pyib_22` sweep are not fully migrated.
+- Arrays, stream-BLOB seek/read APIs, alternate BLOB subtype behavior, events,
+  services, distributed transactions, advanced TPB support, roles, TLS,
+  platform validation, change views, schema object models, backup/restore, and
+  encryption administration remain separate extension suites.
+- This is not exhaustive bug-suite parity. The original writable `test_pyib_22`
+  sweep is adapted for lengths 0 through 254; other upstream behavior remains
+  outside this Go API migration.
 
 ## Interpreting Results
 
@@ -257,13 +265,27 @@ results and scaled floating-point results. The implementation now supports
 those capabilities. There are no feature skips or expected-failure wrappers;
 any failing contract makes the live test command fail.
 
-### Current implementation
+### Current verification
 
-On 2026-09-13 the full suite had **54 passing top-level groups, zero failures
-and zero skips**, against server `LI-V15.1.0.49` and client `LI-V15.1.0.42`.
-All 255 VARCHAR-length subtests passed. New regressions cover actual native
-statement reuse, repeated cursors within an explicit transaction, SQL
-transaction-control rejection, and text BLOB conversion across attachments.
+On 2026-09-14 the full isolated Docker run reported **80 passing top-level
+groups, zero failures and zero skips** from Go JSON output, against server
+`LI-V15.1.0.49` and matching client `LI-V15.1.0.42`. This includes the original
+Dialect 1 suite and the new parity, procedure, metadata, and Dialect 3 contracts.
+The read-side VARCHAR sweep still covers all 255 lengths; the writable sweep
+additionally inserts, commits, and verifies all 255 values.
+
+Offline Go tests, five native ASan/leak harnesses, race tests,
+integration-tagged vet, build, all 15 Bats runner tests, and ShellCheck passed.
+All review findings were fixed and re-reviewed. The runner removed its owned
+container and temporary files; no operational databases or host SDK changes
+were involved.
+
+### Historical verification
+
+On 2026-09-13, before the completed parity, procedure/metadata, and Dialect 3
+work, the suite had **54 passing top-level groups, zero failures and zero
+skips**, against server `LI-V15.1.0.49` and client `LI-V15.1.0.42`. This is
+historical evidence, not a current pass count.
 
 `TestCharsetUTF8InsertReadAcrossAttachments` passed through both WIN1250 and
 UTF8 attachments without a driver change. It faithfully reproduces the upstream
@@ -312,16 +334,17 @@ The original shorthand omitted the innermost UTF8 cast. Its native failure
 remains a limitation of the tested query/binding combination; these results
 do not establish a general server defect or behavior on other versions.
 
-### Migration baseline
+### Earlier migration baseline
 
 The first host-only attempt was blocked by a missing local server. On
 2026-09-12, Docker-backed validation used server `LI-V15.1.0.49` and client
 `LI-V15.1.0.42` with the existing driver compiled against the installed SDK.
 Provisioning and cleanup passed, including the complete fixture schema.
 
-The full suite had **19 passing and 28 failing top-level groups**: the smoke
-test, two helper checks, and 16 read contracts passed. All 255 individually
-named VARCHAR-length subtests passed. Three read contracts failed:
+The then-full suite had **19 passing and 28 failing top-level groups**: the
+smoke test, two helper checks, and 16 read contracts passed. This is a
+historical migration baseline, not a current result. All 255 individually named
+VARCHAR-length subtests passed. Three read contracts failed:
 
 - `TestReadCHARPadding`: UTF8 `CHAR(5)` decoded as 20 bytes of padded text
   (`"AA"` plus 18 spaces), instead of five characters.
@@ -331,11 +354,8 @@ named VARCHAR-length subtests passed. Three read contracts failed:
   same charset conversion with a UTF8 SQL literal succeeded through isql,
   narrowing this to parameter handling rather than unavailable server support.
 
-The other 25 failing groups exercise intentionally unfinished writes,
-transactions, public preparation and additional argument/BLOB types. They now
-fail on actual driver capabilities, not fixture setup. No driver behavior was
-changed or assertions relaxed to obtain these results. This validates the
-tested image/client combination, not general 14.x/15.x compatibility or a
-passing implementation of the full contract suite.
+The other 25 failing groups reflected capabilities that were unfinished at that
+time. This validates that historical image/client combination, not general
+14.x/15.x compatibility or a current full-suite result.
 
 Attribution and permission notices are retained in `UPSTREAM_LICENSE.txt`.

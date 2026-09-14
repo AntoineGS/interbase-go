@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -266,6 +267,7 @@ func parentDeathHelperProcess() {
 		ISQL:     isql,
 		User:     "SYSDBA",
 		Password: "masterkey",
+		Dialect:  1,
 	}, "")
 	if db != nil {
 		_ = db.Close()
@@ -329,6 +331,9 @@ func TestDefaults(t *testing.T) {
 	}
 	if cfg.User != "SYSDBA" || cfg.Password != "masterkey" || cfg.ISQL != "/opt/interbase/bin/isql" {
 		t.Fatalf("unexpected test defaults: %+v", cfg)
+	}
+	if got := scriptDialect(cfg); got != 3 {
+		t.Fatalf("default fixture dialect = %d, want 3", got)
 	}
 }
 
@@ -451,6 +456,91 @@ func TestConfigRejectsControlCharacters(t *testing.T) {
 	}
 }
 
+func TestConfigDialectDefaultsAndValidation(t *testing.T) {
+	field, ok := reflect.TypeOf(Config{}).FieldByName("Dialect")
+	if !ok {
+		t.Fatal("testfixture.Config.Dialect is missing")
+	}
+	if field.Type != reflect.TypeOf(int(0)) {
+		t.Fatalf("testfixture.Config.Dialect type = %v, want int", field.Type)
+	}
+
+	base := Config{ISQL: "/tmp/isql", User: "SYSDBA", Password: "masterkey"}
+	for _, test := range []struct {
+		name  string
+		value int
+		want  int
+		valid bool
+	}{
+		{name: "default", value: 0, want: 3, valid: true},
+		{name: "dialect one", value: 1, want: 1, valid: true},
+		{name: "dialect three", value: 3, want: 3, valid: true},
+		{name: "dialect two", value: 2, valid: false},
+		{name: "negative", value: -1, valid: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base
+			reflect.ValueOf(&cfg).Elem().FieldByName("Dialect").SetInt(int64(test.value))
+			err := validateConfig(cfg)
+			if (err == nil) != test.valid {
+				t.Fatalf("validateConfig(Dialect=%d) error = %v, valid = %t", test.value, err, test.valid)
+			}
+			if test.valid {
+				got, normalizeErr := normalizeDialect(test.value)
+				if normalizeErr != nil {
+					t.Fatalf("normalizeDialect(Dialect=%d) returned error: %v", test.value, normalizeErr)
+				}
+				if got != test.want {
+					t.Fatalf("normalizeDialect(Dialect=%d) = %d, want %d", test.value, got, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestDialectIsPropagatedToISQLScripts(t *testing.T) {
+	cfg := Config{ISQL: "/tmp/isql", User: "SYSDBA", Password: "masterkey"}
+	field := reflect.ValueOf(&cfg).Elem().FieldByName("Dialect")
+	if !field.IsValid() {
+		t.Fatal("testfixture.Config.Dialect is missing")
+	}
+	field.SetInt(3)
+
+	create := createScript("/tmp/example.ib", cfg, "CREATE TABLE T (ID INTEGER);")
+	if !strings.Contains(create, "SET SQL DIALECT 3;") {
+		t.Fatalf("create script does not select Dialect 3:\n%s", create)
+	}
+	if strings.Contains(create, "SET SQL DIALECT 1;") {
+		t.Fatalf("create script selected Dialect 1 for Dialect 3:\n%s", create)
+	}
+
+	drop := dropScript("/tmp/example.ib", cfg)
+	if !strings.Contains(drop, "SET SQL DIALECT 3;") {
+		t.Fatalf("drop script does not select Dialect 3:\n%s", drop)
+	}
+	if strings.Contains(drop, "SET SQL DIALECT 1;") {
+		t.Fatalf("drop script selected Dialect 1 for Dialect 3:\n%s", drop)
+	}
+}
+
+func TestCreateRejectsInvalidDialectBeforeSubprocessExecution(t *testing.T) {
+	cfg := helperConfig(t, "success")
+	field := reflect.ValueOf(&cfg).Elem().FieldByName("Dialect")
+	if !field.IsValid() {
+		t.Fatal("testfixture.Config.Dialect is missing")
+	}
+	field.SetInt(2)
+
+	db, err := Create(context.Background(), cfg, "")
+	if db != nil {
+		_ = db.Close()
+		t.Fatal("Create returned a fixture for an invalid dialect")
+	}
+	if err == nil {
+		t.Fatal("Create accepted an invalid dialect")
+	}
+}
+
 func TestSQLScriptsEscapeLiterals(t *testing.T) {
 	cfg := Config{ISQL: "/tmp/isql", User: "O'Reilly", Password: "p'ass"}
 	path := "/tmp/fixture's/database's.ib"
@@ -458,6 +548,7 @@ func TestSQLScriptsEscapeLiterals(t *testing.T) {
 
 	create := createScript(path, cfg, schema)
 	for _, want := range []string{
+		"SET SQL DIALECT 3;",
 		"CREATE DATABASE '/tmp/fixture''s/database''s.ib'",
 		"USER 'O''Reilly'",
 		"PASSWORD 'p''ass'",
@@ -473,6 +564,7 @@ func TestSQLScriptsEscapeLiterals(t *testing.T) {
 
 	drop := dropScript(path, cfg)
 	for _, want := range []string{
+		"SET SQL DIALECT 3;",
 		"CONNECT '/tmp/fixture''s/database''s.ib'",
 		"USER 'O''Reilly'",
 		"PASSWORD 'p''ass'",
@@ -804,6 +896,7 @@ func TestCreateRemovesEmptyDirectoryWhenISQLIsMissing(t *testing.T) {
 		ISQL:     filepath.Join(t.TempDir(), "missing-isql"),
 		User:     "SYSDBA",
 		Password: "masterkey",
+		Dialect:  1,
 	}
 	db, err := Create(context.Background(), cfg, "")
 	if db == nil {
@@ -1131,7 +1224,7 @@ func helperConfig(t *testing.T, mode string) Config {
 		t.Fatal(err)
 	}
 	t.Setenv("INTERBASE_FIXTURE_HELPER", mode)
-	return Config{ISQL: isql, User: "SYSDBA", Password: "masterkey"}
+	return Config{ISQL: isql, User: "SYSDBA", Password: "masterkey", Dialect: 1}
 }
 
 type parentDeathReady struct {

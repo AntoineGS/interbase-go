@@ -5,7 +5,36 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <ibase.h>
+
+static char attach_database_token;
+static unsigned char captured_dpb[256];
+static unsigned short captured_dpb_length;
+
+static ISC_STATUS test_attach_database(ISC_STATUS *status, short database_length,
+	char *database, isc_db_handle *database_handle, short dpb_length,
+	char *dpb)
+{
+	(void) database_length;
+	(void) database;
+	if (dpb_length < 0 || (size_t) dpb_length > sizeof(captured_dpb)) {
+		status[0] = isc_arg_gds;
+		status[1] = isc_network_error;
+		status[2] = isc_arg_end;
+		return status[1];
+	}
+	captured_dpb_length = (unsigned short) dpb_length;
+	memcpy(captured_dpb, dpb, (size_t) dpb_length);
+	*database_handle = &attach_database_token;
+	status[0] = isc_arg_gds;
+	status[1] = 0;
+	status[2] = isc_arg_end;
+	return 0;
+}
+
+#define isc_attach_database test_attach_database
 #include "../native.c"
+#undef isc_attach_database
 
 static void require_condition(int condition, const char *message)
 {
@@ -88,10 +117,75 @@ static void test_sqlcode_status_keeps_numeric_context(void)
 	ib_error_free(error);
 }
 
+static void test_dialect_is_encoded_in_dpb(void)
+{
+	ib_connection *connection;
+	char *error = NULL;
+	size_t offset;
+	int dialect_seen;
+
+	memset(captured_dpb, 0, sizeof(captured_dpb));
+	captured_dpb_length = 0;
+	connection = ib_connection_open("database", strlen("database"),
+		"SYSDBA", strlen("SYSDBA"), "masterkey", strlen("masterkey"),
+		"UTF8", strlen("UTF8"), SQL_DIALECT_V6, &error);
+	require_condition(connection != NULL && error == NULL,
+		"Dialect 3 connection open failed");
+	if (connection == NULL) {
+		ib_error_free(error);
+		return;
+	}
+	require_condition(connection->dialect == SQL_DIALECT_V6,
+		"Dialect 3 was not retained in native connection state");
+	dialect_seen = 0;
+	require_condition(captured_dpb_length > 0U &&
+		captured_dpb[0] == isc_dpb_version1,
+		"captured DPB has the wrong version marker");
+	offset = 1U;
+	while (offset < (size_t) captured_dpb_length) {
+		unsigned char tag;
+		unsigned char length;
+
+		require_condition((size_t) captured_dpb_length - offset >= 2U,
+			"captured DPB item header is truncated");
+		if ((size_t) captured_dpb_length - offset < 2U) {
+			break;
+		}
+		tag = captured_dpb[offset++];
+		length = captured_dpb[offset++];
+		require_condition((size_t) captured_dpb_length - offset >= length,
+			"captured DPB item is truncated");
+		if ((size_t) captured_dpb_length - offset < length) {
+			break;
+		}
+		if (tag == isc_dpb_sql_dialect && length == 1U) {
+			dialect_seen++;
+			require_condition(captured_dpb[offset] == SQL_DIALECT_V6,
+				"captured DPB selected the wrong SQL dialect");
+		}
+		offset += length;
+	}
+	require_condition(dialect_seen == 1, "captured DPB has no unique SQL dialect item");
+	connection->database = NULL;
+	free(connection);
+}
+
+static void test_unset_connection_defaults_to_dialect_three(void)
+{
+	ib_connection connection = {0};
+
+	require_condition(ib_connection_dialect(&connection) == SQL_DIALECT_V6,
+		"unset native connection did not use the Dialect 3 default");
+	require_condition(ib_connection_dialect(NULL) == SQL_DIALECT_V6,
+		"missing native connection did not use the Dialect 3 default");
+}
+
 int main(void)
 {
 	test_long_interpreted_status_is_not_rendered();
 	test_sqlcode_status_keeps_numeric_context();
+	test_unset_connection_defaults_to_dialect_three();
+	test_dialect_is_encoded_in_dpb();
 	(void) puts("native status tests passed");
 	return EXIT_SUCCESS;
 }
