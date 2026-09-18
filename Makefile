@@ -46,6 +46,8 @@ test-native:
 	ASAN_OPTIONS=detect_leaks=1 ./bin/native_services_test
 	$(CC) -std=c11 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer $(NATIVE_CFLAGS) events/native.c tests/native_events_test.c $(NATIVE_LDFLAGS) -pthread -o bin/native_events_test
 	ASAN_OPTIONS=detect_leaks=1 ./bin/native_events_test
+	$(CC) -std=c11 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer $(NATIVE_CFLAGS) tests/native_cancel_test.c $(NATIVE_LDFLAGS) -pthread -o bin/native_cancel_test
+	ASAN_OPTIONS=detect_leaks=1 ./bin/native_cancel_test
 
 test-runner:
 	@command -v "$(BATS)" >/dev/null 2>&1 || { printf '%s\n' 'bats-core is required for runner tests' >&2; exit 2; }

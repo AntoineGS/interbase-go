@@ -7,6 +7,7 @@
 #include <iconv.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,26 @@
 #define IB_CHARSET_WIN1250 51
 #define IB_CHARSET_WIN1252 53
 #define IB_CHARSET_UTF8 59
+
+#if defined(__GNUC__) || defined(__clang__)
+#define IB_MAYBE_UNUSED __attribute__((__unused__))
+#else
+#define IB_MAYBE_UNUSED
+#endif
+
+struct ib_cancel_slot {
+	pthread_mutex_t mutex;
+	pthread_cond_t condition;
+	uint64_t generation;
+	int active;
+	int published;
+	isc_stmt_handle statement;
+	unsigned int cancel_users;
+	int operation_complete;
+	int completing;
+	ISC_STATUS cancel_status[IB_STATUS_VECTOR_LENGTH];
+	int64_t cancel_native_code;
+};
 
 enum ib_argument_kind {
 	IB_ARGUMENT_NULL = 0,
@@ -641,6 +662,295 @@ static int ib_fail(char **error, const char *message)
 	copy = ib_copy_string(message, strlen(message));
 	ib_give_error(error, copy);
 	return -1;
+}
+
+static int ib_pthread_fail(char **error, const char *operation, int result)
+{
+	char message[256];
+	const char *detail;
+
+	detail = strerror(result);
+	if (detail == NULL) {
+		detail = "unknown synchronization error";
+	}
+	(void) snprintf(message, sizeof(message), "%s failed: %s", operation, detail);
+	return ib_fail(error, message);
+}
+
+ib_cancel_slot *ib_cancel_slot_new(char **error)
+{
+	ib_cancel_slot *slot;
+	int result;
+
+	if (error != NULL) {
+		*error = NULL;
+	}
+	slot = (ib_cancel_slot *) malloc(sizeof(*slot));
+	if (slot == NULL) {
+		(void) ib_fail(error, "out of memory allocating cancellation slot");
+		return NULL;
+	}
+	(void) memset(slot, 0, sizeof(*slot));
+	slot->operation_complete = 1;
+	result = pthread_mutex_init(&slot->mutex, NULL);
+	if (result != 0) {
+		free(slot);
+		(void) ib_pthread_fail(error, "pthread_mutex_init", result);
+		return NULL;
+	}
+	result = pthread_cond_init(&slot->condition, NULL);
+	if (result != 0) {
+		(void) pthread_mutex_destroy(&slot->mutex);
+		free(slot);
+		(void) ib_pthread_fail(error, "pthread_cond_init", result);
+		return NULL;
+	}
+	return slot;
+}
+
+uint64_t ib_cancel_slot_begin(ib_cancel_slot *slot, char **error)
+{
+	uint64_t generation;
+	int result;
+
+	if (error != NULL) {
+		*error = NULL;
+	}
+	if (slot == NULL) {
+		(void) ib_fail(error, "cancellation slot is unavailable");
+		return 0U;
+	}
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		(void) ib_pthread_fail(error, "pthread_mutex_lock", result);
+		return 0U;
+	}
+	if (slot->active || slot->completing || slot->cancel_users != 0U) {
+		(void) pthread_mutex_unlock(&slot->mutex);
+		(void) ib_fail(error, "cancellation slot operation is already active");
+		return 0U;
+	}
+	if (slot->generation == UINT64_MAX) {
+		(void) pthread_mutex_unlock(&slot->mutex);
+		(void) ib_fail(error, "cancellation slot generation exhausted");
+		return 0U;
+	}
+	generation = slot->generation + 1U;
+	slot->generation = generation;
+	slot->active = 1;
+	slot->published = 0;
+	slot->statement = NULL;
+	slot->operation_complete = 0;
+	slot->cancel_native_code = 0;
+	(void) memset(slot->cancel_status, 0, sizeof(slot->cancel_status));
+	result = pthread_cond_broadcast(&slot->condition);
+	if (result != 0) {
+		slot->active = 0;
+		slot->operation_complete = 1;
+		(void) pthread_mutex_unlock(&slot->mutex);
+		(void) ib_pthread_fail(error, "pthread_cond_broadcast", result);
+		return 0U;
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		(void) ib_pthread_fail(error, "pthread_mutex_unlock", result);
+		return 0U;
+	}
+	return generation;
+}
+
+static int IB_MAYBE_UNUSED ib_cancel_slot_publish(ib_cancel_slot *slot,
+	uint64_t generation,
+	isc_stmt_handle *statement, char **error)
+{
+	int result;
+
+	if (error != NULL) {
+		*error = NULL;
+	}
+	if (slot == NULL || statement == NULL || generation == 0U) {
+		return ib_fail(error, "cancellation slot publication arguments are invalid");
+	}
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		return ib_pthread_fail(error, "pthread_mutex_lock", result);
+	}
+	if (slot->generation != generation || !slot->active ||
+		slot->operation_complete || slot->completing || slot->published) {
+		(void) pthread_mutex_unlock(&slot->mutex);
+		return ib_fail(error, "cancellation slot generation cannot be published");
+	}
+	slot->statement = *statement;
+	slot->published = 1;
+	result = pthread_cond_broadcast(&slot->condition);
+	if (result != 0) {
+		slot->statement = NULL;
+		slot->published = 0;
+		(void) pthread_mutex_unlock(&slot->mutex);
+		return ib_pthread_fail(error, "pthread_cond_broadcast", result);
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		return ib_pthread_fail(error, "pthread_mutex_unlock", result);
+	}
+	return 0;
+}
+
+static void IB_MAYBE_UNUSED ib_cancel_slot_complete(ib_cancel_slot *slot,
+	uint64_t generation)
+{
+	int result;
+
+	if (slot == NULL || generation == 0U) {
+		return;
+	}
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	if (slot->generation != generation || slot->operation_complete ||
+		slot->completing) {
+		if (pthread_mutex_unlock(&slot->mutex) != 0) {
+			abort();
+		}
+		return;
+	}
+	slot->active = 0;
+	slot->published = 0;
+	slot->statement = NULL;
+	slot->operation_complete = 1;
+	slot->completing = 1;
+	result = pthread_cond_broadcast(&slot->condition);
+	if (result != 0) {
+		(void) pthread_mutex_unlock(&slot->mutex);
+		abort();
+	}
+	while (slot->cancel_users != 0U) {
+		result = pthread_cond_wait(&slot->condition, &slot->mutex);
+		if (result != 0) {
+			(void) pthread_mutex_unlock(&slot->mutex);
+			abort();
+		}
+	}
+	slot->completing = 0;
+	result = pthread_cond_broadcast(&slot->condition);
+	if (result != 0) {
+		(void) pthread_mutex_unlock(&slot->mutex);
+		abort();
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+}
+
+int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
+	int64_t *native_code, char **error)
+{
+	isc_stmt_handle statement;
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result_status;
+	int result;
+	int request_result;
+
+	if (error != NULL) {
+		*error = NULL;
+	}
+	if (native_code == NULL) {
+		return ib_fail(error, "cancellation native status output is unavailable");
+	}
+	*native_code = 0;
+	if (slot == NULL) {
+		return ib_fail(error, "cancellation slot is unavailable");
+	}
+	statement = NULL;
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		return ib_pthread_fail(error, "pthread_mutex_lock", result);
+	}
+	for (;;) {
+		if (slot->generation != generation || slot->operation_complete ||
+			!slot->active || slot->completing) {
+			result = pthread_mutex_unlock(&slot->mutex);
+			if (result != 0) {
+				return ib_pthread_fail(error, "pthread_mutex_unlock", result);
+			}
+			return 0;
+		}
+		if (slot->published) {
+			if (slot->cancel_users == UINT_MAX) {
+				(void) pthread_mutex_unlock(&slot->mutex);
+				return ib_fail(error, "cancellation slot user count exhausted");
+			}
+			statement = slot->statement;
+			slot->cancel_users++;
+			break;
+		}
+		result = pthread_cond_wait(&slot->condition, &slot->mutex);
+		if (result != 0) {
+			(void) pthread_mutex_unlock(&slot->mutex);
+			return ib_pthread_fail(error, "pthread_cond_wait", result);
+		}
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		return ib_pthread_fail(error, "pthread_mutex_unlock", result);
+	}
+
+	(void) memset(status, 0, sizeof(status));
+	result_status = isc_dsql_free_statement(status, &statement, DSQL_cancel);
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	(void) memcpy(slot->cancel_status, status, sizeof(slot->cancel_status));
+	slot->cancel_native_code = (int64_t) result_status;
+	slot->cancel_users--;
+	request_result = pthread_cond_broadcast(&slot->condition);
+	if (request_result != 0) {
+		(void) pthread_mutex_unlock(&slot->mutex);
+		abort();
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	*native_code = (int64_t) result_status;
+	return 0;
+}
+
+void ib_cancel_slot_free(ib_cancel_slot *slot)
+{
+	int result;
+
+	if (slot == NULL) {
+		return;
+	}
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	while (slot->active || slot->published || slot->completing ||
+		slot->cancel_users != 0U) {
+		result = pthread_cond_wait(&slot->condition, &slot->mutex);
+		if (result != 0) {
+			(void) pthread_mutex_unlock(&slot->mutex);
+			abort();
+		}
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	result = pthread_cond_destroy(&slot->condition);
+	if (result != 0) {
+		abort();
+	}
+	result = pthread_mutex_destroy(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	free(slot);
 }
 
 static char *ib_join_errors(const char *first, const char *second)

@@ -12,6 +12,7 @@ typedef struct ib_bindings ib_bindings;
 typedef struct ib_statement ib_statement;
 typedef struct ib_blob_reader ib_blob_reader;
 typedef struct ib_blob_writer ib_blob_writer;
+typedef struct ib_cancel_slot ib_cancel_slot;
 
 enum ib_value_kind {
 	IB_VALUE_NULL = 0,
@@ -25,6 +26,12 @@ enum ib_value_kind {
 	IB_VALUE_ARRAY = 8,
 	IB_VALUE_BLOB_REF = 9
 };
+
+ib_cancel_slot *ib_cancel_slot_new(char **error);
+uint64_t ib_cancel_slot_begin(ib_cancel_slot *slot, char **error);
+int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
+	int64_t *native_code, char **error);
+void ib_cancel_slot_free(ib_cancel_slot *slot);
 
 /* The status of an SDK handle after an operation reports an error.  A live
  * handle remains owned by its wrapper and may be retried through an explicit
