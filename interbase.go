@@ -910,13 +910,6 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 		metadata:            append([]columnMetadata(nil), nativeRows.metadata...),
 	}
 	conn.registerRowsLocked(result)
-	if err := contextError(ctx); err != nil {
-		closeErr := result.abortLocked(err)
-		if closeErr != nil {
-			return nil, errors.Join(err, closeErr)
-		}
-		return nil, err
-	}
 	return result, nil
 }
 
@@ -1440,10 +1433,6 @@ func (r *rows) Next(dest []driver.Value) error {
 			contextCancellation(r.ctx), operationErr, nil)
 		return errors.Join(operationErr, r.abortLocked(operationErr))
 	}
-	if err := contextError(r.ctx); err != nil {
-		releaseNative()
-		return errors.Join(err, r.abortLocked(err))
-	}
 	if !hasRow {
 		releaseNative()
 		if err := r.closeLocked(); err != nil {
@@ -1472,9 +1461,6 @@ func (r *rows) Next(dest []driver.Value) error {
 		dest[i] = value
 	}
 	releaseNative()
-	if err := contextError(r.ctx); err != nil {
-		return errors.Join(err, r.abortLocked(err))
-	}
 	return nil
 }
 

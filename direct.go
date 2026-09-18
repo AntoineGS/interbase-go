@@ -1750,9 +1750,6 @@ func (c *Cursor) Next(ctx context.Context) (bool, error) {
 		closeErr := c.closeLocked(true, operationErr)
 		return false, errors.Join(operationErr, closeErr)
 	}
-	if err := contextError(ctx); err != nil {
-		return false, errors.Join(err, c.closeLocked(true, err))
-	}
 	if !hasRow {
 		return false, c.closeLocked(false, nil)
 	}

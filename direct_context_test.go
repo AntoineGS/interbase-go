@@ -285,3 +285,52 @@ func TestDirectCursorNextCancelsActiveNativeFetch(t *testing.T) {
 		t.Fatalf("direct cursor cleanup = closed %v native %p cursors %d; want closed cursor removed from transaction", cursor.closed, cursor.native, len(transaction.cursors))
 	}
 }
+
+func TestDirectCursorNextPreservesCompletedNativeFetch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, transaction := newDirectContextTestTransaction(t)
+	transaction.native = &nativeTransaction{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	cursor := &Cursor{
+		tx:         transaction,
+		generation: transaction.generation,
+		native: &nativeCursor{
+			nextOverride: func() (bool, error) {
+				close(entered)
+				<-release
+				return true, nil
+			},
+		},
+	}
+	transaction.cursors[cursor] = struct{}{}
+
+	nextDone := make(chan struct {
+		hasRow bool
+		err    error
+	}, 1)
+	go func() {
+		hasRow, err := cursor.Next(ctx)
+		nextDone <- struct {
+			hasRow bool
+			err    error
+		}{hasRow: hasRow, err: err}
+	}()
+	waitForTestSignal(t, entered, "direct cursor fetch did not enter the native call")
+	cancel()
+	close(release)
+	result := <-nextDone
+	if result.err != nil {
+		t.Fatalf("completed direct Cursor.Next() error = %v, want nil", result.err)
+	}
+	if !result.hasRow {
+		t.Fatal("completed direct Cursor.Next() reported no row")
+	}
+	if cursor.closed || !cursor.fetched {
+		t.Fatalf("completed direct cursor state = closed %v fetched %v; want open fetched cursor", cursor.closed, cursor.fetched)
+	}
+	if err := cursor.Close(); err != nil {
+		t.Fatalf("completed direct cursor Close() error = %v", err)
+	}
+}

@@ -38,7 +38,7 @@ test-native:
 	ASAN_OPTIONS=detect_leaks=1 ./bin/native_plan_test
 	$(CC) -std=c11 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer $(NATIVE_CFLAGS) tests/native_blob_test.c $(NATIVE_LDFLAGS) -o bin/native_blob_test
 	ASAN_OPTIONS=detect_leaks=1 ./bin/native_blob_test
-	$(CC) -std=c11 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer $(NATIVE_CFLAGS) tests/native_prepared_test.c $(NATIVE_LDFLAGS) -o bin/native_prepared_test
+	$(CC) -std=c11 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer $(NATIVE_CFLAGS) tests/native_prepared_test.c $(NATIVE_LDFLAGS) -pthread -o bin/native_prepared_test
 	ASAN_OPTIONS=detect_leaks=1 ./bin/native_prepared_test
 	$(CC) -std=c11 -Wall -Wextra -g -O1 -fsanitize=address -fno-omit-frame-pointer $(NATIVE_CFLAGS) tests/native_distributed_test.c $(NATIVE_LDFLAGS) -o bin/native_distributed_test
 	ASAN_OPTIONS=detect_leaks=1 ./bin/native_distributed_test

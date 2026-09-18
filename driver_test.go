@@ -781,6 +781,57 @@ func TestDatabaseSQLPreparedQueryContextCancelsActiveNativeCall(t *testing.T) {
 	}
 }
 
+func TestDatabaseSQLPreparedQueryContextPreservesCompletedNativeResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	connection := &conn{
+		native: &nativeConnection{
+			brokenOverride: func() bool { return false },
+			prepareOverride: func(string) (*nativeStatement, error) {
+				return &nativeStatement{
+					numInputOverride: func() int { return -1 },
+					queryOverride: func([]argument) (*nativeCursor, []string, error) {
+						close(entered)
+						<-release
+						return &nativeCursor{}, nil, nil
+					},
+				}, nil
+			},
+		},
+	}
+	db := openDatabaseSQLTestDB(t, connection)
+	statement, err := db.PrepareContext(context.Background(), "SELECT value FROM example")
+	if err != nil {
+		t.Fatalf("DB.PrepareContext() error = %v", err)
+	}
+	defer statement.Close()
+
+	type queryResult struct {
+		rows *sql.Rows
+		err  error
+	}
+	resultDone := make(chan queryResult, 1)
+	go func() {
+		rows, queryErr := statement.QueryContext(ctx)
+		resultDone <- queryResult{rows: rows, err: queryErr}
+	}()
+	waitForTestSignal(t, entered, "prepared query did not enter the native call")
+	cancel()
+	close(release)
+	result := <-resultDone
+	if result.err != nil {
+		t.Fatalf("completed prepared QueryContext() error = %v, want nil", result.err)
+	}
+	if result.rows == nil {
+		t.Fatal("completed prepared QueryContext() returned nil rows")
+	}
+	if err := result.rows.Close(); err != nil {
+		t.Fatalf("completed prepared query Rows.Close() error = %v", err)
+	}
+}
+
 func TestRowsNextCancelsActiveNativeFetch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -831,6 +882,41 @@ func TestRowsNextCancelsActiveNativeFetch(t *testing.T) {
 	}
 	if errors.Is(err, driver.ErrBadConn) {
 		t.Fatal("rows fetch cancellation was classified as driver.ErrBadConn")
+	}
+}
+
+func TestRowsNextPreservesCompletedNativeFetch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	connection := &conn{
+		native: &nativeConnection{
+			brokenOverride: func() bool { return false },
+		},
+	}
+	native := &nativeCursor{
+		nextOverride: func() (bool, error) {
+			close(entered)
+			<-release
+			return true, nil
+		},
+		abortOverride: func() error { return nil },
+	}
+	result := &rows{conn: connection, native: native, ctx: ctx}
+	nextDone := make(chan error, 1)
+	go func() { nextDone <- result.Next(nil) }()
+	waitForTestSignal(t, entered, "rows fetch did not enter the native call")
+	cancel()
+	close(release)
+	if err := <-nextDone; err != nil {
+		t.Fatalf("completed rows.Next() error = %v, want nil", err)
+	}
+	if result.closed {
+		t.Fatal("completed rows.Next() aborted the successful row")
+	}
+	if err := result.Close(); err != nil {
+		t.Fatalf("completed rows.Close() error = %v", err)
 	}
 }
 

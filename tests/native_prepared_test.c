@@ -1,4 +1,5 @@
 #include <stdarg.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +27,8 @@ ISC_STATUS test_dsql_free_statement(ISC_STATUS *, isc_stmt_handle *, unsigned sh
 ISC_STATUS test_dsql_prepare(ISC_STATUS *, isc_tr_handle *, isc_stmt_handle *, unsigned short, char *, unsigned short, XSQLDA *);
 ISC_STATUS test_dsql_sql_info(ISC_STATUS *, isc_stmt_handle *, short, char *, short, char *);
 ISC_STATUS test_detach_database(ISC_STATUS *, isc_db_handle *);
+struct ib_cancel_slot;
+static void overlap_completion_wait_hook(struct ib_cancel_slot *slot);
 
 #define isc_start_transaction test_start_transaction
 #define isc_commit_transaction test_commit_transaction
@@ -41,7 +44,9 @@ ISC_STATUS test_detach_database(ISC_STATUS *, isc_db_handle *);
 #define isc_dsql_sql_info test_dsql_sql_info
 #define isc_detach_database test_detach_database
 #define malloc test_malloc
+#define IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK(slot) overlap_completion_wait_hook(slot)
 #include "../native.c"
+#undef IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK
 #undef isc_start_transaction
 #undef isc_commit_transaction
 #undef isc_rollback_transaction
@@ -127,6 +132,27 @@ static isc_stmt_handle expected_cancel_statement;
 static int execute_publication_calls;
 static int execute2_publication_calls;
 static int fetch_publication_calls;
+enum overlap_kind {
+	OVERLAP_NONE = 0,
+	OVERLAP_EXECUTE = 1,
+	OVERLAP_EXECUTE2 = 2,
+	OVERLAP_FETCH = 3
+};
+static pthread_mutex_t overlap_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t overlap_condition = PTHREAD_COND_INITIALIZER;
+static int overlap_mode;
+static int overlap_native_entered;
+static int overlap_native_release;
+static int overlap_native_failed;
+static int overlap_cancel_entered;
+static int overlap_cancel_release;
+static int overlap_cancel_failed;
+static int overlap_cancel_in_call;
+static int overlap_cancel_requested;
+static int overlap_completion_waiting;
+static int overlap_operation_done;
+static int overlap_cleanup_calls;
+static int overlap_cleanup_violations;
 static char database_token;
 static char transaction_tokens[32];
 static char statement_tokens[32];
@@ -149,26 +175,50 @@ static void check(int condition, const char *message)
 static void check_cancel_publication(isc_stmt_handle *statement, int *seen,
 	const char *message)
 {
+	ib_cancel_slot *slot;
+	uint64_t generation;
+	isc_stmt_handle expected_statement;
+	int published;
+
 	if (expected_cancel_slot == NULL || statement == NULL ||
 		expected_cancel_statement == NULL || *statement != expected_cancel_statement) {
 		return;
 	}
+	slot = expected_cancel_slot;
+	generation = expected_cancel_generation;
+	expected_statement = expected_cancel_statement;
 	(*seen)++;
-	check(expected_cancel_slot->generation == expected_cancel_generation &&
-		expected_cancel_slot->active && expected_cancel_slot->published &&
-		expected_cancel_slot->statement == *statement,
+	if (pthread_mutex_lock(&slot->mutex) != 0) {
+		abort();
+	}
+	published = slot->generation == generation && slot->active &&
+		slot->published && slot->statement == expected_statement &&
+		slot->statement == *statement;
+	if (pthread_mutex_unlock(&slot->mutex) != 0) {
+		abort();
+	}
+	check(published,
 		message);
 }
 
 static void check_cancel_complete(const char *message)
 {
+	ib_cancel_slot *slot;
+	int complete;
+
 	if (expected_cancel_slot == NULL) {
 		return;
 	}
-	check(!expected_cancel_slot->active && !expected_cancel_slot->published &&
-		expected_cancel_slot->operation_complete &&
-		expected_cancel_slot->cancel_users == 0U &&
-		expected_cancel_slot->cancel_callers == 0U, message);
+	slot = expected_cancel_slot;
+	if (pthread_mutex_lock(&slot->mutex) != 0) {
+		abort();
+	}
+	complete = !slot->active && !slot->published && slot->operation_complete &&
+		slot->cancel_users == 0U && slot->cancel_callers == 0U;
+	if (pthread_mutex_unlock(&slot->mutex) != 0) {
+		abort();
+	}
+	check(complete, message);
 }
 
 static int is_catalog_statement(const isc_stmt_handle *statement)
@@ -218,8 +268,197 @@ static ISC_STATUS status_result(ISC_STATUS *status, int failed)
 	return status[1];
 }
 
+static ISC_STATUS status_code(ISC_STATUS *status, ISC_STATUS code)
+{
+	status[0] = isc_arg_gds;
+	status[1] = code;
+	status[2] = isc_arg_end;
+	return code;
+}
+
+static void overlap_lock(void)
+{
+	if (pthread_mutex_lock(&overlap_mutex) != 0) {
+		abort();
+	}
+}
+
+static void overlap_unlock(void)
+{
+	if (pthread_mutex_unlock(&overlap_mutex) != 0) {
+		abort();
+	}
+}
+
+static void overlap_broadcast(void)
+{
+	if (pthread_cond_broadcast(&overlap_condition) != 0) {
+		abort();
+	}
+}
+
+static void overlap_wait(int *condition)
+{
+	while (!*condition) {
+		if (pthread_cond_wait(&overlap_condition, &overlap_mutex) != 0) {
+			abort();
+		}
+	}
+}
+
+static void overlap_reset(int mode, int native_failed, int cancel_failed)
+{
+	overlap_lock();
+	overlap_mode = mode;
+	overlap_native_entered = 0;
+	overlap_native_release = 0;
+	overlap_native_failed = native_failed;
+	overlap_cancel_entered = 0;
+	overlap_cancel_release = 0;
+	overlap_cancel_failed = cancel_failed;
+	overlap_cancel_in_call = 0;
+	overlap_cancel_requested = 0;
+	overlap_completion_waiting = 0;
+	overlap_operation_done = 0;
+	overlap_cleanup_calls = 0;
+	overlap_cleanup_violations = 0;
+	overlap_unlock();
+}
+
+static int overlap_native_call(enum overlap_kind kind)
+{
+	int failed;
+
+	overlap_lock();
+	if (overlap_mode != (int) kind) {
+		overlap_unlock();
+		return 0;
+	}
+	overlap_native_entered = 1;
+	overlap_broadcast();
+	overlap_wait(&overlap_native_release);
+	failed = overlap_native_failed;
+	overlap_unlock();
+	return failed;
+}
+
+static ISC_STATUS overlap_cancel_call(ISC_STATUS *status)
+{
+	int failed;
+
+	overlap_lock();
+	overlap_cancel_entered = 1;
+	overlap_cancel_in_call = 1;
+	overlap_cancel_requested = 1;
+	overlap_broadcast();
+	overlap_wait(&overlap_cancel_release);
+	failed = overlap_cancel_failed;
+	overlap_cancel_in_call = 0;
+	overlap_broadcast();
+	overlap_unlock();
+	return status_result(status, failed);
+}
+
+static void overlap_cleanup_event(void)
+{
+	overlap_lock();
+	overlap_cleanup_calls++;
+	if (overlap_cancel_in_call) {
+		overlap_cleanup_violations++;
+	}
+	overlap_broadcast();
+	overlap_unlock();
+}
+
+static void overlap_completion_wait_hook(struct ib_cancel_slot *slot)
+{
+	(void) slot;
+	overlap_lock();
+	overlap_completion_waiting = 1;
+	overlap_broadcast();
+	overlap_unlock();
+}
+
+static void overlap_wait_native_entry(void)
+{
+	overlap_lock();
+	overlap_wait(&overlap_native_entered);
+	overlap_unlock();
+}
+
+static void overlap_wait_cancel_entry(void)
+{
+	overlap_lock();
+	overlap_wait(&overlap_cancel_entered);
+	overlap_unlock();
+}
+
+static void overlap_wait_completion(void)
+{
+	overlap_lock();
+	overlap_wait(&overlap_completion_waiting);
+	overlap_unlock();
+}
+
+static void overlap_release_native(void)
+{
+	overlap_lock();
+	overlap_native_release = 1;
+	overlap_broadcast();
+	overlap_unlock();
+}
+
+static void overlap_release_cancel(void)
+{
+	overlap_lock();
+	overlap_cancel_release = 1;
+	overlap_broadcast();
+	overlap_unlock();
+}
+
+static int overlap_operation_is_done(void)
+{
+	int done;
+
+	overlap_lock();
+	done = overlap_operation_done;
+	overlap_unlock();
+	return done;
+}
+
+static int overlap_cleanup_violation_count(void)
+{
+	int violations;
+
+	overlap_lock();
+	violations = overlap_cleanup_violations;
+	overlap_unlock();
+	return violations;
+}
+
+static int overlap_cleanup_count(void)
+{
+	int count;
+
+	overlap_lock();
+	count = overlap_cleanup_calls;
+	overlap_unlock();
+	return count;
+}
+
+static int overlap_is_enabled(void)
+{
+	int enabled;
+
+	overlap_lock();
+	enabled = overlap_mode != OVERLAP_NONE;
+	overlap_unlock();
+	return enabled;
+}
+
 static void reset_mocks(void)
 {
+	overlap_reset(OVERLAP_NONE, 0, 0);
 	start_calls = 0;
 	commit_calls = 0;
 	rollback_calls = 0;
@@ -318,6 +557,104 @@ static struct ib_statement *prepare_statement(ib_connection *connection, int typ
 	return statement;
 }
 
+struct overlap_operation_call {
+	int kind;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	ib_cancel_slot *slot;
+	uint64_t generation;
+	int result;
+	int64_t rows_affected;
+	int has_row;
+	char *error;
+	int abort_result;
+	char *abort_error;
+};
+
+struct overlap_cancel_call {
+	ib_cancel_slot *slot;
+	uint64_t generation;
+	int request_status;
+	int64_t native_code;
+	char *error;
+};
+
+static void *overlap_operation_worker(void *argument)
+{
+	struct overlap_operation_call *call =
+		(struct overlap_operation_call *) argument;
+
+	if (call->kind == OVERLAP_EXECUTE) {
+		call->result = (ib_statement_exec)(call->statement, call->bindings,
+			call->slot, call->generation, &call->rows_affected, &call->error);
+	} else if (call->kind == OVERLAP_EXECUTE2) {
+		call->cursor = (ib_statement_query)(call->statement, call->bindings,
+			call->slot, call->generation, &call->error);
+	} else {
+		call->has_row = (ib_cursor_next)(call->cursor, call->slot,
+			call->generation, &call->error);
+		call->abort_result = ib_cursor_abort(call->cursor, &call->abort_error);
+	}
+	overlap_lock();
+	overlap_operation_done = 1;
+	overlap_broadcast();
+	overlap_unlock();
+	return NULL;
+}
+
+static void *overlap_cancel_worker(void *argument)
+{
+	struct overlap_cancel_call *call =
+		(struct overlap_cancel_call *) argument;
+
+	call->request_status = ib_cancel_slot_cancel(call->slot, call->generation,
+		&call->native_code, &call->error);
+	return NULL;
+}
+
+static void run_delayed_cancel(struct overlap_operation_call *operation,
+	struct overlap_cancel_call *cancel, int cancel_failed,
+	const char *operation_name)
+{
+	pthread_t operation_thread;
+	pthread_t cancel_thread;
+
+	if (pthread_create(&operation_thread, NULL, overlap_operation_worker,
+		operation) != 0) {
+		abort();
+	}
+	overlap_wait_native_entry();
+	if (pthread_create(&cancel_thread, NULL, overlap_cancel_worker, cancel) != 0) {
+		abort();
+	}
+	overlap_wait_cancel_entry();
+	overlap_release_native();
+	overlap_wait_completion();
+	check(!overlap_operation_is_done(), operation_name);
+	check(overlap_cleanup_count() == 0,
+		"prepared cleanup started before delayed cancellation returned");
+	check(overlap_cleanup_violation_count() == 0,
+		"prepared cleanup overlapped delayed cancellation");
+	overlap_release_cancel();
+	if (pthread_join(cancel_thread, NULL) != 0 ||
+		pthread_join(operation_thread, NULL) != 0) {
+		abort();
+	}
+	check(overlap_operation_is_done(), "prepared operation worker did not finish");
+	check(cancel->request_status == 0 && cancel->error == NULL,
+		"prepared cancellation request returned an unexpected request error");
+	if (cancel_failed) {
+		check(cancel->native_code != 0,
+			"prepared cancellation failure did not preserve native request status");
+	} else {
+		check(cancel->native_code == 0,
+			"prepared cancellation unexpectedly returned a native request failure");
+	}
+	check(overlap_cleanup_count() > 0,
+		"prepared operation did not perform cleanup after cancellation returned");
+}
+
 static void test_dialect_arguments_are_propagated(void)
 {
 	ib_connection *connection;
@@ -389,6 +726,7 @@ ISC_STATUS ISC_EXPORT_VARARG test_start_transaction(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_commit_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction)
 {
+	overlap_cleanup_event();
 	check_cancel_complete("prepared cancellation slot was not complete before commit");
 	commit_calls++;
 	if (!fail_commit) {
@@ -400,6 +738,7 @@ ISC_STATUS ISC_EXPORT test_commit_transaction(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_rollback_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction)
 {
+	overlap_cleanup_event();
 	check_cancel_complete("prepared cancellation slot was not complete before rollback");
 	rollback_calls++;
 	if (*transaction != NULL) {
@@ -573,6 +912,9 @@ ISC_STATUS ISC_EXPORT test_dsql_execute(ISC_STATUS *status,
 	check(dialect == expected_dialect, "execute used the wrong SQL dialect");
 	check_cancel_publication(statement, &execute_publication_calls,
 		"prepared execute did not publish its statement handle");
+	if (overlap_native_call(OVERLAP_EXECUTE)) {
+		return status_code(status, isc_cancelled);
+	}
 	execute_calls++;
 	if (input != NULL && input->sqld == 1 && input->sqlvar[0].sqldata != NULL) {
 		memcpy(&last_execute_value, input->sqlvar[0].sqldata,
@@ -589,6 +931,9 @@ ISC_STATUS ISC_EXPORT test_dsql_execute2(ISC_STATUS *status,
 	check(dialect == expected_dialect, "execute2 used the wrong SQL dialect");
 	check_cancel_publication(statement, &execute2_publication_calls,
 		"prepared execute2 did not publish its statement handle");
+	if (overlap_native_call(OVERLAP_EXECUTE2)) {
+		return status_code(status, isc_cancelled);
+	}
 	(void) input;
 	(void) output;
 	execute2_calls++;
@@ -1074,6 +1419,9 @@ ISC_STATUS ISC_EXPORT test_dsql_fetch(ISC_STATUS *status,
 		return status_result(status, 0) == 0 ? 100 : -1;
 	}
 	(void) output;
+	if (overlap_native_call(OVERLAP_FETCH)) {
+		return status_code(status, isc_cancelled);
+	}
 	if (!execute2_open) {
 		return status_result(status, 1);
 	}
@@ -1088,8 +1436,14 @@ ISC_STATUS ISC_EXPORT test_dsql_fetch(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short option)
 {
+	if (option == DSQL_cancel && overlap_is_enabled()) {
+		return overlap_cancel_call(status);
+	}
+	if (option != DSQL_cancel && overlap_is_enabled()) {
+		overlap_cleanup_event();
+	}
 	if (expected_cancel_slot != NULL && statement != NULL &&
-		*statement == expected_cancel_statement) {
+		*statement == expected_cancel_statement && option != DSQL_cancel) {
 		check_cancel_complete("prepared cancellation slot was not complete before statement cleanup");
 	}
 	if (*statement == catalog_statement) {
@@ -1980,6 +2334,265 @@ static void test_connection_close_drains_prepared_statements(void)
 		"connection close did not drain all prepared handles before detach");
 }
 
+static void test_cancel_overlap_execute(void)
+{
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cancel_slot *slot;
+	struct overlap_operation_call operation;
+	struct overlap_cancel_call cancel;
+	char *error = NULL;
+	uint64_t generation;
+
+	reset_mocks();
+	connection = new_connection();
+	statement = prepare_statement(connection, isc_info_sql_stmt_insert);
+	bindings = new_integer_binding(51);
+	slot = ib_cancel_slot_new(&error);
+	check(statement != NULL && bindings != NULL && slot != NULL && error == NULL,
+		"delayed execute setup failed");
+	ib_error_free(error);
+	if (statement == NULL || bindings == NULL || slot == NULL) {
+		ib_bindings_free(bindings);
+		ib_cancel_slot_free(slot);
+		free(connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	check(generation != 0U && error == NULL, "delayed execute slot begin failed");
+	ib_error_free(error);
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = statement->statement;
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = OVERLAP_EXECUTE;
+	operation.statement = statement;
+	operation.bindings = bindings;
+	operation.slot = slot;
+	operation.generation = generation;
+	memset(&cancel, 0, sizeof(cancel));
+	cancel.slot = slot;
+	cancel.generation = generation;
+	overlap_reset(OVERLAP_EXECUTE, 1, 0);
+	run_delayed_cancel(&operation, &cancel, 0,
+		"prepared execute completed before delayed cancellation");
+	check(operation.result != 0 && operation.error != NULL,
+		"delayed prepared execute did not return its native cancellation error");
+	check(operation.abort_result == 0 && operation.abort_error == NULL,
+		"delayed prepared execute cleanup failed");
+	ib_error_free(operation.error);
+	ib_error_free(cancel.error);
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	overlap_reset(OVERLAP_NONE, 0, 0);
+	ib_cancel_slot_free(slot);
+	ib_bindings_free(bindings);
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"prepared execute could not reuse its statement after cancellation cleanup");
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_cancel_overlap_execute2(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cancel_slot *slot;
+	struct overlap_operation_call operation;
+	struct overlap_cancel_call cancel;
+	char *error = NULL;
+	uint64_t generation;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	connection = new_connection();
+	statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"delayed execute2 statement preparation failed");
+	ib_error_free(error);
+	bindings = new_integer_binding(52);
+	slot = ib_cancel_slot_new(&error);
+	check(bindings != NULL && slot != NULL && error == NULL,
+		"delayed execute2 setup failed");
+	ib_error_free(error);
+	if (statement == NULL || bindings == NULL || slot == NULL) {
+		ib_bindings_free(bindings);
+		ib_cancel_slot_free(slot);
+		free(connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	check(generation != 0U && error == NULL, "delayed execute2 slot begin failed");
+	ib_error_free(error);
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = statement->statement;
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = OVERLAP_EXECUTE2;
+	operation.statement = statement;
+	operation.bindings = bindings;
+	operation.slot = slot;
+	operation.generation = generation;
+	memset(&cancel, 0, sizeof(cancel));
+	cancel.slot = slot;
+	cancel.generation = generation;
+	overlap_reset(OVERLAP_EXECUTE2, 1, 0);
+	run_delayed_cancel(&operation, &cancel, 0,
+		"prepared execute2 completed before delayed cancellation");
+	check(operation.cursor == NULL && operation.error != NULL,
+		"delayed prepared execute2 returned a cursor after native cancellation");
+	ib_error_free(operation.error);
+	ib_error_free(cancel.error);
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	overlap_reset(OVERLAP_NONE, 0, 0);
+	ib_cancel_slot_free(slot);
+	ib_bindings_free(bindings);
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"prepared execute2 statement close after cancellation failed");
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_cancel_overlap_fetch_and_reuse(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_statement *other_statement;
+	ib_bindings *bindings;
+	ib_bindings *reuse_bindings;
+	ib_bindings *other_bindings;
+	ib_cancel_slot *slot;
+	ib_cursor *cursor;
+	ib_cursor *reuse_cursor;
+	struct overlap_operation_call operation;
+	struct overlap_cancel_call cancel;
+	char *error = NULL;
+	int64_t rows_affected;
+	uint64_t generation;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	connection = new_connection();
+	connection->transaction = &transaction_tokens[0];
+	statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"delayed fetch statement preparation failed");
+	ib_error_free(error);
+	bindings = new_integer_binding(53);
+	cursor = bindings == NULL ? NULL :
+		ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL,
+		"delayed fetch cursor setup failed");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (statement == NULL || cursor == NULL) {
+		free(connection);
+		return;
+	}
+	slot = ib_cancel_slot_new(&error);
+	check(slot != NULL && error == NULL, "delayed fetch slot allocation failed");
+	ib_error_free(error);
+	if (slot == NULL) {
+		error = NULL;
+		(void) ib_cursor_abort(cursor, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	check(generation != 0U && error == NULL, "delayed fetch slot begin failed");
+	ib_error_free(error);
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = statement->statement;
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = OVERLAP_FETCH;
+	operation.cursor = cursor;
+	operation.slot = slot;
+	operation.generation = generation;
+	memset(&cancel, 0, sizeof(cancel));
+	cancel.slot = slot;
+	cancel.generation = generation;
+	overlap_reset(OVERLAP_FETCH, 1, 1);
+	run_delayed_cancel(&operation, &cancel, 1,
+		"prepared fetch completed before delayed cancellation");
+	check(operation.has_row < 0 && operation.error != NULL,
+		"delayed prepared fetch did not return its native cancellation error");
+	check(operation.abort_result == 0 && operation.abort_error == NULL,
+		"delayed prepared fetch cleanup failed");
+	check(cancel.native_code != 0,
+		"delayed prepared fetch did not expose cancellation-call failure");
+	ib_error_free(operation.error);
+	ib_error_free(operation.abort_error);
+	ib_error_free(cancel.error);
+	check(connection->transaction == &transaction_tokens[0],
+		"canceled fetch cleanup lost the explicit transaction");
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	overlap_reset(OVERLAP_NONE, 0, 0);
+	ib_cancel_slot_free(slot);
+
+	reuse_bindings = new_integer_binding(54);
+	error = NULL;
+	reuse_cursor = reuse_bindings == NULL ? NULL :
+		ib_statement_query(statement, reuse_bindings, &error);
+	check(reuse_cursor != NULL && error == NULL,
+		"prepared statement was not reusable after canceled fetch cleanup");
+	ib_error_free(error);
+	ib_bindings_free(reuse_bindings);
+	if (reuse_cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_next(reuse_cursor, &error) == 1 && error == NULL,
+			"reused prepared statement did not fetch after cancellation cleanup");
+		ib_error_free(error);
+		error = NULL;
+		check(ib_cursor_close(reuse_cursor, &error) == 0 && error == NULL,
+			"reused prepared cursor close failed");
+		ib_error_free(error);
+	}
+	check(connection->transaction == &transaction_tokens[0],
+		"prepared fetch reuse changed the explicit transaction");
+
+	statement_type = isc_info_sql_stmt_insert;
+	other_statement = prepare_statement(connection, isc_info_sql_stmt_insert);
+	other_bindings = new_integer_binding(55);
+	rows_affected = -1;
+	error = NULL;
+	check(other_statement != NULL && other_bindings != NULL &&
+		(ib_statement_exec)(other_statement, other_bindings, NULL, 0U,
+			&rows_affected, &error) == 0 && error == NULL,
+		"another prepared statement did not execute after canceled fetch cleanup");
+	ib_error_free(error);
+	ib_bindings_free(other_bindings);
+	if (other_statement != NULL) {
+		error = NULL;
+		check(ib_statement_close(other_statement, &error) == 0 && error == NULL,
+			"follow-up prepared statement close failed");
+		ib_error_free(error);
+	}
+	check(connection->transaction == &transaction_tokens[0],
+		"follow-up prepared execution changed the explicit transaction");
+	error = NULL;
+	check(ib_connection_rollback(connection, &error) == 0 && error == NULL,
+		"explicit transaction rollback after prepared cancellation reuse failed");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"reused prepared statement close failed");
+	ib_error_free(error);
+	free(connection);
+}
+
 static void test_cancel_publication_and_cleanup_order(void)
 {
 	static const char execute_query[] = "INSERT INTO T (ID) VALUES (?)";
@@ -2136,6 +2749,9 @@ int main(void)
 	test_savepoint_remains_executable();
 	test_transaction_completion_closes_active_prepared_cursor();
 	test_connection_close_drains_prepared_statements();
+	test_cancel_overlap_execute();
+	test_cancel_overlap_execute2();
+	test_cancel_overlap_fetch_and_reuse();
 	test_cancel_publication_and_cleanup_order();
 	if (failures != 0) {
 		return EXIT_FAILURE;

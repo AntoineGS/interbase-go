@@ -75,3 +75,148 @@ cancellation ASan harnesses with leak detection enabled.
 No live integration cancellation test was run; that coverage remains outside
 this task's scope. Pre-existing untracked planning/specification artifacts in
 the worktree were not staged.
+
+## Round 1/5 review fixes
+
+### P2: authoritative successful results
+
+The post-success context checks in `stmt.QueryContext`, `rows.Next`, and
+direct `Cursor.Next` were removing results after the native query/fetch had
+already completed successfully. Those checks were removed. Context checks
+before admission and before starting the native operation remain in place;
+successful query, row, EOF, and direct-cursor results are now authoritative
+even when cancellation is observed immediately afterward.
+
+Added deterministic completion-vs-cancel regressions for:
+
+- prepared `database/sql` query completion;
+- `database/sql` rows fetch completion; and
+- direct cursor fetch completion.
+
+### P2: overlapping production-slot cancellation
+
+Extended `tests/native_prepared_test.c` with pthread barriers that exercise the
+actual cancellation-slot path around `isc_dsql_execute`, `isc_dsql_execute2`,
+and `isc_dsql_fetch`. Each test delays `DSQL_cancel`, releases the native call,
+observes slot completion waiting on the live cancel user, and verifies that
+rollback/close/drop cleanup has not started until the cancellation call exits.
+The fetch case additionally covers a failing cancellation request, cursor
+cleanup, reuse of the same prepared statement, and a follow-up prepared
+execution on the same explicit connection transaction. The prepared ASan
+harness is now linked with `-pthread` by `make test-native`.
+
+No public direct prepared-statement API was added. Direct coverage remains on
+the existing transaction/cursor API (`Cursor.Next`); this API-scope ruling is
+recorded here for the task ledger.
+
+## Round 1 exact verification evidence
+
+All commands below were run after the fixes with the SDK/client at
+`/tmp/opencode` and `INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include`.
+
+### TDD focused cycle
+
+RED command:
+
+```sh
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/tmp/opencode \
+go test . -run 'Test(DatabaseSQLPreparedQueryContextPreserves|RowsNextPreserves|DirectCursorNextPreserves)' \
+  -count=1 -timeout=120s
+```
+
+Observed exit status: `1`. The three new tests failed at their expected
+post-cancellation success assertions: prepared query returned
+`context canceled`, `rows.Next` returned `context canceled`, and direct
+`Cursor.Next` returned `context canceled`.
+
+GREEN command:
+
+```sh
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/tmp/opencode \
+go test . -run 'Test(DatabaseSQLPrepared(QueryContextPreserves|ExecContextCancels|ExecContextReuses)|RowsNext(Preserves|Cancels)|DirectCursorNext(Preserves|Cancels))' \
+  -count=1 -timeout=120s
+```
+
+Observed output: `ok interbase-go 0.065s`.
+
+Repeated focused race command:
+
+```sh
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/tmp/opencode \
+go test -race . -run 'Test(DatabaseSQLPreparedQueryContextPreserves|RowsNextPreserves|DirectCursorNextPreserves)' \
+  -count=20 -timeout=180s
+```
+
+Observed output: `ok interbase-go 1.038s`.
+
+### Native production-slot barriers
+
+Non-ASan focused harness:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -g -O0 \
+  -I/tmp/opencode/interbase-parity-include tests/native_prepared_test.c \
+  -L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds -pthread \
+  -o /tmp/opencode/native_prepared_round1
+timeout 30s /tmp/opencode/native_prepared_round1
+```
+
+Observed output: `native prepared tests passed`.
+
+Prepared ASan harness:
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -g -O1 -fsanitize=address \
+  -fno-omit-frame-pointer -I/tmp/opencode/interbase-parity-include \
+  tests/native_prepared_test.c \
+  -L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds -pthread \
+  -o /tmp/opencode/native_prepared_round1_asan
+ASAN_OPTIONS=detect_leaks=1 /tmp/opencode/native_prepared_round1_asan
+```
+
+Observed output: `native prepared tests passed`; no sanitizer or leak
+diagnostics were emitted.
+
+### Complete relevant suites
+
+The following all exited `0`:
+
+```sh
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/tmp/opencode \
+go test ./... -count=1 -timeout=300s
+
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/tmp/opencode \
+go test -race ./... -count=1 -timeout=300s
+
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/tmp/opencode \
+go test -gcflags=all=-d=checkptr=2 ./... -count=1 -timeout=300s
+
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/tmp/opencode \
+go vet ./...
+
+make test-native INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
+  INTERBASE_LIB=/tmp/opencode
+
+git diff --check
+```
+
+The Go suites reported `ok` for all packages (`interbase-go`, `cmd/ibprobe`,
+`events`, `internal/faultproxy`, `internal/nativegate`,
+`internal/testfixture`, `schema`, and `services`). `go vet` produced no
+diagnostics. `make test-native` passed the status, values, direct, lifecycle,
+plan, BLOB, prepared, distributed, services, events, and cancellation ASan
+harnesses with leak detection enabled.
