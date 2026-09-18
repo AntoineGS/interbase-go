@@ -221,7 +221,8 @@ static void test_start_failure(void)
 	rollback_calls = 0;
 	fail_start = 1;
 	check(ib_connection_query(&connection, query, sizeof(query) - 1U,
-		&bindings, 0, &error) == NULL, "start failure returned a cursor");
+		&bindings, 0, NULL, 0U, &error) == NULL,
+		"start failure returned a cursor");
 	check(error != NULL, "start failure lost its error");
 	check(ib_connection_is_broken(&connection), "start failure did not invalidate attachment");
 	check(connection.cursors == NULL && rollback_calls == 0,

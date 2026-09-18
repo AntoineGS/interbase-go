@@ -503,7 +503,11 @@ func (t *nativeTransaction) transactionInfo(item byte) ([]byte, error) {
 	return t.info(item)
 }
 
-func (t *nativeTransaction) query(query string, args []argument, allowArrays bool) (*nativeCursor, []string, error) {
+func (t *nativeTransaction) query(ctx context.Context, query string, args []argument,
+	allowArrays bool) (*nativeCursor, []string, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, nil, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if t == nil || t.ptr == nil {
@@ -516,16 +520,26 @@ func (t *nativeTransaction) query(query string, args []argument, allowArrays boo
 	defer C.ib_bindings_free(bindings)
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	var errorPointer *C.char
 	cursor := C.ib_transaction_query(t.ptr, queryPointer, C.size_t(len(query)),
-		bindings, C.int(boolToInt(allowArrays)), &errorPointer)
+		bindings, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &errorPointer)
+	operation.finish()
 	if cursor == nil {
 		return nil, nil, takeNativeError(errorPointer)
 	}
 	return nativeCursorFromPointer(cursor, nil)
 }
 
-func (t *nativeTransaction) exec(query string, args []argument, allowArrays bool) (int64, error) {
+func (t *nativeTransaction) exec(ctx context.Context, query string, args []argument,
+	allowArrays bool) (int64, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if t == nil || t.ptr == nil {
@@ -538,16 +552,27 @@ func (t *nativeTransaction) exec(query string, args []argument, allowArrays bool
 	defer C.ib_bindings_free(bindings)
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return 0, err
+	}
 	var affected C.int64_t
 	var errorPointer *C.char
 	if result := C.ib_transaction_exec(t.ptr, queryPointer, C.size_t(len(query)),
-		bindings, &affected, C.int(boolToInt(allowArrays)), &errorPointer); result != 0 {
+		bindings, &affected, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &errorPointer); result != 0 {
+		operation.finish()
 		return 0, takeNativeError(errorPointer)
 	}
+	operation.finish()
 	return int64(affected), nil
 }
 
-func (t *nativeTransaction) prepare(query string, allowArrays bool) (*nativeStatement, error) {
+func (t *nativeTransaction) prepare(ctx context.Context, query string,
+	allowArrays bool) (*nativeStatement, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if t == nil || t.ptr == nil {
@@ -555,9 +580,15 @@ func (t *nativeTransaction) prepare(query string, allowArrays bool) (*nativeStat
 	}
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var errorPointer *C.char
 	statement := C.ib_transaction_prepare(t.ptr, queryPointer, C.size_t(len(query)),
-		C.int(boolToInt(allowArrays)), &errorPointer)
+		C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &errorPointer)
+	operation.finish()
 	if statement == nil {
 		return nil, takeNativeError(errorPointer)
 	}
@@ -1275,7 +1306,11 @@ func (s *nativeStatement) plan() (string, error) {
 	return string(C.GoBytes(unsafe.Pointer(planPointer), C.int(planLength))), nil
 }
 
-func (c *nativeConnection) query(query string, args []argument, allowArrays bool) (*nativeCursor, []string, error) {
+func (c *nativeConnection) query(ctx context.Context, query string, args []argument,
+	allowArrays bool) (*nativeCursor, []string, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, nil, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if c == nil || c.ptr == nil {
@@ -1297,9 +1332,15 @@ func (c *nativeConnection) query(query string, args []argument, allowArrays bool
 
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	var cursorError *C.char
 	cursor := C.ib_connection_query(c.ptr, queryPointer, C.size_t(len(query)),
-		bindings, C.int(boolToInt(allowArrays)), &cursorError)
+		bindings, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &cursorError)
+	operation.finish()
 	if cursor == nil {
 		return nil, nil, takeNativeError(cursorError)
 	}
@@ -1330,7 +1371,11 @@ func (c *nativeConnection) query(query string, args []argument, allowArrays bool
 	return nativeRows, columns, nil
 }
 
-func (c *nativeConnection) exec(query string, args []argument, allowArrays bool) (int64, error) {
+func (c *nativeConnection) exec(ctx context.Context, query string, args []argument,
+	allowArrays bool) (int64, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if c != nil && c.execOverride != nil {
@@ -1355,12 +1400,19 @@ func (c *nativeConnection) exec(query string, args []argument, allowArrays bool)
 
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return 0, err
+	}
 	var affected C.int64_t
 	var execError *C.char
 	if result := C.ib_connection_exec(c.ptr, queryPointer, C.size_t(len(query)),
-		bindings, &affected, C.int(boolToInt(allowArrays)), &execError); result != 0 {
+		bindings, &affected, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &execError); result != 0 {
+		operation.finish()
 		return 0, takeNativeError(execError)
 	}
+	operation.finish()
 	return int64(affected), nil
 }
 
@@ -1504,7 +1556,10 @@ func (c *nativeConnection) info(item byte, transaction bool) ([]byte, error) {
 	return C.GoBytes(unsafe.Pointer(responsePointer), C.int(responseLength)), nil
 }
 
-func (c *nativeConnection) prepare(query string) (*nativeStatement, error) {
+func (c *nativeConnection) prepare(ctx context.Context, query string) (*nativeStatement, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if c != nil && c.prepareOverride != nil {
@@ -1515,8 +1570,14 @@ func (c *nativeConnection) prepare(query string) (*nativeStatement, error) {
 	}
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var errorPointer *C.char
-	statement := C.ib_statement_prepare(c.ptr, queryPointer, C.size_t(len(query)), &errorPointer)
+	statement := C.ib_statement_prepare(c.ptr, queryPointer, C.size_t(len(query)),
+		operation.nativeCancelSlot(), operation.nativeCancelGeneration(), &errorPointer)
+	operation.finish()
 	if statement == nil {
 		return nil, takeNativeError(errorPointer)
 	}

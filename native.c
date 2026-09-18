@@ -824,12 +824,116 @@ static int ib_cancel_slot_publish_if_active(ib_cancel_slot *slot,
 	uint64_t generation, isc_stmt_handle *statement, char **error)
 {
 	if (slot == NULL && generation == 0U) {
-		if (error != NULL) {
-			*error = NULL;
-		}
+		(void) error;
 		return 0;
 	}
 	return ib_cancel_slot_publish(slot, generation, statement, error);
+}
+
+/* Move an active generation to the next statement handle without ending the
+ * Go-owned operation.  Transient query paths can prepare one handle, inspect
+ * metadata through short-lived catalog handles, and then execute the original
+ * handle.  A cancellation caller using the previous publication must leave
+ * before the handle is reused or dropped. */
+static int ib_cancel_slot_republish_if_active(ib_cancel_slot *slot,
+	uint64_t generation, isc_stmt_handle *statement, char **error)
+{
+	int result;
+
+	if (slot == NULL && generation == 0U) {
+		(void) error;
+		return 0;
+	}
+	if (slot == NULL || statement == NULL || generation == 0U) {
+		return ib_fail(error, "cancellation slot publication arguments are invalid");
+	}
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		return ib_pthread_fail(error, "pthread_mutex_lock", result);
+	}
+	if (slot->generation != generation || !slot->active ||
+		slot->operation_complete || slot->completing) {
+		ib_cancel_slot_unlock_or_abort(slot);
+		return ib_fail(error, "cancellation slot generation cannot be republished");
+	}
+	if (slot->published && slot->statement == *statement) {
+		ib_cancel_slot_unlock_or_abort(slot);
+		return 0;
+	}
+	if (slot->published) {
+		slot->published = 0;
+		slot->statement = NULL;
+		if (pthread_cond_broadcast(&slot->condition) != 0) {
+			ib_cancel_slot_unlock_or_abort(slot);
+			abort();
+		}
+		while (slot->cancel_users != 0U) {
+			result = pthread_cond_wait(&slot->condition, &slot->mutex);
+			if (result != 0) {
+				ib_cancel_slot_unlock_or_abort(slot);
+				return ib_pthread_fail(error, "pthread_cond_wait", result);
+			}
+		}
+	}
+	slot->statement = *statement;
+	slot->published = 1;
+	result = pthread_cond_broadcast(&slot->condition);
+	if (result != 0) {
+		slot->statement = NULL;
+		slot->published = 0;
+		ib_cancel_slot_unlock_or_abort(slot);
+		return ib_pthread_fail(error, "pthread_cond_broadcast", result);
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	return 0;
+}
+
+static int ib_cancel_slot_unpublish(ib_cancel_slot *slot, uint64_t generation,
+	char **error)
+{
+	int result;
+
+	if (slot == NULL && generation == 0U) {
+		(void) error;
+		return 0;
+	}
+	if (slot == NULL || generation == 0U) {
+		return ib_fail(error, "cancellation slot unpublication arguments are invalid");
+	}
+	result = pthread_mutex_lock(&slot->mutex);
+	if (result != 0) {
+		return ib_pthread_fail(error, "pthread_mutex_lock", result);
+	}
+	if (slot->generation != generation || !slot->active ||
+		slot->operation_complete || slot->completing) {
+		ib_cancel_slot_unlock_or_abort(slot);
+		return ib_fail(error, "cancellation slot generation cannot be unpublished");
+	}
+	if (!slot->published) {
+		ib_cancel_slot_unlock_or_abort(slot);
+		return 0;
+	}
+	slot->published = 0;
+	slot->statement = NULL;
+	if (pthread_cond_broadcast(&slot->condition) != 0) {
+		ib_cancel_slot_unlock_or_abort(slot);
+		abort();
+	}
+	while (slot->cancel_users != 0U) {
+		result = pthread_cond_wait(&slot->condition, &slot->mutex);
+		if (result != 0) {
+			ib_cancel_slot_unlock_or_abort(slot);
+			return ib_pthread_fail(error, "pthread_cond_wait", result);
+		}
+	}
+	result = pthread_mutex_unlock(&slot->mutex);
+	if (result != 0) {
+		abort();
+	}
+	return 0;
 }
 
 static void IB_MAYBE_UNUSED ib_cancel_slot_complete(ib_cancel_slot *slot,
@@ -1683,10 +1787,12 @@ static int ib_statement_rows_affected(ib_cursor *cursor,
 }
 
 static int ib_cursor_prepare_statement(ib_cursor *cursor, const char *query,
-	size_t query_length, char **error)
+	size_t query_length, ib_cancel_slot *cancel, uint64_t generation,
+	char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
+	char *unpublish_error;
 
 	if (cursor == NULL || cursor->connection == NULL ||
 		cursor->connection->database == NULL || cursor->transaction == NULL ||
@@ -1699,10 +1805,22 @@ static int ib_cursor_prepare_statement(ib_cursor *cursor, const char *query,
 	if (result != 0) {
 		return ib_fail_status(error, "allocate statement", status);
 	}
+	if (ib_cancel_slot_republish_if_active(cancel, generation,
+		&cursor->statement, error) != 0) {
+		return -1;
+	}
 	memset(status, 0, sizeof(status));
 	result = isc_dsql_prepare(status, &cursor->transaction, &cursor->statement,
 		(unsigned short) query_length, (char *) query,
 		ib_connection_dialect(cursor->connection), NULL);
+	unpublish_error = NULL;
+	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+		if (result == 0) {
+			ib_give_error(error, unpublish_error);
+			return -1;
+		}
+		free(unpublish_error);
+	}
 	if (result != 0) {
 		return ib_fail_status(error, "prepare statement", status);
 	}
@@ -3699,6 +3817,8 @@ int ib_blob_writer_close(ib_blob_writer *writer, int cancel, int32_t *high,
 	return 0;
 }
 
+static int ib_cursor_next_active(ib_cursor *cursor, ib_cancel_slot *cancel,
+	uint64_t generation, char **error);
 static int ib_array_field_metadata(ib_cursor *cursor, const XSQLVAR *variable,
 	int *precision, int *charset, char **error);
 static size_t ib_utf8_prefix_length(const char *data, size_t length,
@@ -4937,7 +5057,7 @@ static int ib_array_field_metadata(ib_cursor *cursor, const XSQLVAR *variable,
 	result = 0;
 	close_result = 0;
 	if (ib_cursor_prepare_statement(catalog_cursor, query, sizeof(query) - 1U,
-		&catalog_error) != 0 ||
+		NULL, 0U, &catalog_error) != 0 ||
 		ib_statement_is_select(catalog_cursor, &catalog_error) != 0 ||
 		ib_describe_bind(catalog_cursor, &catalog_error) != 0) {
 		result = -1;
@@ -5591,7 +5711,8 @@ static int ib_catalog_apply_row(ib_cursor *cursor, const ib_cursor *catalog,
 	return 0;
 }
 
-static int ib_procedure_metadata_catalog(ib_cursor *cursor, char **error)
+static int ib_procedure_metadata_catalog(ib_cursor *cursor,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	char *catalog_query;
 	size_t catalog_query_length;
@@ -5646,7 +5767,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor, char **error)
 		result = 0;
 		close_result = 0;
 		if (ib_cursor_prepare_statement(catalog_cursor, catalog_query,
-			catalog_query_length, &catalog_error) != 0 ||
+			catalog_query_length, cancel, generation, &catalog_error) != 0 ||
 			ib_statement_is_select(catalog_cursor, &catalog_error) != 0 ||
 			ib_describe_bind(catalog_cursor, &catalog_error) != 0) {
 			result = -1;
@@ -5672,10 +5793,27 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor, char **error)
 			XSQLDA *input = catalog_cursor->input->sqld == 0 ? NULL :
 				catalog_cursor->input;
 
+			if (ib_cancel_slot_republish_if_active(cancel, generation,
+				&catalog_cursor->statement, &catalog_error) != 0) {
+				result = -1;
+				goto procedure_catalog_done;
+			}
 			memset(status, 0, sizeof(status));
 			native_result = isc_dsql_execute2(status, &catalog_cursor->transaction,
 				&catalog_cursor->statement,
 				ib_connection_dialect(catalog_cursor->connection), input, NULL);
+			{
+				char *unpublish_error = NULL;
+				if (ib_cancel_slot_unpublish(cancel, generation,
+					&unpublish_error) != 0) {
+					if (native_result == 0) {
+						ib_give_error(&catalog_error, unpublish_error);
+						result = -1;
+						goto procedure_catalog_done;
+					}
+					free(unpublish_error);
+				}
+			}
 			if (native_result != 0) {
 				(void) ib_fail_status(&catalog_error, "execute procedure catalog query",
 					status);
@@ -5685,7 +5823,8 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor, char **error)
 		}
 		catalog_cursor->server_cursor_open = 1;
 		for (;;) {
-			has_row = ib_cursor_next(catalog_cursor, NULL, 0U, &catalog_error);
+			has_row = ib_cursor_next_active(catalog_cursor, cancel, generation,
+				&catalog_error);
 			if (has_row < 0) {
 				result = -1;
 				break;
@@ -5706,12 +5845,23 @@ procedure_catalog_done:
 		}
 		if (catalog_cursor->statement != NULL || catalog_cursor->input != NULL ||
 			catalog_cursor->output != NULL) {
+			if (ib_cancel_slot_unpublish(cancel, generation, &close_error) != 0) {
+				result = -1;
+			}
 			close_result = ib_cursor_close_internal(catalog_cursor, &close_error, 0);
 			if (close_result != 0) {
 				result = -1;
 			}
 		} else {
 			free(catalog_cursor);
+		}
+		if (ib_cancel_slot_republish_if_active(cancel, generation,
+			&cursor->statement, &close_error) != 0) {
+			result = -1;
+		}
+		if (close_error != NULL) {
+			ib_append_error(&catalog_error, close_error);
+			close_error = NULL;
 		}
 		if (close_result != 0) {
 			ib_append_error(&catalog_error, close_error);
@@ -5720,19 +5870,28 @@ procedure_catalog_done:
 			ib_give_error(error, catalog_error);
 			return -1;
 		}
-		free(catalog_error);
-		free(close_error);
 		if (result != 0) {
+			if (cancel != NULL) {
+				free(catalog_query);
+				ib_give_error(error, catalog_error);
+				free(close_error);
+				return -1;
+			}
 			/* Procedure catalog metadata is an enhancement; preserve the query
 			 * result when the catalog is unavailable. */
+			free(catalog_error);
+			free(close_error);
 			continue;
 		}
+		free(catalog_error);
+		free(close_error);
 	}
 	free(catalog_query);
 	return 0;
 }
 
-static int ib_metadata_catalog(ib_cursor *cursor, char **error)
+static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
+	uint64_t generation, char **error)
 {
 	char **relation_names;
 	size_t *relation_lengths;
@@ -5778,7 +5937,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, char **error)
 	result = 0;
 	close_result = 0;
 	if (ib_cursor_prepare_statement(catalog_cursor, catalog_query,
-		catalog_query_length, &catalog_error) != 0 ||
+		catalog_query_length, cancel, generation, &catalog_error) != 0 ||
 		ib_statement_is_select(catalog_cursor, &catalog_error) != 0 ||
 		ib_describe_bind(catalog_cursor, &catalog_error) != 0) {
 		result = -1;
@@ -5809,10 +5968,26 @@ static int ib_metadata_catalog(ib_cursor *cursor, char **error)
 		ISC_STATUS native_result;
 		XSQLDA *input = catalog_cursor->input->sqld == 0 ? NULL : catalog_cursor->input;
 
+		if (ib_cancel_slot_republish_if_active(cancel, generation,
+			&catalog_cursor->statement, &catalog_error) != 0) {
+			result = -1;
+			goto catalog_done;
+		}
 		memset(status, 0, sizeof(status));
 		native_result = isc_dsql_execute2(status, &catalog_cursor->transaction,
 			&catalog_cursor->statement,
 			ib_connection_dialect(catalog_cursor->connection), input, NULL);
+		{
+			char *unpublish_error = NULL;
+			if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+				if (native_result == 0) {
+					ib_give_error(&catalog_error, unpublish_error);
+					result = -1;
+					goto catalog_done;
+				}
+				free(unpublish_error);
+			}
+		}
 		if (native_result != 0) {
 			(void) ib_fail_status(&catalog_error, "execute catalog query", status);
 			result = -1;
@@ -5821,7 +5996,8 @@ static int ib_metadata_catalog(ib_cursor *cursor, char **error)
 	}
 	catalog_cursor->server_cursor_open = 1;
 	for (;;) {
-		int has_row = ib_cursor_next(catalog_cursor, NULL, 0U, &catalog_error);
+		int has_row = ib_cursor_next_active(catalog_cursor, cancel, generation,
+			&catalog_error);
 
 		if (has_row < 0) {
 			result = -1;
@@ -5836,12 +6012,15 @@ static int ib_metadata_catalog(ib_cursor *cursor, char **error)
 		}
 	}
 
-catalog_done:
+	catalog_done:
 	if (bindings != NULL) {
 		ib_bindings_free(bindings);
 	}
 	if (catalog_cursor->statement != NULL || catalog_cursor->input != NULL ||
 		catalog_cursor->output != NULL) {
+		if (ib_cancel_slot_unpublish(cancel, generation, &close_error) != 0) {
+			result = -1;
+		}
 		close_result = ib_cursor_close_internal(catalog_cursor, &close_error, 0);
 		if (close_result != 0) {
 			result = -1;
@@ -5851,6 +6030,14 @@ catalog_done:
 	}
 	free(catalog_query);
 	ib_free_catalog_relations(relation_names, relation_lengths, relation_count);
+	if (ib_cancel_slot_republish_if_active(cancel, generation,
+		&cursor->statement, &close_error) != 0) {
+		result = -1;
+	}
+	if (close_error != NULL) {
+		ib_append_error(&catalog_error, close_error);
+		close_error = NULL;
+	}
 	if (close_result != 0) {
 		ib_append_error(&catalog_error, close_error);
 		close_error = NULL;
@@ -5858,6 +6045,11 @@ catalog_done:
 		return -1;
 	}
 	if (result != 0) {
+		if (cancel != NULL) {
+			ib_give_error(error, catalog_error);
+			free(close_error);
+			return -1;
+		}
 		/* Catalog information is an enhancement; an unavailable catalog must not
 		 * turn an otherwise valid user query into a failure. */
 		free(catalog_error);
@@ -5869,7 +6061,8 @@ catalog_done:
 	return 0;
 }
 
-static int ib_cursor_describe_metadata(ib_cursor *cursor, char **error)
+static int ib_cursor_describe_metadata(ib_cursor *cursor, ib_cancel_slot *cancel,
+	uint64_t generation, char **error)
 {
 	if (ib_metadata_allocate(cursor, error) != 0) {
 		return -1;
@@ -5878,9 +6071,9 @@ static int ib_cursor_describe_metadata(ib_cursor *cursor, char **error)
 		return -1;
 	}
 	if (cursor->statement_type == isc_info_sql_stmt_exec_procedure) {
-		return ib_procedure_metadata_catalog(cursor, error);
+		return ib_procedure_metadata_catalog(cursor, cancel, generation, error);
 	}
-	return ib_metadata_catalog(cursor, error);
+	return ib_metadata_catalog(cursor, cancel, generation, error);
 }
 
 static void ib_failed_query_cleanup(ib_cursor *cursor, char **error)
@@ -7044,10 +7237,11 @@ int ib_bindings_set_timestamp(ib_bindings *bindings, size_t index,
 
 ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	size_t query_length, const ib_bindings *bindings, int allow_arrays,
-	char **error)
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
+	char *unpublish_error;
 	ib_cursor *cursor;
 	char *prepared_query;
 	size_t prepared_query_length;
@@ -7055,24 +7249,29 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	int implicit;
 
 	if (connection == NULL || connection->database == NULL || connection->broken) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "connection is unavailable");
 		return NULL;
 	}
 	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "query is empty or too long");
 		return NULL;
 	}
 	if (bindings == NULL || bindings->count > (size_t) SHRT_MAX) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "query arguments are invalid");
 		return NULL;
 	}
 	prepared_query = ib_convert_utf8(query, query_length, connection->charset,
 		&prepared_query_length, error);
 	if (prepared_query == NULL) {
+		ib_cancel_slot_complete(cancel, generation);
 		return NULL;
 	}
 	if (prepared_query_length > (size_t) USHRT_MAX) {
 		free(prepared_query);
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "converted query is too long");
 		return NULL;
 	}
@@ -7080,6 +7279,7 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	cursor = (ib_cursor *) calloc(1U, sizeof(*cursor));
 	if (cursor == NULL) {
 		free(prepared_query);
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "out of memory allocating cursor state");
 		return NULL;
 	}
@@ -7097,6 +7297,7 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		"start read transaction", error) != 0) {
 		free(prepared_query);
 		prepared_query = NULL;
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
 	} else {
@@ -7104,15 +7305,17 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		implicit = 1;
 	}
 	if (ib_cursor_prepare_statement(cursor, cursor->query, cursor->query_length,
-		error) != 0) {
+		cancel, generation, error) != 0) {
 		free(prepared_query);
 		prepared_query = NULL;
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
 	}
 	if (ib_statement_type(cursor, &statement_type, error) != 0) {
 		free(prepared_query);
 		prepared_query = NULL;
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
 	}
@@ -7127,7 +7330,7 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		}
 		cursor->owns_transaction = 1;
 		if (ib_cursor_prepare_statement(cursor, cursor->query, cursor->query_length,
-			error) != 0) {
+			cancel, generation, error) != 0) {
 			goto procedure_transition_failure;
 		}
 		if (ib_statement_type(cursor, &statement_type, error) != 0) {
@@ -7138,6 +7341,7 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		(implicit || connection->transaction_read_only)) {
 		free(prepared_query);
 		prepared_query = NULL;
+		ib_cancel_slot_complete(cancel, generation);
 		(void) ib_fail(error,
 			"SELECT FOR UPDATE requires an explicit writable transaction");
 		ib_failed_query_cleanup(cursor, error);
@@ -7148,6 +7352,7 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		statement_type != isc_info_sql_stmt_exec_procedure) {
 		free(prepared_query);
 		prepared_query = NULL;
+		ib_cancel_slot_complete(cancel, generation);
 		(void) ib_fail(error,
 			"only SELECT, SELECT FOR UPDATE, and executable procedure statements are permitted");
 		ib_failed_query_cleanup(cursor, error);
@@ -7159,15 +7364,23 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	if (ib_describe_bind(cursor, error) != 0 ||
 		ib_bind_input_mode(cursor, bindings, cursor->allow_arrays, error) != 0 ||
 		ib_describe_output(cursor, error) != 0 ||
-		ib_cursor_describe_metadata(cursor, error) != 0 ||
+		ib_cursor_describe_metadata(cursor, cancel, generation, error) != 0 ||
 		ib_validate_output_types_mode(cursor->output, cursor->allow_arrays, error) != 0 ||
 		ib_allocate_output(cursor, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
 	}
 	if (statement_type == isc_info_sql_stmt_exec_procedure &&
 		cursor->output->sqld == 0) {
 		(void) ib_fail(error, "procedure has no output; use Exec instead");
+		ib_cancel_slot_complete(cancel, generation);
+		ib_failed_query_cleanup(cursor, error);
+		return NULL;
+	}
+	if (ib_cancel_slot_republish_if_active(cancel, generation,
+		&cursor->statement, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
 	}
@@ -7178,6 +7391,17 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 			ib_connection_dialect(cursor->connection), input,
 			statement_type == isc_info_sql_stmt_exec_procedure ? cursor->output : NULL);
 	}
+	unpublish_error = NULL;
+	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+		if (result == 0) {
+			ib_give_error(error, unpublish_error);
+			ib_cancel_slot_complete(cancel, generation);
+			ib_failed_query_cleanup(cursor, error);
+			return NULL;
+		}
+		free(unpublish_error);
+	}
+	ib_cancel_slot_complete(cancel, generation);
 	if (result != 0) {
 		(void) ib_fail_status(error,
 			statement_type == isc_info_sql_stmt_exec_procedure ?
@@ -7193,16 +7417,19 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 procedure_transition_failure:
 	free(prepared_query);
 	prepared_query = NULL;
+	ib_cancel_slot_complete(cancel, generation);
 	ib_failed_query_cleanup(cursor, error);
 	return NULL;
 }
 
 int ib_connection_exec(ib_connection *connection, const char *query,
 	size_t query_length, const ib_bindings *bindings, int64_t *rows_affected,
-	int allow_arrays, char **error)
+	int allow_arrays, ib_cancel_slot *cancel, uint64_t generation,
+	char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
+	char *unpublish_error;
 	ib_cursor *cursor;
 	char *prepared_query;
 	char *cleanup_error;
@@ -7214,31 +7441,38 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 	int implicit;
 
 	if (rows_affected == NULL) {
+		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "affected-row destination is unavailable");
 	}
 	*rows_affected = -1;
 	if (connection == NULL || connection->database == NULL || connection->broken) {
+		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "connection is unavailable");
 	}
 	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
+		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "query is empty or too long");
 	}
 	if (bindings == NULL || bindings->count > (size_t) SHRT_MAX) {
+		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "query arguments are invalid");
 	}
 	prepared_query = ib_convert_utf8(query, query_length, connection->charset,
 		&prepared_query_length, error);
 	if (prepared_query == NULL) {
+		ib_cancel_slot_complete(cancel, generation);
 		return -1;
 	}
 	if (prepared_query_length > (size_t) USHRT_MAX) {
 		free(prepared_query);
+		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "converted query is too long");
 	}
 
 	cursor = (ib_cursor *) calloc(1U, sizeof(*cursor));
 	if (cursor == NULL) {
 		free(prepared_query);
+		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "out of memory allocating cursor state");
 	}
 	cursor->connection = connection;
@@ -7256,6 +7490,7 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 			"start write transaction", error) != 0) {
 			free(prepared_query);
 			prepared_query = NULL;
+			ib_cancel_slot_complete(cancel, generation);
 			ib_failed_query_cleanup(cursor, error);
 			return -1;
 		}
@@ -7269,6 +7504,13 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 		free(prepared_query);
 		prepared_query = NULL;
 		ib_fail_status(error, "allocate statement", status);
+		ib_cancel_slot_complete(cancel, generation);
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	if (ib_cancel_slot_republish_if_active(cancel, generation,
+		&cursor->statement, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return -1;
 	}
@@ -7276,10 +7518,21 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 	result = isc_dsql_prepare(status, &cursor->transaction, &cursor->statement,
 		(unsigned short) cursor->query_length, cursor->query,
 		ib_connection_dialect(cursor->connection), NULL);
+	unpublish_error = NULL;
+	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+		if (result == 0) {
+			ib_give_error(error, unpublish_error);
+			ib_cancel_slot_complete(cancel, generation);
+			ib_failed_query_cleanup(cursor, error);
+			return -1;
+		}
+		free(unpublish_error);
+	}
 	free(prepared_query);
 	prepared_query = NULL;
 	if (result != 0) {
 		ib_fail_status(error, "prepare statement", status);
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return -1;
 	}
@@ -7289,6 +7542,13 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 		ib_statement_rejects_result(cursor, error) != 0 ||
 		ib_describe_bind(cursor, error) != 0 ||
 		ib_bind_input_mode(cursor, bindings, cursor->allow_arrays, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
+		ib_failed_query_cleanup(cursor, error);
+		return -1;
+	}
+	if (ib_cancel_slot_republish_if_active(cancel, generation,
+		&cursor->statement, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return -1;
 	}
@@ -7298,6 +7558,17 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 		result = isc_dsql_execute(status, &cursor->transaction, &cursor->statement,
 			ib_connection_dialect(cursor->connection), input);
 	}
+	unpublish_error = NULL;
+	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+		if (result == 0) {
+			ib_give_error(error, unpublish_error);
+			ib_cancel_slot_complete(cancel, generation);
+			ib_failed_query_cleanup(cursor, error);
+			return -1;
+		}
+		free(unpublish_error);
+	}
+	ib_cancel_slot_complete(cancel, generation);
 	if (result != 0) {
 		ib_fail_status(error, "execute statement", status);
 		ib_failed_query_cleanup(cursor, error);
@@ -7361,10 +7632,12 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 
 static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 	const char *query,
-	size_t query_length, int allow_arrays, char **error)
+	size_t query_length, int allow_arrays, ib_cancel_slot *cancel,
+	uint64_t generation, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
+	char *unpublish_error;
 	ib_statement *statement;
 	ib_cursor descriptor;
 	char *prepared_query;
@@ -7377,26 +7650,31 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 	int statement_type;
 
 	if (connection == NULL || connection->database == NULL || connection->broken) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "connection is unavailable");
 		return NULL;
 	}
 	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "query is empty or too long");
 		return NULL;
 	}
 	prepared_query = ib_convert_utf8(query, query_length, connection->charset,
 		&prepared_query_length, error);
 	if (prepared_query == NULL) {
+		ib_cancel_slot_complete(cancel, generation);
 		return NULL;
 	}
 	if (prepared_query_length > (size_t) USHRT_MAX) {
 		free(prepared_query);
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "converted query is too long");
 		return NULL;
 	}
 	statement = (ib_statement *) calloc(1U, sizeof(*statement));
 	if (statement == NULL) {
 		free(prepared_query);
+		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "out of memory allocating prepared statement");
 		return NULL;
 	}
@@ -7424,16 +7702,33 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 		&statement->statement);
 	if (result != 0) {
 		(void) ib_fail_status(&failure_error, "allocate statement", status);
+		ib_cancel_slot_complete(cancel, generation);
+		goto fail;
+	}
+	if (ib_cancel_slot_republish_if_active(cancel, generation,
+		&statement->statement, &failure_error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		goto fail;
 	}
 	memset(status, 0, sizeof(status));
 	result = isc_dsql_prepare(status, &prepare_transaction, &statement->statement,
 		(unsigned short) statement->query_length, statement->query,
 		ib_connection_dialect(connection), NULL);
+	unpublish_error = NULL;
+	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+		if (result == 0) {
+			ib_append_error(&failure_error, unpublish_error);
+			ib_cancel_slot_complete(cancel, generation);
+			goto fail;
+		}
+		free(unpublish_error);
+	}
 	if (result != 0) {
 		(void) ib_fail_status(&failure_error, "prepare statement", status);
+		ib_cancel_slot_complete(cancel, generation);
 		goto fail;
 	}
+	ib_cancel_slot_complete(cancel, generation);
 	descriptor.connection = connection;
 	descriptor.transaction = prepare_transaction;
 	descriptor.statement = statement->statement;
@@ -7474,6 +7769,7 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 
 fail:
 	free(prepared_query);
+	ib_cancel_slot_complete(cancel, generation);
 	ib_free_sqlda(descriptor.input);
 	ib_free_sqlda(descriptor.output);
 	if (statement != NULL) {
@@ -7496,9 +7792,11 @@ fail:
 }
 
 ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
-	size_t query_length, char **error)
+	size_t query_length, ib_cancel_slot *cancel, uint64_t generation,
+	char **error)
 {
-	return ib_statement_prepare_mode(connection, query, query_length, 0, error);
+	return ib_statement_prepare_mode(connection, query, query_length, 0,
+		cancel, generation, error);
 }
 
 int ib_statement_num_input(const ib_statement *statement)
@@ -7732,14 +8030,15 @@ ib_cursor *ib_statement_query(ib_statement *statement,
 		return NULL;
 	}
 	cursor->output = ib_clone_sqlda(statement->output, error);
-	if (cursor->output == NULL || ib_cursor_describe_metadata(cursor, error) != 0 ||
+	if (cursor->output == NULL || ib_cursor_describe_metadata(cursor, cancel,
+		generation, error) != 0 ||
 		ib_validate_output_types(cursor->output, error) != 0 ||
 		ib_allocate_output(cursor, error) != 0) {
 		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
 	}
-	if (ib_cancel_slot_publish_if_active(cancel, generation, &cursor->statement,
+	if (ib_cancel_slot_republish_if_active(cancel, generation, &cursor->statement,
 		error) != 0) {
 		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
@@ -7864,36 +8163,57 @@ int ib_statement_plan(ib_statement *statement, char **plan,
 	}
 }
 
-int ib_cursor_next(ib_cursor *cursor, ib_cancel_slot *cancel,
-	uint64_t generation, char **error)
+static int ib_cursor_next_internal(ib_cursor *cursor, ib_cancel_slot *cancel,
+	uint64_t generation, int complete, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
+	char *unpublish_error;
+	int operation_result;
 
 	if (cursor == NULL || cursor->statement == NULL || cursor->output == NULL) {
-		ib_cancel_slot_complete(cancel, generation);
+		if (complete) {
+			ib_cancel_slot_complete(cancel, generation);
+		}
 		return ib_fail(error, "cursor is unavailable");
 	}
 	if (cursor->procedure) {
 		if (cursor->output_pending) {
-			ib_cancel_slot_complete(cancel, generation);
+			if (complete) {
+				ib_cancel_slot_complete(cancel, generation);
+			}
 			cursor->output_pending = 0;
 			cursor->fetched = 1;
 			return 1;
 		}
-		ib_cancel_slot_complete(cancel, generation);
+		if (complete) {
+			ib_cancel_slot_complete(cancel, generation);
+		}
 		return 0;
 	}
 	if (ib_cancel_slot_publish_if_active(cancel, generation, &cursor->statement,
 		error) != 0) {
-		ib_cancel_slot_complete(cancel, generation);
+		if (complete) {
+			ib_cancel_slot_complete(cancel, generation);
+		}
 		return -1;
 	}
 	memset(status, 0, sizeof(status));
 	result = isc_dsql_fetch(status, &cursor->statement,
 		ib_connection_dialect(cursor->connection),
 		cursor->output);
-	ib_cancel_slot_complete(cancel, generation);
+	if (complete) {
+		ib_cancel_slot_complete(cancel, generation);
+	} else {
+		unpublish_error = NULL;
+		operation_result = ib_cancel_slot_unpublish(cancel, generation,
+			&unpublish_error);
+		if (operation_result != 0 && result == 0) {
+			ib_give_error(error, unpublish_error);
+			return -1;
+		}
+		free(unpublish_error);
+	}
 	if (result == 100) {
 		return 0;
 	}
@@ -7902,6 +8222,18 @@ int ib_cursor_next(ib_cursor *cursor, ib_cancel_slot *cancel,
 	}
 	cursor->fetched = 1;
 	return 1;
+}
+
+static int ib_cursor_next_active(ib_cursor *cursor, ib_cancel_slot *cancel,
+	uint64_t generation, char **error)
+{
+	return ib_cursor_next_internal(cursor, cancel, generation, 0, error);
+}
+
+int ib_cursor_next(ib_cursor *cursor, ib_cancel_slot *cancel,
+	uint64_t generation, char **error)
+{
+	return ib_cursor_next_internal(cursor, cancel, generation, 1, error);
 }
 
 int ib_cursor_close(ib_cursor *cursor, char **error)
@@ -8971,44 +9303,49 @@ int ib_transaction_info(ib_transaction *transaction, uint8_t item,
 
 ib_cursor *ib_transaction_query(ib_transaction *transaction, const char *query,
 	size_t query_length, const ib_bindings *bindings, int allow_arrays,
-	char **error)
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	ib_cursor *cursor;
 
 	if (ib_transaction_available(transaction, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		return NULL;
 	}
 	cursor = ib_connection_query(&transaction->view, query, query_length,
-		bindings, allow_arrays, error);
+		bindings, allow_arrays, cancel, generation, error);
 	ib_transaction_sync(transaction);
 	return cursor;
 }
 
 int ib_transaction_exec(ib_transaction *transaction, const char *query,
 	size_t query_length, const ib_bindings *bindings, int64_t *rows_affected,
-	int allow_arrays, char **error)
+	int allow_arrays, ib_cancel_slot *cancel, uint64_t generation,
+	char **error)
 {
 	int result;
 
 	if (ib_transaction_available(transaction, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		return -1;
 	}
 	result = ib_connection_exec(&transaction->view, query, query_length,
-		bindings, rows_affected, allow_arrays, error);
+		bindings, rows_affected, allow_arrays, cancel, generation, error);
 	ib_transaction_sync(transaction);
 	return result;
 }
 
 ib_statement *ib_transaction_prepare(ib_transaction *transaction,
-	const char *query, size_t query_length, int allow_arrays, char **error)
+	const char *query, size_t query_length, int allow_arrays,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	ib_statement *statement;
 
 	if (ib_transaction_available(transaction, error) != 0) {
+		ib_cancel_slot_complete(cancel, generation);
 		return NULL;
 	}
 	statement = ib_statement_prepare_mode(&transaction->view, query, query_length,
-		allow_arrays, error);
+		allow_arrays, cancel, generation, error);
 	ib_transaction_sync(transaction);
 	return statement;
 }

@@ -236,7 +236,7 @@ static void test_transaction_prepare_array_mode(void)
 	transaction.view = connection;
 
 	statement = ib_transaction_prepare(&transaction, query, sizeof(query) - 1U,
-		1, &error);
+		1, NULL, 0U, &error);
 	check(statement != NULL && error == NULL,
 		"array-capable transaction preparation rejected an array result");
 	ib_error_free(error);
@@ -249,7 +249,7 @@ static void test_transaction_prepare_array_mode(void)
 
 	error = NULL;
 	statement = ib_transaction_prepare(&transaction, query, sizeof(query) - 1U,
-		0, &error);
+		0, NULL, 0U, &error);
 	check(statement == NULL && error != NULL,
 		"ordinary transaction preparation accepted an array result");
 	ib_error_free(error);

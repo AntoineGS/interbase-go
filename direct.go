@@ -789,10 +789,12 @@ func (t *Transaction) Query(ctx context.Context, query string, args ...any) (*Cu
 		return nil, err
 	}
 	defer releaseNative()
-	nativeCursor, columns, err := t.native.query(query, converted, true)
+	nativeCursor, columns, err := t.native.query(ctx, query, converted, true)
 	releaseNative()
 	if err != nil {
 		operationErr := a.conn.sanitizeError("direct query", err)
+		operationErr = classifyNativeOutcome("direct query", false,
+			contextCancellation(ctx), operationErr, nil)
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
@@ -847,17 +849,21 @@ func (t *Transaction) Exec(ctx context.Context, query string, args ...any) (int6
 		return 0, err
 	}
 	defer releaseNative()
-	affected, err := t.native.exec(query, converted, true)
+	affected, err := t.native.exec(ctx, query, converted, true)
 	releaseNative()
 	if err != nil {
 		operationErr := a.conn.sanitizeError("direct exec", err)
+		operationErr = classifyNativeOutcome("direct exec", true,
+			contextCancellation(ctx), operationErr, nil)
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
 		return 0, operationErr
 	}
 	if err := contextError(ctx); err != nil {
-		return 0, err
+		// Native execution completed successfully before the context was
+		// observed. Returning the known result avoids an unsafe retry.
+		return affected, nil
 	}
 	return affected, nil
 }
@@ -1022,12 +1028,14 @@ func (t *Transaction) Plan(ctx context.Context, query string) (string, error) {
 		return "", err
 	}
 	defer releaseNative()
-	statement, err := t.native.prepare(query, true)
+	statement, err := t.native.prepare(ctx, query, true)
 	if err != nil {
 		releaseNative()
 	}
 	if err != nil {
 		operationErr := a.conn.sanitizeError("prepare direct plan", err)
+		operationErr = classifyNativeOutcome("prepare direct plan", false,
+			contextCancellation(ctx), operationErr, nil)
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}

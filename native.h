@@ -184,12 +184,14 @@ int ib_transaction_info(ib_transaction *transaction, uint8_t item,
 	char **response, size_t *response_length, char **error);
 ib_cursor *ib_transaction_query(ib_transaction *transaction, const char *query,
 	size_t query_length, const ib_bindings *bindings, int allow_arrays,
-	char **error);
+	ib_cancel_slot *cancel, uint64_t generation, char **error);
 int ib_transaction_exec(ib_transaction *transaction, const char *query,
 	size_t query_length, const ib_bindings *bindings, int64_t *rows_affected,
-	int allow_arrays, char **error);
+	int allow_arrays, ib_cancel_slot *cancel, uint64_t generation,
+	char **error);
 ib_statement *ib_transaction_prepare(ib_transaction *transaction,
-	const char *query, size_t query_length, int allow_arrays, char **error);
+	const char *query, size_t query_length, int allow_arrays,
+	ib_cancel_slot *cancel, uint64_t generation, char **error);
 ib_blob_reader *ib_transaction_blob_open2(ib_transaction *transaction,
 	int32_t high, uint32_t low, int subtype, int charset, char **error);
 ib_blob_writer *ib_transaction_blob_create(ib_transaction *transaction,
@@ -246,12 +248,14 @@ int ib_blob_writer_close(ib_blob_writer *writer, int cancel, int32_t *high,
 
 ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	size_t query_length, const ib_bindings *bindings, int allow_arrays,
-	char **error);
+	ib_cancel_slot *cancel, uint64_t generation, char **error);
 int ib_connection_exec(ib_connection *connection, const char *query,
 	size_t query_length, const ib_bindings *bindings, int64_t *rows_affected,
-	int allow_arrays, char **error);
+	int allow_arrays, ib_cancel_slot *cancel, uint64_t generation,
+	char **error);
 ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
-	size_t query_length, char **error);
+	size_t query_length, ib_cancel_slot *cancel, uint64_t generation,
+	char **error);
 int ib_statement_num_input(const ib_statement *statement);
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,

@@ -97,7 +97,7 @@ func TestNativeConnectionCallWaitsForActiveLifecycle(t *testing.T) {
 	}
 	callDone := make(chan error, 1)
 	go func() {
-		_, err := connection.exec("SELECT 1", nil, false)
+		_, err := connection.exec(context.Background(), "SELECT 1", nil, false)
 		callDone <- err
 	}()
 

@@ -63,7 +63,8 @@ static void overlap_completion_wait_hook(struct ib_cancel_slot *slot);
 #undef malloc
 
 struct ib_statement;
-struct ib_statement *ib_statement_prepare(ib_connection *, const char *, size_t, char **);
+struct ib_statement *ib_statement_prepare(ib_connection *, const char *, size_t,
+	ib_cancel_slot *, uint64_t, char **);
 int ib_statement_num_input(const struct ib_statement *);
 int ib_statement_exec(struct ib_statement *, const ib_bindings *, ib_cancel_slot *,
 	uint64_t, int64_t *, char **);
@@ -79,6 +80,14 @@ int ib_cursor_next(ib_cursor *, ib_cancel_slot *, uint64_t, char **);
 	(ib_statement_exec)(statement, bindings, NULL, 0U, rows, error)
 #define ib_statement_query(statement, bindings, error) \
 	(ib_statement_query)(statement, bindings, NULL, 0U, error)
+#define ib_statement_prepare(connection, query, length, error) \
+	(ib_statement_prepare)(connection, query, length, NULL, 0U, error)
+#define ib_connection_query(connection, query, length, bindings, arrays, error) \
+	(ib_connection_query)(connection, query, length, bindings, arrays, NULL, 0U, error)
+#define ib_connection_exec(connection, query, length, bindings, rows, arrays, error) \
+	(ib_connection_exec)(connection, query, length, bindings, rows, arrays, NULL, 0U, error)
+#define ib_cursor_describe_metadata(cursor, error) \
+	(ib_cursor_describe_metadata)(cursor, NULL, 0U, error)
 #define ib_cursor_next(cursor, error) \
 	(ib_cursor_next)(cursor, NULL, 0U, error)
 
