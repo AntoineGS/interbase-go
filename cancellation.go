@@ -96,6 +96,11 @@ type nativeCancelOperation struct {
 	done         chan struct{}
 	watcherDone  chan struct{}
 	watchStarted chan struct{}
+	// Optional deterministic test barriers; nil in production.
+	finishWaitStarted chan struct{}
+	closeWaitStarted  chan struct{}
+	finishWaitOnce    sync.Once
+	closeWaitOnce     sync.Once
 
 	started  atomic.Bool
 	finished atomic.Bool
@@ -213,7 +218,10 @@ func (o *nativeCancelOperation) finish() {
 	if o == nil || !o.started.Load() {
 		return
 	}
-	o.close()
+	if o.finished.CompareAndSwap(false, true) {
+		close(o.done)
+	}
+	o.waitForWatcher(o.finishWaitStarted, &o.finishWaitOnce)
 }
 
 // close is idempotent and retains the ownership boundary in one place. Every
@@ -225,6 +233,13 @@ func (o *nativeCancelOperation) close() {
 	}
 	if o.finished.CompareAndSwap(false, true) {
 		close(o.done)
+	}
+	o.waitForWatcher(o.closeWaitStarted, &o.closeWaitOnce)
+}
+
+func (o *nativeCancelOperation) waitForWatcher(waitStarted chan struct{}, once *sync.Once) {
+	if waitStarted != nil {
+		once.Do(func() { close(waitStarted) })
 	}
 	<-o.watcherDone
 	if o.closed.CompareAndSwap(false, true) {

@@ -5,7 +5,6 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -23,6 +22,8 @@ type fakeCancelSlot struct {
 	cancelStarted     chan struct{}
 	cancelStartedOnce sync.Once
 	publication       <-chan struct{}
+	publicationPassed chan struct{}
+	publicationOnce   sync.Once
 	cancelRelease     <-chan struct{}
 	cancelErr         error
 	nativeCode        int64
@@ -53,6 +54,9 @@ func (s *fakeCancelSlot) cancel(generation uint64) (nativeCancelResult, error) {
 	}
 	if s.publication != nil {
 		<-s.publication
+		if s.publicationPassed != nil {
+			s.publicationOnce.Do(func() { close(s.publicationPassed) })
+		}
 	}
 	if release != nil {
 		<-release
@@ -89,17 +93,6 @@ func waitForTestSignal(t *testing.T, signal <-chan struct{}, message string) {
 	}
 }
 
-func waitForTestCondition(t *testing.T, condition func() bool, message string) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for !condition() && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-	if !condition() {
-		t.Fatal(message)
-	}
-}
-
 func TestNativeCancelOperationRejectsPreCanceledContextBeforeBegin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -119,13 +112,16 @@ func TestNativeCancelOperationRejectsPreCanceledContextBeforeBegin(t *testing.T)
 func TestNativeCancelOperationWaitsForPublicationAndCancellationBeforeClosingSlot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	publication := make(chan struct{})
+	publicationPassed := make(chan struct{})
 	cancelRelease := make(chan struct{})
 	slot := &fakeCancelSlot{
-		cancelStarted: make(chan struct{}),
-		publication:   publication,
-		cancelRelease: cancelRelease,
+		cancelStarted:     make(chan struct{}),
+		publication:       publication,
+		publicationPassed: publicationPassed,
+		cancelRelease:     cancelRelease,
 	}
-	op := &nativeCancelOperation{slot: slot}
+	finishWaitStarted := make(chan struct{})
+	op := &nativeCancelOperation{slot: slot, finishWaitStarted: finishWaitStarted}
 	if err := op.begin(ctx); err != nil {
 		t.Fatalf("begin() error = %v", err)
 	}
@@ -140,6 +136,7 @@ func TestNativeCancelOperationWaitsForPublicationAndCancellationBeforeClosingSlo
 		op.finish()
 		close(finished)
 	}()
+	waitForTestSignal(t, finishWaitStarted, "finish did not enter watcher wait")
 	select {
 	case <-finished:
 		t.Fatal("finish returned before cancellation request completed")
@@ -147,6 +144,7 @@ func TestNativeCancelOperationWaitsForPublicationAndCancellationBeforeClosingSlo
 	}
 
 	close(publication)
+	waitForTestSignal(t, publicationPassed, "cancellation did not observe publication")
 	select {
 	case <-finished:
 		t.Fatal("finish returned before the published cancellation request completed")
@@ -170,7 +168,13 @@ func TestNativeCancelOperationOverlappingFinishAndCloseWaitsForWatcher(t *testin
 		cancelStarted: make(chan struct{}),
 		cancelRelease: cancelRelease,
 	}
-	op := &nativeCancelOperation{slot: slot}
+	finishWaitStarted := make(chan struct{})
+	closeWaitStarted := make(chan struct{})
+	op := &nativeCancelOperation{
+		slot:              slot,
+		finishWaitStarted: finishWaitStarted,
+		closeWaitStarted:  closeWaitStarted,
+	}
 	if err := op.begin(ctx); err != nil {
 		t.Fatalf("begin() error = %v", err)
 	}
@@ -185,8 +189,7 @@ func TestNativeCancelOperationOverlappingFinishAndCloseWaitsForWatcher(t *testin
 		op.finish()
 		close(finishDone)
 	}()
-	waitForTestCondition(t, op.finished.Load,
-		"finish did not publish completion before close overlap")
+	waitForTestSignal(t, finishWaitStarted, "finish did not enter watcher wait")
 
 	closeAttempted := make(chan struct{})
 	closeDone := make(chan struct{})
@@ -196,6 +199,7 @@ func TestNativeCancelOperationOverlappingFinishAndCloseWaitsForWatcher(t *testin
 		close(closeDone)
 	}()
 	waitForTestSignal(t, closeAttempted, "close did not overlap finish")
+	waitForTestSignal(t, closeWaitStarted, "close did not enter watcher wait")
 	select {
 	case <-closeDone:
 		t.Fatal("close destroyed the slot before watcher completion")
