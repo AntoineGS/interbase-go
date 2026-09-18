@@ -21,6 +21,91 @@ import (
 	"interbase-go/internal/nativegate"
 )
 
+// isc_cancelled is stable in the InterBase status definitions used by the
+// supported client. Keep the value in Go so cancellation classification does
+// not require a second cgo translation unit or expose a raw SDK constant.
+const nativeCancelledCode int64 = 335544794
+
+// nativeCancelResult keeps the request status separate from the executing
+// operation's result. A non-zero nativeCode is cancellation-call diagnostics;
+// it never establishes the outcome of the operation being canceled.
+type nativeCancelResult struct {
+	nativeCode int64
+}
+
+type nativeCancelSlotBackend interface {
+	begin() (uint64, error)
+	cancel(generation uint64) (nativeCancelResult, error)
+	close()
+}
+
+type cNativeCancelSlot struct {
+	ptr *C.ib_cancel_slot
+}
+
+func newNativeCancelSlot() (nativeCancelSlotBackend, error) {
+	var errorPointer *C.char
+	slot := C.ib_cancel_slot_new(&errorPointer)
+	if slot == nil {
+		return nil, takeNativeError(errorPointer)
+	}
+	return &cNativeCancelSlot{ptr: slot}, nil
+}
+
+func (s *cNativeCancelSlot) begin() (uint64, error) {
+	if s == nil || s.ptr == nil {
+		return 0, errors.New("interbase: native cancellation slot is unavailable")
+	}
+	var errorPointer *C.char
+	generation := C.ib_cancel_slot_begin(s.ptr, &errorPointer)
+	if generation == 0 {
+		return 0, takeNativeError(errorPointer)
+	}
+	return uint64(generation), nil
+}
+
+func (s *cNativeCancelSlot) cancel(generation uint64) (nativeCancelResult, error) {
+	if s == nil || s.ptr == nil {
+		return nativeCancelResult{}, errors.New("interbase: native cancellation slot is unavailable")
+	}
+	var nativeCode C.int64_t
+	var errorPointer *C.char
+	if result := C.ib_cancel_slot_cancel(s.ptr, C.uint64_t(generation), &nativeCode,
+		&errorPointer); result != 0 {
+		return nativeCancelResult{}, takeNativeError(errorPointer)
+	}
+	return nativeCancelResult{nativeCode: int64(nativeCode)}, nil
+}
+
+func (s *cNativeCancelSlot) close() {
+	if s == nil || s.ptr == nil {
+		return
+	}
+	C.ib_cancel_slot_free(s.ptr)
+	s.ptr = nil
+}
+
+// nativeCancelSlot and nativeCancelGeneration are consumed by the statement
+// wrappers that publish and complete a generation in C. Test backends do not
+// expose an SDK pointer, so the slot is nil outside the production C backend.
+func (o *nativeCancelOperation) nativeCancelSlot() *C.ib_cancel_slot {
+	if o == nil {
+		return nil
+	}
+	slot, ok := o.slot.(*cNativeCancelSlot)
+	if !ok || slot == nil {
+		return nil
+	}
+	return slot.ptr
+}
+
+func (o *nativeCancelOperation) nativeCancelGeneration() C.uint64_t {
+	if o == nil {
+		return 0
+	}
+	return C.uint64_t(o.generation)
+}
+
 // enterNativeContext admits an ordinary native call before the caller performs
 // any client-library side effect. The second context check closes the small
 // race between admission and the caller's first native operation; callers

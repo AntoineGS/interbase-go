@@ -1,6 +1,7 @@
 package interbase
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
@@ -299,6 +300,85 @@ func TestNativeErrorPreservesStatusThroughRedaction(t *testing.T) {
 	}
 	if nativeErr.Operation != "connect" || strings.Contains(sanitized.Error(), "secret") {
 		t.Fatalf("sanitized native error = %v", sanitized)
+	}
+}
+
+func TestCancellationErrorPreservesContextAndNativeDiagnostics(t *testing.T) {
+	native := &NativeError{
+		Operation:  "execute statement",
+		SQLCode:    -901,
+		NativeCode: nativeCancelledCode,
+		Message:    "SQL=UPDATE accounts SET password='secret' binding=credential attachment=/private/db.ib",
+	}
+	err := &CancellationError{
+		Operation: "execute statement",
+		Mutating:  true,
+		Context:   context.DeadlineExceeded,
+		Native:    native,
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("cancellation error does not match the originating context")
+	}
+	var cancellationErr *CancellationError
+	if !errors.As(err, &cancellationErr) {
+		t.Fatal("cancellation error is not discoverable with errors.As")
+	}
+	var nativeErr *NativeError
+	if !errors.As(err, &nativeErr) {
+		t.Fatal("native cancellation diagnostics are not discoverable with errors.As")
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatal("cancellation error must not be driver.ErrBadConn")
+	}
+	for _, secret := range []string{"UPDATE accounts", "password='secret'", "credential", "/private/db.ib"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("cancellation error leaked %q: %v", secret, err)
+		}
+	}
+}
+
+func TestUncertainOutcomeErrorPreservesContextAndNativeCleanupDiagnostics(t *testing.T) {
+	native := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "UPDATE accounts binding=secret",
+	}
+	cleanup := &NativeError{
+		Operation:  "rollback transaction",
+		NativeCode: 335544999,
+		Message:    "database=/private/db.ib password=secret",
+	}
+	err := &UncertainOutcomeError{
+		Operation: "execute statement",
+		Mutating:  true,
+		Cause: &CancellationError{
+			Operation: "execute statement",
+			Mutating:  true,
+			Context:   context.DeadlineExceeded,
+			Native:    native,
+		},
+		Cleanup: cleanup,
+	}
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("uncertain outcome does not match the originating context")
+	}
+	var uncertain *UncertainOutcomeError
+	if !errors.As(err, &uncertain) || !uncertain.Mutating {
+		t.Fatal("uncertain outcome is not discoverable as a mutating error")
+	}
+	var nativeErr *NativeError
+	if !errors.As(err, &nativeErr) {
+		t.Fatal("uncertain outcome lost native diagnostics")
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatal("uncertain cancellation must not be driver.ErrBadConn")
+	}
+	for _, secret := range []string{"UPDATE accounts", "binding=secret", "/private/db.ib", "password=secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("uncertain outcome leaked %q: %v", secret, err)
+		}
 	}
 }
 
