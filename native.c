@@ -868,6 +868,9 @@ static int ib_cancel_slot_republish_if_active(ib_cancel_slot *slot,
 			abort();
 		}
 		while (slot->cancel_users != 0U) {
+#ifdef IB_CANCEL_SLOT_TEST_PUBLICATION_WAIT_HOOK
+			IB_CANCEL_SLOT_TEST_PUBLICATION_WAIT_HOOK(slot);
+#endif
 			result = pthread_cond_wait(&slot->condition, &slot->mutex);
 			if (result != 0) {
 				ib_cancel_slot_unlock_or_abort(slot);
@@ -923,6 +926,9 @@ static int ib_cancel_slot_unpublish(ib_cancel_slot *slot, uint64_t generation,
 		abort();
 	}
 	while (slot->cancel_users != 0U) {
+#ifdef IB_CANCEL_SLOT_TEST_PUBLICATION_WAIT_HOOK
+		IB_CANCEL_SLOT_TEST_PUBLICATION_WAIT_HOOK(slot);
+#endif
 		result = pthread_cond_wait(&slot->condition, &slot->mutex);
 		if (result != 0) {
 			ib_cancel_slot_unlock_or_abort(slot);
@@ -1191,6 +1197,43 @@ static int ib_fail_status(char **error, const char *operation,
 			"%s failed (SQLCODE 0, native status unavailable)", operation);
 	}
 	return ib_fail(error, message);
+}
+
+static int ib_error_has_native_status(const char *error, ISC_STATUS status)
+{
+	char needle[80];
+
+	if (error == NULL) {
+		return 0;
+	}
+	(void) snprintf(needle, sizeof(needle), "native status %" PRIdPTR,
+		(intptr_t) status);
+	return strstr(error, needle) != NULL;
+}
+
+static int ib_catalog_error_requires_propagation(const char *error)
+{
+	if (error == NULL) {
+		return 0;
+	}
+	/* Catalog metadata is optional, but a native cancellation or a failure in
+	 * the cancellation-slot protocol must not be hidden by that fallback. */
+	return ib_error_has_native_status(error, isc_cancelled) ||
+		strstr(error, "cancellation slot") != NULL ||
+		strstr(error, "pthread_") != NULL;
+}
+
+static int ib_catalog_fallback_if_optional(ib_cancel_slot *cancel, char **error)
+{
+	if (cancel == NULL || ib_catalog_error_requires_propagation(
+		error == NULL ? NULL : *error)) {
+		return 0;
+	}
+	if (error != NULL) {
+		free(*error);
+		*error = NULL;
+	}
+	return 1;
 }
 
 static void ib_append_error(char **first_error, char *next_error)
@@ -1815,14 +1858,14 @@ static int ib_cursor_prepare_statement(ib_cursor *cursor, const char *query,
 		ib_connection_dialect(cursor->connection), NULL);
 	unpublish_error = NULL;
 	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
-		if (result == 0) {
-			ib_give_error(error, unpublish_error);
-			return -1;
-		}
-		free(unpublish_error);
+		ib_append_error(error, unpublish_error);
 	}
 	if (result != 0) {
-		return ib_fail_status(error, "prepare statement", status);
+		char *prepare_error = NULL;
+
+		(void) ib_fail_status(&prepare_error, "prepare statement", status);
+		ib_append_error(error, prepare_error);
+		return -1;
 	}
 	return 0;
 }
@@ -5723,6 +5766,9 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 	}
 	if (ib_procedure_catalog_query_text(&catalog_query, &catalog_query_length,
 		error) != 0) {
+		if (ib_catalog_fallback_if_optional(cancel, error)) {
+			return 0;
+		}
 		return -1;
 	}
 	for (index = 0; index < cursor->output->sqld; index++) {
@@ -5739,6 +5785,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 		int result;
 		int close_result;
 		int has_row;
+		int fatal_error;
 		XSQLVAR *variable = &cursor->output->sqlvar[index];
 
 		procedure_result = ib_descriptor_name(variable->relname,
@@ -5748,6 +5795,10 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 			variable->sqlname_length, parameter_name, sizeof(parameter_name),
 			&parameter_name_length, error);
 		if (procedure_result < 0 || parameter_result < 0) {
+			if (ib_catalog_fallback_if_optional(cancel, error)) {
+				free(catalog_query);
+				return 0;
+			}
 			free(catalog_query);
 			return -1;
 		}
@@ -5756,8 +5807,13 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 		}
 		catalog_cursor = (ib_cursor *) calloc(1U, sizeof(*catalog_cursor));
 		if (catalog_cursor == NULL) {
+			(void) ib_fail(error, "out of memory allocating procedure catalog cursor");
+			if (ib_catalog_fallback_if_optional(cancel, error)) {
+				free(catalog_query);
+				return 0;
+			}
 			free(catalog_query);
-			return ib_fail(error, "out of memory allocating procedure catalog cursor");
+			return -1;
 		}
 		catalog_cursor->connection = cursor->connection;
 		catalog_cursor->transaction = cursor->transaction;
@@ -5766,11 +5822,13 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 		close_error = NULL;
 		result = 0;
 		close_result = 0;
+		fatal_error = 0;
 		if (ib_cursor_prepare_statement(catalog_cursor, catalog_query,
 			catalog_query_length, cancel, generation, &catalog_error) != 0 ||
 			ib_statement_is_select(catalog_cursor, &catalog_error) != 0 ||
 			ib_describe_bind(catalog_cursor, &catalog_error) != 0) {
 			result = -1;
+			fatal_error = ib_catalog_error_requires_propagation(catalog_error);
 			goto procedure_catalog_done;
 		}
 		bindings = ib_bindings_new(2U, &catalog_error);
@@ -5785,6 +5843,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 			ib_validate_output_types(catalog_cursor->output, &catalog_error) != 0 ||
 			ib_allocate_output(catalog_cursor, &catalog_error) != 0) {
 			result = -1;
+			fatal_error = ib_catalog_error_requires_propagation(catalog_error);
 			goto procedure_catalog_done;
 		}
 		{
@@ -5796,6 +5855,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 			if (ib_cancel_slot_republish_if_active(cancel, generation,
 				&catalog_cursor->statement, &catalog_error) != 0) {
 				result = -1;
+				fatal_error = 1;
 				goto procedure_catalog_done;
 			}
 			memset(status, 0, sizeof(status));
@@ -5806,17 +5866,23 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 				char *unpublish_error = NULL;
 				if (ib_cancel_slot_unpublish(cancel, generation,
 					&unpublish_error) != 0) {
+					fatal_error = 1;
 					if (native_result == 0) {
 						ib_give_error(&catalog_error, unpublish_error);
 						result = -1;
 						goto procedure_catalog_done;
 					}
-					free(unpublish_error);
+					ib_append_error(&catalog_error, unpublish_error);
 				}
 			}
 			if (native_result != 0) {
-				(void) ib_fail_status(&catalog_error, "execute procedure catalog query",
-					status);
+				char *native_error = NULL;
+
+				(void) ib_fail_status(&native_error,
+					"execute procedure catalog query", status);
+				ib_append_error(&catalog_error, native_error);
+				fatal_error = fatal_error ||
+					ib_catalog_error_requires_propagation(catalog_error);
 				result = -1;
 				goto procedure_catalog_done;
 			}
@@ -5827,6 +5893,8 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 				&catalog_error);
 			if (has_row < 0) {
 				result = -1;
+				fatal_error = fatal_error ||
+					ib_catalog_error_requires_propagation(catalog_error);
 				break;
 			}
 			if (has_row == 0) {
@@ -5835,6 +5903,8 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 			if (ib_procedure_catalog_apply_row(cursor, catalog_cursor,
 				&catalog_error) != 0) {
 				result = -1;
+				fatal_error = fatal_error ||
+					ib_catalog_error_requires_propagation(catalog_error);
 				break;
 			}
 		}
@@ -5845,46 +5915,47 @@ procedure_catalog_done:
 		}
 		if (catalog_cursor->statement != NULL || catalog_cursor->input != NULL ||
 			catalog_cursor->output != NULL) {
-			if (ib_cancel_slot_unpublish(cancel, generation, &close_error) != 0) {
+			char *unpublish_error = NULL;
+			char *cursor_close_error = NULL;
+
+			if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
 				result = -1;
+				fatal_error = 1;
 			}
-			close_result = ib_cursor_close_internal(catalog_cursor, &close_error, 0);
+			ib_append_error(&catalog_error, unpublish_error);
+			close_result = ib_cursor_close_internal(catalog_cursor,
+				&cursor_close_error, 0);
 			if (close_result != 0) {
 				result = -1;
+				fatal_error = 1;
 			}
+			ib_append_error(&catalog_error, cursor_close_error);
 		} else {
 			free(catalog_cursor);
 		}
 		if (ib_cancel_slot_republish_if_active(cancel, generation,
 			&cursor->statement, &close_error) != 0) {
 			result = -1;
+			fatal_error = 1;
 		}
-		if (close_error != NULL) {
-			ib_append_error(&catalog_error, close_error);
-			close_error = NULL;
-		}
-		if (close_result != 0) {
-			ib_append_error(&catalog_error, close_error);
-			close_error = NULL;
-			free(catalog_query);
-			ib_give_error(error, catalog_error);
-			return -1;
-		}
+		ib_append_error(&catalog_error, close_error);
+		close_error = NULL;
 		if (result != 0) {
-			if (cancel != NULL) {
+			if (fatal_error) {
+				if (catalog_error == NULL) {
+					(void) ib_fail(&catalog_error,
+						"procedure catalog cleanup failed");
+				}
 				free(catalog_query);
 				ib_give_error(error, catalog_error);
-				free(close_error);
 				return -1;
 			}
 			/* Procedure catalog metadata is an enhancement; preserve the query
 			 * result when the catalog is unavailable. */
 			free(catalog_error);
-			free(close_error);
 			continue;
 		}
 		free(catalog_error);
-		free(close_error);
 	}
 	free(catalog_query);
 	return 0;
@@ -5905,12 +5976,16 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 	size_t index;
 	int result;
 	int close_result;
+	int fatal_error;
 
 	relation_names = NULL;
 	relation_lengths = NULL;
 	relation_count = 0U;
 	if (ib_catalog_relation_list(cursor, &relation_names, &relation_lengths,
 		&relation_count, error) != 0) {
+		if (ib_catalog_fallback_if_optional(cancel, error)) {
+			return 0;
+		}
 		return -1;
 	}
 	if (relation_count == 0U) {
@@ -5921,13 +5996,20 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 	if (ib_catalog_query_text(relation_count, &catalog_query, &catalog_query_length,
 		error) != 0) {
 		ib_free_catalog_relations(relation_names, relation_lengths, relation_count);
+		if (ib_catalog_fallback_if_optional(cancel, error)) {
+			return 0;
+		}
 		return -1;
 	}
 	catalog_cursor = (ib_cursor *) calloc(1U, sizeof(*catalog_cursor));
 	if (catalog_cursor == NULL) {
+		(void) ib_fail(error, "out of memory allocating catalog cursor");
 		free(catalog_query);
 		ib_free_catalog_relations(relation_names, relation_lengths, relation_count);
-		return ib_fail(error, "out of memory allocating catalog cursor");
+		if (ib_catalog_fallback_if_optional(cancel, error)) {
+			return 0;
+		}
+		return -1;
 	}
 	catalog_cursor->connection = cursor->connection;
 	catalog_cursor->transaction = cursor->transaction;
@@ -5936,11 +6018,13 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 	close_error = NULL;
 	result = 0;
 	close_result = 0;
+	fatal_error = 0;
 	if (ib_cursor_prepare_statement(catalog_cursor, catalog_query,
 		catalog_query_length, cancel, generation, &catalog_error) != 0 ||
 		ib_statement_is_select(catalog_cursor, &catalog_error) != 0 ||
 		ib_describe_bind(catalog_cursor, &catalog_error) != 0) {
 		result = -1;
+		fatal_error = ib_catalog_error_requires_propagation(catalog_error);
 		goto catalog_done;
 	}
 	bindings = ib_bindings_new(relation_count, &catalog_error);
@@ -5961,6 +6045,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		ib_validate_output_types(catalog_cursor->output, &catalog_error) != 0 ||
 		ib_allocate_output(catalog_cursor, &catalog_error) != 0) {
 		result = -1;
+		fatal_error = ib_catalog_error_requires_propagation(catalog_error);
 		goto catalog_done;
 	}
 	{
@@ -5971,6 +6056,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		if (ib_cancel_slot_republish_if_active(cancel, generation,
 			&catalog_cursor->statement, &catalog_error) != 0) {
 			result = -1;
+			fatal_error = 1;
 			goto catalog_done;
 		}
 		memset(status, 0, sizeof(status));
@@ -5980,16 +6066,22 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		{
 			char *unpublish_error = NULL;
 			if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+				fatal_error = 1;
 				if (native_result == 0) {
 					ib_give_error(&catalog_error, unpublish_error);
 					result = -1;
 					goto catalog_done;
 				}
-				free(unpublish_error);
+				ib_append_error(&catalog_error, unpublish_error);
 			}
 		}
 		if (native_result != 0) {
-			(void) ib_fail_status(&catalog_error, "execute catalog query", status);
+			char *native_error = NULL;
+
+			(void) ib_fail_status(&native_error, "execute catalog query", status);
+			ib_append_error(&catalog_error, native_error);
+			fatal_error = fatal_error ||
+				ib_catalog_error_requires_propagation(catalog_error);
 			result = -1;
 			goto catalog_done;
 		}
@@ -6001,6 +6093,8 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 
 		if (has_row < 0) {
 			result = -1;
+			fatal_error = fatal_error ||
+				ib_catalog_error_requires_propagation(catalog_error);
 			break;
 		}
 		if (has_row == 0) {
@@ -6008,6 +6102,8 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		}
 		if (ib_catalog_apply_row(cursor, catalog_cursor, &catalog_error) != 0) {
 			result = -1;
+			fatal_error = fatal_error ||
+				ib_catalog_error_requires_propagation(catalog_error);
 			break;
 		}
 	}
@@ -6018,13 +6114,21 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 	}
 	if (catalog_cursor->statement != NULL || catalog_cursor->input != NULL ||
 		catalog_cursor->output != NULL) {
-		if (ib_cancel_slot_unpublish(cancel, generation, &close_error) != 0) {
+		char *unpublish_error = NULL;
+		char *cursor_close_error = NULL;
+
+		if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
 			result = -1;
+			fatal_error = 1;
 		}
-		close_result = ib_cursor_close_internal(catalog_cursor, &close_error, 0);
+		ib_append_error(&catalog_error, unpublish_error);
+		close_result = ib_cursor_close_internal(catalog_cursor,
+			&cursor_close_error, 0);
 		if (close_result != 0) {
 			result = -1;
+			fatal_error = 1;
 		}
+		ib_append_error(&catalog_error, cursor_close_error);
 	} else {
 		free(catalog_cursor);
 	}
@@ -6033,31 +6137,24 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 	if (ib_cancel_slot_republish_if_active(cancel, generation,
 		&cursor->statement, &close_error) != 0) {
 		result = -1;
+		fatal_error = 1;
 	}
-	if (close_error != NULL) {
-		ib_append_error(&catalog_error, close_error);
-		close_error = NULL;
-	}
-	if (close_result != 0) {
-		ib_append_error(&catalog_error, close_error);
-		close_error = NULL;
-		ib_give_error(error, catalog_error);
-		return -1;
-	}
+	ib_append_error(&catalog_error, close_error);
+	close_error = NULL;
 	if (result != 0) {
-		if (cancel != NULL) {
+		if (fatal_error) {
+			if (catalog_error == NULL) {
+				(void) ib_fail(&catalog_error, "catalog metadata cleanup failed");
+			}
 			ib_give_error(error, catalog_error);
-			free(close_error);
 			return -1;
 		}
 		/* Catalog information is an enhancement; an unavailable catalog must not
 		 * turn an otherwise valid user query into a failure. */
 		free(catalog_error);
-		free(close_error);
 		return 0;
 	}
 	free(catalog_error);
-	free(close_error);
 	return 0;
 }
 
@@ -8210,6 +8307,14 @@ static int ib_cursor_next_internal(ib_cursor *cursor, ib_cancel_slot *cancel,
 			&unpublish_error);
 		if (operation_result != 0 && result == 0) {
 			ib_give_error(error, unpublish_error);
+			return -1;
+		}
+		if (operation_result != 0) {
+			char *fetch_error = NULL;
+
+			(void) ib_fail_status(&fetch_error, "fetch row", status);
+			ib_append_error(&fetch_error, unpublish_error);
+			ib_give_error(error, fetch_error);
 			return -1;
 		}
 		free(unpublish_error);

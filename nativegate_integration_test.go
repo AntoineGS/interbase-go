@@ -2,6 +2,7 @@ package interbase
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"testing"
 	"time"
@@ -48,6 +49,65 @@ func TestExecContextCancellationWhileNativeGateWaitsDoesNotEnterNativeCall(t *te
 	case <-called:
 		t.Fatal("canceled ExecContext entered the native operation after gate release")
 	default:
+	}
+}
+
+func TestRootExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	nativeErr := &Error{
+		Operation:  "execute statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	connection := &conn{
+		native: &nativeConnection{
+			brokenOverride: func() bool { return false },
+			execOverride: func(string, []argument, bool) (int64, error) {
+				close(entered)
+				<-release
+				return 0, nativeErr
+			},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := connection.ExecContext(ctx, "UPDATE example SET value = 1", nil)
+		result <- err
+	}()
+	<-entered
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		connection.mu.Lock()
+		close(lockAcquired)
+		connection.mu.Unlock()
+	}()
+	cancel()
+	select {
+	case <-lockAcquired:
+		t.Fatal("root operation released its connection lock before native completion")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("root ExecContext() error = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, driver.ErrBadConn) {
+			t.Fatal("root execution cancellation was classified as driver.ErrBadConn")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("root ExecContext() did not return after native completion")
+	}
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("root operation did not release its connection lock")
 	}
 }
 

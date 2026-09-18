@@ -158,6 +158,64 @@ func TestDirectOperationsRecheckContextAfterWaitingForConnection(t *testing.T) {
 	}
 }
 
+func TestDirectExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
+	connection, _, transaction := newDirectContextTestTransaction(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	nativeErr := &Error{
+		Operation:  "execute prepared statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	connection.native.brokenOverride = func() bool { return false }
+	transaction.native = &nativeTransaction{
+		execOverride: func(string, []argument, bool) (int64, error) {
+			close(entered)
+			<-release
+			return 0, nativeErr
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := transaction.Exec(ctx, "UPDATE example SET value = 1")
+		result <- err
+	}()
+	<-entered
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		connection.mu.Lock()
+		close(lockAcquired)
+		connection.mu.Unlock()
+	}()
+	cancel()
+	select {
+	case <-lockAcquired:
+		t.Fatal("direct operation released its connection lock before native completion")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("direct Exec() error = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, driver.ErrBadConn) {
+			t.Fatal("direct execution cancellation was classified as driver.ErrBadConn")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("direct Exec() did not return after native completion")
+	}
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("direct operation did not release its connection lock")
+	}
+}
+
 func TestOpenBlobRechecksContextAfterLockedValidation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

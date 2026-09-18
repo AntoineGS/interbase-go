@@ -166,6 +166,7 @@ type nativeConnection struct {
 
 type nativeTransaction struct {
 	ptr                     *C.ib_transaction
+	execOverride            func(string, []argument, bool) (int64, error)
 	freeOverride            func()
 	commitOverride          func() error
 	rollbackOverride        func() error
@@ -542,6 +543,9 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 	}
 	release := nativegate.Global.Enter()
 	defer release()
+	if t != nil && t.execOverride != nil {
+		return t.execOverride(query, append([]argument(nil), args...), allowArrays)
+	}
 	if t == nil || t.ptr == nil {
 		return 0, errors.New("interbase: native transaction is unavailable")
 	}

@@ -132,3 +132,80 @@ cases remained skipped in that ordinary run and the lifecycle race was run
 separately above.
 
 The pre-existing untracked planning/specification files were not staged.
+
+## Fix round 1
+
+### RED
+
+The new native regression harness initially failed before the catalog error
+classification fix:
+
+```text
+native prepared test failed: ordinary catalog failure did not fall back with an active slot
+native prepared test failed: ordinary catalog failure did not fall back with an active slot
+```
+
+The first transient-prepare overlap also hung after the native call returned,
+showing that the test needed to observe the publication/unpublication wait
+before releasing the cancellation call rather than relying only on operation
+completion.
+
+### GREEN
+
+- Catalog and procedure metadata now fall back only for ordinary optional
+  lookup failures when a cancellation slot is active. `isc_cancelled`, slot
+  publication/protocol errors, and all catalog cleanup failures remain
+  authoritative and propagate to the caller. Native and cleanup diagnostics
+  are preserved together.
+- The native harness now blocks `ib_cancel_slot_cancel` across transient
+  prepare, exec, procedure `execute2`, catalog `execute2`, and distributed
+  participant exec. It asserts publication targeting, waits at the native
+  publication barrier, proves cleanup has not started early, then releases
+  cancellation and verifies participant rollback recovery.
+- Added public root and direct `Exec` cancellation tests while each operation
+  owns its connection mutex; both preserve `context.Canceled` and avoid
+  `driver.ErrBadConn` classification.
+
+Fresh verification after the fix:
+
+```text
+LD_LIBRARY_PATH=/tmp/opencode make test \
+  INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
+  INTERBASE_LIB=/tmp/opencode                         PASS
+
+LD_LIBRARY_PATH=/tmp/opencode \
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+go test . -run 'Test(RootExecContextCancellationWhileOwningConnectionLock|DirectExecContextCancellationWhileOwningConnectionLock)' \
+  -count=1 -v -timeout=60s                              PASS
+
+LD_LIBRARY_PATH=/tmp/opencode \
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+go test -race ./... -count=1 -timeout=180s                PASS
+
+LD_LIBRARY_PATH=/tmp/opencode \
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+go test -race . ./internal/nativegate -run 'Cancel|Cancellation|Uncertain' \
+  -count=50 -timeout=180s                                  PASS
+
+LD_LIBRARY_PATH=/tmp/opencode \
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+go test -gcflags=all=-d=checkptr=2 ./... -count=1 -timeout=180s PASS
+
+LD_LIBRARY_PATH=/tmp/opencode \
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+go vet ./...                                             PASS
+
+IMAGE=interbase-go-parity-test:local \
+INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
+./scripts/test-integration-docker.sh -v                    PASS
+
+IMAGE=interbase-go-parity-test:local \
+INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
+./scripts/test-integration-docker.sh --native-lifecycle \
+  -run '^TestNativeLifecycleRace$' -v                       PASS
+```
