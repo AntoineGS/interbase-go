@@ -1,9 +1,14 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <ibase.h>
 
@@ -19,9 +24,24 @@ static ISC_STATUS cancel_result;
 static int execute_entered;
 static int execute_release;
 static int completion_started;
+static int completion_returned;
 static int drop_calls;
 static ISC_STATUS execute_status_storage[20];
 static int fail_next_malloc;
+static int fail_next_mutex_unlock;
+static unsigned int event_sequence;
+static unsigned int cancel_return_order;
+static unsigned int free_return_order;
+static int free_started;
+
+static int injected_pthread_mutex_unlock(pthread_mutex_t *mutex)
+{
+	if (fail_next_mutex_unlock) {
+		fail_next_mutex_unlock = 0;
+		return EIO;
+	}
+	return pthread_mutex_unlock(mutex);
+}
 
 static void *test_malloc(size_t size)
 {
@@ -60,8 +80,10 @@ static ISC_STATUS test_isc_dsql_free_statement(ISC_STATUS *status,
 
 #define isc_dsql_free_statement test_isc_dsql_free_statement
 #define malloc test_malloc
+#define pthread_mutex_unlock injected_pthread_mutex_unlock
 #include "../native.c"
 #undef malloc
+#undef pthread_mutex_unlock
 #undef isc_dsql_free_statement
 
 static void require_condition(int condition, const char *message)
@@ -94,7 +116,13 @@ static void reset_cancel_stub(ISC_STATUS result)
 	execute_entered = 0;
 	execute_release = 0;
 	completion_started = 0;
+	completion_returned = 0;
 	drop_calls = 0;
+	fail_next_mutex_unlock = 0;
+	event_sequence = 0;
+	cancel_return_order = 0;
+	free_return_order = 0;
+	free_started = 0;
 	(void) memset(execute_status_storage, 0, sizeof(execute_status_storage));
 	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
 }
@@ -151,6 +179,11 @@ static void *cancel_worker(void *argument)
 
 	call->request_status = ib_cancel_slot_cancel(call->slot, call->generation,
 		&call->native_code, &call->error);
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	cancel_return_order = ++event_sequence;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
 	return NULL;
 }
 
@@ -179,7 +212,34 @@ static void *execute_worker(void *argument)
 	ib_cancel_slot_complete(call->slot, call->generation);
 
 	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	completion_returned = 1;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
 	drop_calls++;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+	return NULL;
+}
+
+struct free_call {
+	ib_cancel_slot *slot;
+};
+
+static void *free_worker(void *argument)
+{
+	struct free_call *call = (struct free_call *) argument;
+
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	free_started = 1;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+
+	ib_cancel_slot_free(call->slot);
+
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	free_return_order = ++event_sequence;
 	require_pthread(pthread_cond_broadcast(&test_condition),
 		"pthread_cond_broadcast");
 	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
@@ -190,6 +250,36 @@ static void wait_for_completion_start(void)
 {
 	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
 	while (!completion_started) {
+		require_pthread(pthread_cond_wait(&test_condition, &test_mutex),
+			"pthread_cond_wait");
+	}
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+}
+
+static void wait_for_completion_return(void)
+{
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	while (!completion_returned) {
+		require_pthread(pthread_cond_wait(&test_condition, &test_mutex),
+			"pthread_cond_wait");
+	}
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+}
+
+static void wait_for_unpublished_cancel(ib_cancel_slot *slot)
+{
+	require_pthread(pthread_mutex_lock(&slot->mutex), "pthread_mutex_lock");
+	while (slot->cancel_callers == 0U || slot->published) {
+		require_pthread(pthread_cond_wait(&slot->condition, &slot->mutex),
+			"pthread_cond_wait");
+	}
+	require_pthread(pthread_mutex_unlock(&slot->mutex), "pthread_mutex_unlock");
+}
+
+static void wait_for_free_start(void)
+{
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	while (!free_started) {
 		require_pthread(pthread_cond_wait(&test_condition, &test_mutex),
 			"pthread_cond_wait");
 	}
@@ -266,11 +356,14 @@ static void test_active_cancel_joins_completion(void)
 	release_execute_call();
 	wait_for_completion_start();
 	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	require_condition(!completion_returned,
+		"completion returned before the cancellation stub returned");
 	require_condition(drop_calls == 0,
 		"completion reached simulated drop before cancel returned");
 	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
 
 	release_cancel_stub();
+	wait_for_completion_return();
 	require_pthread(pthread_join(cancel_thread, NULL), "pthread_join");
 	require_pthread(pthread_join(completion_thread, NULL), "pthread_join");
 
@@ -292,8 +385,10 @@ static void test_active_cancel_joins_completion(void)
 	ib_cancel_slot_free(slot);
 }
 
-static void test_cancel_before_publication_is_noop_after_completion(void)
+static void test_waiting_cancel_is_published_once(void)
 {
+	char statement_token;
+	isc_stmt_handle statement = &statement_token;
 	ib_cancel_slot *slot;
 	uint64_t generation;
 	struct cancel_call cancel_call_data;
@@ -310,15 +405,88 @@ static void test_cancel_before_publication_is_noop_after_completion(void)
 	require_pthread(pthread_create(&cancel_thread, NULL, cancel_worker,
 		&cancel_call_data), "pthread_create");
 
+	wait_for_unpublished_cancel(slot);
+	publish_slot(slot, generation, &statement);
+	wait_for_cancel_entry();
+	require_condition(cancel_calls == 1,
+		"published waiting cancellation was not requested exactly once");
+	release_cancel_stub();
+	require_pthread(pthread_join(cancel_thread, NULL), "pthread_join");
+	require_condition(cancel_call_data.request_status == 0,
+		"published waiting cancellation request failed");
+	require_condition(cancel_call_data.native_code == 0,
+		"published waiting cancellation returned a native status");
+	require_condition(cancel_call_data.error == NULL,
+		"published waiting cancellation returned an error");
+	complete_slot(slot, generation);
+	ib_cancel_slot_free(slot);
+}
+
+static void test_waiting_cancel_completion_is_noop(void)
+{
+	ib_cancel_slot *slot;
+	uint64_t generation;
+	struct cancel_call cancel_call_data;
+	pthread_t cancel_thread;
+
+	reset_cancel_stub(0);
+	slot = new_slot();
+	generation = begin_slot(slot);
+	cancel_call_data.slot = slot;
+	cancel_call_data.generation = generation;
+	cancel_call_data.request_status = -2;
+	cancel_call_data.native_code = -1;
+	cancel_call_data.error = NULL;
+	require_pthread(pthread_create(&cancel_thread, NULL, cancel_worker,
+		&cancel_call_data), "pthread_create");
+	wait_for_unpublished_cancel(slot);
 	complete_slot(slot, generation);
 	require_pthread(pthread_join(cancel_thread, NULL), "pthread_join");
 	require_condition(cancel_call_data.request_status == 0,
-		"pre-publication cancellation request failed");
+		"completion-before-publication cancellation request failed");
 	require_condition(cancel_call_data.native_code == 0,
-		"pre-publication cancellation returned a native status");
+		"completion-before-publication cancellation returned a native status");
 	require_condition(cancel_calls == 0,
-		"pre-publication cancellation called the native client");
+		"completion-before-publication cancellation called the native client");
 	ib_cancel_slot_free(slot);
+}
+
+static void test_free_waits_for_unpublished_cancel(void)
+{
+	ib_cancel_slot *slot;
+	uint64_t generation;
+	struct cancel_call cancel_call_data;
+	struct free_call free_call_data;
+	pthread_t cancel_thread;
+	pthread_t free_thread;
+
+	reset_cancel_stub(0);
+	slot = new_slot();
+	generation = begin_slot(slot);
+	cancel_call_data.slot = slot;
+	cancel_call_data.generation = generation;
+	cancel_call_data.request_status = -2;
+	cancel_call_data.native_code = -1;
+	cancel_call_data.error = NULL;
+	require_pthread(pthread_create(&cancel_thread, NULL, cancel_worker,
+		&cancel_call_data), "pthread_create");
+	wait_for_unpublished_cancel(slot);
+	free_call_data.slot = slot;
+	require_pthread(pthread_create(&free_thread, NULL, free_worker,
+		&free_call_data), "pthread_create");
+	wait_for_free_start();
+	complete_slot(slot, generation);
+	require_pthread(pthread_join(cancel_thread, NULL), "pthread_join");
+	require_pthread(pthread_join(free_thread, NULL), "pthread_join");
+	require_condition(cancel_call_data.request_status == 0,
+		"free-lifetime cancellation request failed");
+	require_condition(cancel_call_data.native_code == 0,
+		"free-lifetime cancellation returned a native status");
+	require_condition(cancel_calls == 0,
+		"free-lifetime cancellation called the native client");
+	require_condition(cancel_return_order != 0U && free_return_order != 0U &&
+		cancel_return_order < free_return_order,
+		"slot was destroyed before the waiting cancellation caller returned");
 }
 
 static void test_completion_before_cancel_is_noop(void)
@@ -439,6 +607,68 @@ static void test_allocation_failure_is_reported(void)
 	ib_error_free(error);
 }
 
+static ib_cancel_slot *fault_slot;
+static uint64_t fault_generation;
+
+static void child_begin_unlock_failure(void)
+{
+	char *error = NULL;
+
+	fail_next_mutex_unlock = 1;
+	(void) ib_cancel_slot_begin(fault_slot, &error);
+	_exit(EXIT_FAILURE);
+}
+
+static void child_cancel_unlock_failure(void)
+{
+	char *error = NULL;
+	int64_t native_code = -1;
+
+	fail_next_mutex_unlock = 1;
+	cancel_release = 1;
+	(void) ib_cancel_slot_cancel(fault_slot, fault_generation, &native_code, &error);
+	_exit(EXIT_FAILURE);
+}
+
+static void require_abort(void (*child_body)(void), const char *message)
+{
+	pid_t child;
+	int wait_status;
+
+	child = fork();
+	require_condition(child >= 0, "fork failed during pthread fault injection");
+	if (child == 0) {
+		(void) alarm(2U);
+		child_body();
+		_exit(EXIT_FAILURE);
+	}
+	require_condition(waitpid(child, &wait_status, 0) == child,
+		"waitpid failed during pthread fault injection");
+	require_condition(WIFSIGNALED(wait_status) &&
+		WTERMSIG(wait_status) == SIGABRT, message);
+}
+
+static void test_pthread_unlock_failure_is_fail_fast(void)
+{
+	char statement_token;
+	isc_stmt_handle statement = &statement_token;
+
+	reset_cancel_stub(0);
+	fault_slot = new_slot();
+	require_abort(child_begin_unlock_failure,
+		"begin mutex-unlock failure did not fail fast");
+	ib_cancel_slot_free(fault_slot);
+
+	reset_cancel_stub(0);
+	fault_slot = new_slot();
+	fault_generation = begin_slot(fault_slot);
+	publish_slot(fault_slot, fault_generation, &statement);
+	require_abort(child_cancel_unlock_failure,
+		"cancel mutex-unlock failure did not fail fast");
+	complete_slot(fault_slot, fault_generation);
+	ib_cancel_slot_free(fault_slot);
+}
+
 static void test_invalid_arguments_are_rejected(void)
 {
 	char *error = NULL;
@@ -458,12 +688,15 @@ static void test_invalid_arguments_are_rejected(void)
 int main(void)
 {
 	test_active_cancel_joins_completion();
-	test_cancel_before_publication_is_noop_after_completion();
+	test_waiting_cancel_is_published_once();
+	test_waiting_cancel_completion_is_noop();
+	test_free_waits_for_unpublished_cancel();
 	test_completion_before_cancel_is_noop();
 	test_idle_cancel_is_noop();
 	test_stale_generation_cannot_cancel_next_operation();
 	test_cancel_failure_is_reported_separately();
 	test_allocation_failure_is_reported();
+	test_pthread_unlock_failure_is_fail_fast();
 	test_invalid_arguments_are_rejected();
 	(void) puts("native cancellation tests passed");
 	return EXIT_SUCCESS;

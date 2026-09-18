@@ -31,6 +31,8 @@ ib_cancel_slot *ib_cancel_slot_new(char **error);
 uint64_t ib_cancel_slot_begin(ib_cancel_slot *slot, char **error);
 int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
 	int64_t *native_code, char **error);
+/* The owner must not start a new cancellation call after free begins.  Calls
+ * that have entered the slot are included in free's lifetime wait. */
 void ib_cancel_slot_free(ib_cancel_slot *slot);
 
 /* The status of an SDK handle after an operation reports an error.  A live
