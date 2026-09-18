@@ -619,12 +619,14 @@ func (t *nativeTransaction) free() {
 type nativeStatement struct {
 	ptr              *C.ib_statement
 	execOverride     func([]argument) (int64, error)
+	queryOverride    func([]argument) (*nativeCursor, []string, error)
 	closeOverride    func() error
 	numInputOverride func() int
 }
 
 type nativeCursor struct {
 	ptr                 *C.ib_cursor
+	nextOverride        func() (bool, error)
 	closeOverride       func() error
 	abortOverride       func() error
 	statement           *nativeStatement
@@ -985,7 +987,10 @@ func (s *nativeStatement) numInput() int {
 	return int(C.ib_statement_num_input(s.ptr))
 }
 
-func (s *nativeStatement) exec(args []argument) (int64, error) {
+func (s *nativeStatement) exec(ctx context.Context, args []argument) (int64, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if s != nil && s.execOverride != nil {
@@ -1000,17 +1005,30 @@ func (s *nativeStatement) exec(args []argument) (int64, error) {
 	}
 	defer C.ib_bindings_free(bindings)
 
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return 0, err
+	}
 	var affected C.int64_t
 	var errorPointer *C.char
-	if result := C.ib_statement_exec(s.ptr, bindings, &affected, &errorPointer); result != 0 {
+	result := C.ib_statement_exec(s.ptr, bindings, operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &affected, &errorPointer)
+	operation.finish()
+	if result != 0 {
 		return 0, takeNativeError(errorPointer)
 	}
 	return int64(affected), nil
 }
 
-func (s *nativeStatement) query(args []argument) (*nativeCursor, []string, error) {
+func (s *nativeStatement) query(ctx context.Context, args []argument) (*nativeCursor, []string, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, nil, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
+	if s != nil && s.queryOverride != nil {
+		return s.queryOverride(append([]argument(nil), args...))
+	}
 	if s == nil || s.ptr == nil {
 		return nil, nil, errors.New("native statement is unavailable")
 	}
@@ -1020,8 +1038,14 @@ func (s *nativeStatement) query(args []argument) (*nativeCursor, []string, error
 	}
 	defer C.ib_bindings_free(bindings)
 
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
 	var errorPointer *C.char
-	cursor := C.ib_statement_query(s.ptr, bindings, &errorPointer)
+	cursor := C.ib_statement_query(s.ptr, bindings, operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &errorPointer)
+	operation.finish()
 	if cursor == nil {
 		return nil, nil, takeNativeError(errorPointer)
 	}
@@ -1745,14 +1769,26 @@ func nativeCursorQueryError(cursor *nativeCursor, primary error) error {
 	return primary
 }
 
-func (c *nativeCursor) next() (bool, error) {
+func (c *nativeCursor) next(ctx context.Context) (bool, error) {
+	if err := contextError(ctx); err != nil {
+		return false, err
+	}
 	release := nativegate.Global.Enter()
 	defer release()
+	if c != nil && c.nextOverride != nil {
+		return c.nextOverride()
+	}
 	if c == nil || c.ptr == nil {
 		return false, errors.New("native cursor is unavailable")
 	}
+	operation, err := newNativeCancelOperation(ctx)
+	if err != nil {
+		return false, err
+	}
 	var errorPointer *C.char
-	result := C.ib_cursor_next(c.ptr, &errorPointer)
+	result := C.ib_cursor_next(c.ptr, operation.nativeCancelSlot(),
+		operation.nativeCancelGeneration(), &errorPointer)
+	operation.finish()
 	switch result {
 	case 0:
 		return false, nil

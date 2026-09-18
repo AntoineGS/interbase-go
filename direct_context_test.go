@@ -2,8 +2,10 @@ package interbase
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestCreateDatabaseReturnsCreatedAttachmentAfterPostCreateCancellation(t *testing.T) {
@@ -220,5 +222,66 @@ func TestOpenBlobClosesNativeStreamAfterPostOpenCancellation(t *testing.T) {
 	}
 	if len(transaction.blobs) != 0 {
 		t.Fatalf("transaction retained cancelled BLOB stream: %d", len(transaction.blobs))
+	}
+}
+
+func TestDirectCursorNextCancelsActiveNativeFetch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, _, transaction := newDirectContextTestTransaction(t)
+	transaction.native = &nativeTransaction{}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	abortStarted := make(chan struct{})
+	nativeErr := &Error{
+		Operation:  "fetch row",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	cursor := &Cursor{
+		tx:         transaction,
+		generation: transaction.generation,
+		native: &nativeCursor{
+			nextOverride: func() (bool, error) {
+				close(entered)
+				<-release
+				return false, nativeErr
+			},
+			abortOverride: func() error {
+				close(abortStarted)
+				return nil
+			},
+		},
+	}
+	transaction.cursors[cursor] = struct{}{}
+
+	nextDone := make(chan error, 1)
+	go func() {
+		_, err := cursor.Next(ctx)
+		nextDone <- err
+	}()
+	waitForTestSignal(t, entered, "direct cursor fetch did not enter the native call")
+	cancel()
+	select {
+	case <-abortStarted:
+		t.Fatal("direct cursor aborted before the native fetch returned")
+	case err := <-nextDone:
+		t.Fatalf("direct Cursor.Next() returned before the native fetch returned: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	err := <-nextDone
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("direct Cursor.Next() error = %v, want context.Canceled", err)
+	}
+	var gotNative *Error
+	if !errors.As(err, &gotNative) || gotNative.NativeCode != nativeCancelledCode {
+		t.Fatalf("direct Cursor.Next() error = %v, want native cancellation diagnostics", err)
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatal("direct fetch cancellation was classified as driver.ErrBadConn")
+	}
+	if !cursor.closed || cursor.native != nil || len(transaction.cursors) != 0 {
+		t.Fatalf("direct cursor cleanup = closed %v native %p cursors %d; want closed cursor removed from transaction", cursor.closed, cursor.native, len(transaction.cursors))
 	}
 }

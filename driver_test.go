@@ -576,6 +576,264 @@ func TestInvalidatedSiblingRowsDoNotReportCleanEOF(t *testing.T) {
 	}
 }
 
+func TestDatabaseSQLPreparedExecContextCancelsActiveNativeCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	closeStarted := make(chan struct{})
+	closeOnce := sync.Once{}
+	callCount := 0
+	nativeErr := &Error{
+		Operation:  "execute prepared statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	connection := &conn{
+		native: &nativeConnection{
+			brokenOverride: func() bool { return false },
+			prepareOverride: func(string) (*nativeStatement, error) {
+				return &nativeStatement{
+					numInputOverride: func() int { return -1 },
+					execOverride: func([]argument) (int64, error) {
+						callCount++
+						if callCount == 1 {
+							close(entered)
+							<-release
+							return 0, nativeErr
+						}
+						return 13, nil
+					},
+					closeOverride: func() error {
+						closeOnce.Do(func() { close(closeStarted) })
+						return nil
+					},
+				}, nil
+			},
+		},
+	}
+	db := openDatabaseSQLTestDB(t, connection)
+
+	statement, err := db.PrepareContext(context.Background(), "UPDATE example SET value = 1")
+	if err != nil {
+		t.Fatalf("DB.PrepareContext() error = %v", err)
+	}
+	defer statement.Close()
+
+	resultDone := make(chan error, 1)
+	go func() {
+		result, callErr := statement.ExecContext(ctx)
+		if result != nil {
+			callErr = errors.Join(callErr, errors.New("canceled prepared execution returned a result"))
+		}
+		resultDone <- callErr
+	}()
+	waitForTestSignal(t, entered, "prepared execution did not enter the native call")
+	cancel()
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- statement.Close() }()
+	select {
+	case <-closeStarted:
+		t.Fatal("prepared statement closed before the native worker returned")
+	case <-closeDone:
+		t.Fatal("prepared statement close returned before the native worker returned")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-resultDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepared ExecContext() error = %v, want context.Canceled", err)
+	} else {
+		var gotNative *Error
+		if !errors.As(err, &gotNative) || gotNative.NativeCode != nativeCancelledCode {
+			t.Fatalf("prepared ExecContext() error = %v, want native cancellation diagnostics", err)
+		}
+		if errors.Is(err, driver.ErrBadConn) {
+			t.Fatal("prepared cancellation was classified as driver.ErrBadConn")
+		}
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("prepared statement Close() error = %v", err)
+	}
+}
+
+func TestDatabaseSQLPreparedExecContextReusesStatementAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	callCount := 0
+	nativeErr := &Error{
+		Operation:  "execute prepared statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	connection := &conn{
+		native: &nativeConnection{
+			brokenOverride: func() bool { return false },
+			prepareOverride: func(string) (*nativeStatement, error) {
+				return &nativeStatement{
+					numInputOverride: func() int { return -1 },
+					execOverride: func([]argument) (int64, error) {
+						callCount++
+						if callCount == 1 {
+							close(entered)
+							<-release
+							return 0, nativeErr
+						}
+						return 17, nil
+					},
+				}, nil
+			},
+		},
+	}
+	db := openDatabaseSQLTestDB(t, connection)
+	statement, err := db.PrepareContext(context.Background(), "UPDATE example SET value = 1")
+	if err != nil {
+		t.Fatalf("DB.PrepareContext() error = %v", err)
+	}
+	defer statement.Close()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, callErr := statement.ExecContext(ctx)
+		firstDone <- callErr
+	}()
+	waitForTestSignal(t, entered, "prepared execution did not enter the native call")
+	cancel()
+	close(release)
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled prepared ExecContext() error = %v, want context.Canceled", err)
+	}
+
+	result, err := statement.ExecContext(context.Background())
+	if err != nil {
+		t.Fatalf("prepared ExecContext() reuse error = %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 17 {
+		t.Fatalf("prepared reuse rows affected = (%d, %v), want (17, nil)", affected, err)
+	}
+	if connection.closed {
+		t.Fatal("canceled prepared execution invalidated a reusable connection")
+	}
+}
+
+func TestDatabaseSQLPreparedQueryContextCancelsActiveNativeCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	nativeErr := &Error{
+		Operation:  "execute prepared SELECT",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	connection := &conn{
+		native: &nativeConnection{
+			brokenOverride: func() bool { return false },
+			prepareOverride: func(string) (*nativeStatement, error) {
+				return &nativeStatement{
+					numInputOverride: func() int { return -1 },
+					queryOverride: func([]argument) (*nativeCursor, []string, error) {
+						close(entered)
+						<-release
+						return nil, nil, nativeErr
+					},
+				}, nil
+			},
+		},
+	}
+	db := openDatabaseSQLTestDB(t, connection)
+	statement, err := db.PrepareContext(context.Background(), "SELECT value FROM example")
+	if err != nil {
+		t.Fatalf("DB.PrepareContext() error = %v", err)
+	}
+	defer statement.Close()
+
+	resultDone := make(chan error, 1)
+	go func() {
+		rows, callErr := statement.QueryContext(ctx)
+		if rows != nil {
+			callErr = errors.Join(callErr, errors.New("canceled prepared query returned rows"))
+		}
+		resultDone <- callErr
+	}()
+	waitForTestSignal(t, entered, "prepared query did not enter the native call")
+	cancel()
+	select {
+	case err := <-resultDone:
+		t.Fatalf("prepared QueryContext() returned before the native worker: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	err = <-resultDone
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("prepared QueryContext() error = %v, want context.Canceled", err)
+	}
+	var gotNative *Error
+	if !errors.As(err, &gotNative) || gotNative.NativeCode != nativeCancelledCode {
+		t.Fatalf("prepared QueryContext() error = %v, want native cancellation diagnostics", err)
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatal("prepared query cancellation was classified as driver.ErrBadConn")
+	}
+}
+
+func TestRowsNextCancelsActiveNativeFetch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	abortStarted := make(chan struct{})
+	nativeErr := &Error{
+		Operation:  "fetch row",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	connection := &conn{
+		native: &nativeConnection{
+			brokenOverride: func() bool { return false },
+		},
+	}
+	native := &nativeCursor{
+		nextOverride: func() (bool, error) {
+			close(entered)
+			<-release
+			return false, nativeErr
+		},
+		abortOverride: func() error {
+			close(abortStarted)
+			return nil
+		},
+	}
+	result := &rows{conn: connection, native: native, ctx: ctx}
+	nextDone := make(chan error, 1)
+	go func() { nextDone <- result.Next(nil) }()
+	waitForTestSignal(t, entered, "rows fetch did not enter the native call")
+	cancel()
+	select {
+	case <-abortStarted:
+		t.Fatal("rows aborted the cursor before the native fetch returned")
+	case err := <-nextDone:
+		t.Fatalf("rows.Next() returned before the native fetch returned: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	err := <-nextDone
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("rows.Next() error = %v, want context.Canceled", err)
+	}
+	var gotNative *Error
+	if !errors.As(err, &gotNative) || gotNative.NativeCode != nativeCancelledCode {
+		t.Fatalf("rows.Next() error = %v, want native cancellation diagnostics", err)
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatal("rows fetch cancellation was classified as driver.ErrBadConn")
+	}
+}
+
 var (
 	_ driver.Connector = (*connector)(nil)
 )

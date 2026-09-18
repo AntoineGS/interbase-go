@@ -837,10 +837,12 @@ func (s *stmt) ExecContext(ctx context.Context, values []driver.NamedValue) (dri
 		return nil, err
 	}
 	defer releaseNative()
-	affected, err := native.exec(args)
+	affected, err := native.exec(ctx, args)
 	releaseNative()
 	if err != nil {
 		operationErr := conn.sanitizeError("exec prepared statement", err)
+		operationErr = classifyNativeOutcome("execute prepared statement", true,
+			contextCancellation(ctx), operationErr, nil)
 		if conn.native == nil || conn.native.broken() {
 			conn.invalidateLocked(operationErr)
 		}
@@ -888,10 +890,12 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 		return nil, err
 	}
 	defer releaseNative()
-	nativeRows, columns, err := native.query(args)
+	nativeRows, columns, err := native.query(ctx, args)
 	releaseNative()
 	if err != nil {
 		operationErr := conn.sanitizeError("query prepared statement", err)
+		operationErr = classifyNativeOutcome("execute prepared query", false,
+			contextCancellation(ctx), operationErr, nil)
 		if conn.native == nil || conn.native.broken() {
 			conn.invalidateLocked(operationErr)
 		}
@@ -923,7 +927,8 @@ func (s *stmt) nativeLocked() (*nativeStatement, error) {
 		return nil, errStatementClosed
 	}
 	if s.conn == nil || s.native == nil ||
-		(s.native.ptr == nil && s.native.execOverride == nil) {
+		(s.native.ptr == nil && s.native.execOverride == nil &&
+			s.native.queryOverride == nil) {
 		return nil, driver.ErrBadConn
 	}
 	return s.native, nil
@@ -1427,10 +1432,12 @@ func (r *rows) Next(dest []driver.Value) error {
 	}
 	defer releaseNative()
 
-	hasRow, err := r.native.next()
+	hasRow, err := r.native.next(r.ctx)
 	if err != nil {
 		releaseNative()
 		operationErr := r.conn.sanitizeError("fetch", err)
+		operationErr = classifyNativeOutcome("fetch row", false,
+			contextCancellation(r.ctx), operationErr, nil)
 		return errors.Join(operationErr, r.abortLocked(operationErr))
 	}
 	if err := contextError(r.ctx); err != nil {

@@ -254,13 +254,16 @@ ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
 	size_t query_length, char **error);
 int ib_statement_num_input(const ib_statement *statement);
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
-	int64_t *rows_affected, char **error);
+	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,
+	char **error);
 ib_cursor *ib_statement_query(ib_statement *statement,
-	const ib_bindings *bindings, char **error);
+	const ib_bindings *bindings, ib_cancel_slot *cancel, uint64_t generation,
+	char **error);
 int ib_statement_close(ib_statement *statement, char **error);
 int ib_statement_plan(ib_statement *statement, char **plan,
 	size_t *plan_length, char **error);
-int ib_cursor_next(ib_cursor *cursor, char **error);
+int ib_cursor_next(ib_cursor *cursor, ib_cancel_slot *cancel,
+	uint64_t generation, char **error);
 int ib_cursor_close(ib_cursor *cursor, char **error);
 int ib_cursor_abort(ib_cursor *cursor, char **error);
 int ib_cursor_set_name(ib_cursor *cursor, const char *name, size_t name_length,

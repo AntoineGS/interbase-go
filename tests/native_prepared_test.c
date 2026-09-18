@@ -60,9 +60,22 @@ ISC_STATUS test_detach_database(ISC_STATUS *, isc_db_handle *);
 struct ib_statement;
 struct ib_statement *ib_statement_prepare(ib_connection *, const char *, size_t, char **);
 int ib_statement_num_input(const struct ib_statement *);
-int ib_statement_exec(struct ib_statement *, const ib_bindings *, int64_t *, char **);
-ib_cursor *ib_statement_query(struct ib_statement *, const ib_bindings *, char **);
+int ib_statement_exec(struct ib_statement *, const ib_bindings *, ib_cancel_slot *,
+	uint64_t, int64_t *, char **);
+ib_cursor *ib_statement_query(struct ib_statement *, const ib_bindings *, ib_cancel_slot *,
+	uint64_t, char **);
 int ib_statement_close(struct ib_statement *, char **);
+int ib_cursor_next(ib_cursor *, ib_cancel_slot *, uint64_t, char **);
+
+/* Existing prepared coverage uses the contextless native seam.  Keep those
+ * calls explicit about an idle slot while the publication tests below invoke
+ * the full cancellation-aware signatures without this compatibility shim. */
+#define ib_statement_exec(statement, bindings, rows, error) \
+	(ib_statement_exec)(statement, bindings, NULL, 0U, rows, error)
+#define ib_statement_query(statement, bindings, error) \
+	(ib_statement_query)(statement, bindings, NULL, 0U, error)
+#define ib_cursor_next(cursor, error) \
+	(ib_cursor_next)(cursor, NULL, 0U, error)
 
 static int failures;
 static int start_calls;
@@ -108,6 +121,12 @@ static int describe_procedure_decimal;
 static int describe_procedure_source;
 static int user_execute2_calls;
 static int64_t last_execute_value;
+static ib_cancel_slot *expected_cancel_slot;
+static uint64_t expected_cancel_generation;
+static isc_stmt_handle expected_cancel_statement;
+static int execute_publication_calls;
+static int execute2_publication_calls;
+static int fetch_publication_calls;
 static char database_token;
 static char transaction_tokens[32];
 static char statement_tokens[32];
@@ -125,6 +144,31 @@ static void check(int condition, const char *message)
 		(void) fprintf(stderr, "native prepared test failed: %s\n", message);
 		failures++;
 	}
+}
+
+static void check_cancel_publication(isc_stmt_handle *statement, int *seen,
+	const char *message)
+{
+	if (expected_cancel_slot == NULL || statement == NULL ||
+		expected_cancel_statement == NULL || *statement != expected_cancel_statement) {
+		return;
+	}
+	(*seen)++;
+	check(expected_cancel_slot->generation == expected_cancel_generation &&
+		expected_cancel_slot->active && expected_cancel_slot->published &&
+		expected_cancel_slot->statement == *statement,
+		message);
+}
+
+static void check_cancel_complete(const char *message)
+{
+	if (expected_cancel_slot == NULL) {
+		return;
+	}
+	check(!expected_cancel_slot->active && !expected_cancel_slot->published &&
+		expected_cancel_slot->operation_complete &&
+		expected_cancel_slot->cancel_users == 0U &&
+		expected_cancel_slot->cancel_callers == 0U, message);
 }
 
 static int is_catalog_statement(const isc_stmt_handle *statement)
@@ -218,6 +262,12 @@ static void reset_mocks(void)
 	describe_procedure_source = 0;
 	user_execute2_calls = 0;
 	catalog_statement = NULL;
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	execute_publication_calls = 0;
+	execute2_publication_calls = 0;
+	fetch_publication_calls = 0;
 	procedure_catalog_statement = 0;
 	procedure_catalog_precision = 0;
 	procedure_catalog_scale = 0;
@@ -339,6 +389,7 @@ ISC_STATUS ISC_EXPORT_VARARG test_start_transaction(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_commit_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction)
 {
+	check_cancel_complete("prepared cancellation slot was not complete before commit");
 	commit_calls++;
 	if (!fail_commit) {
 		*transaction = NULL;
@@ -349,6 +400,7 @@ ISC_STATUS ISC_EXPORT test_commit_transaction(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_rollback_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction)
 {
+	check_cancel_complete("prepared cancellation slot was not complete before rollback");
 	rollback_calls++;
 	if (*transaction != NULL) {
 		rollback_saw_live_transaction = 1;
@@ -518,8 +570,9 @@ ISC_STATUS ISC_EXPORT test_dsql_execute(ISC_STATUS *status,
 	unsigned short dialect, XSQLDA *input)
 {
 	(void) transaction;
-	(void) statement;
 	check(dialect == expected_dialect, "execute used the wrong SQL dialect");
+	check_cancel_publication(statement, &execute_publication_calls,
+		"prepared execute did not publish its statement handle");
 	execute_calls++;
 	if (input != NULL && input->sqld == 1 && input->sqlvar[0].sqldata != NULL) {
 		memcpy(&last_execute_value, input->sqlvar[0].sqldata,
@@ -534,6 +587,8 @@ ISC_STATUS ISC_EXPORT test_dsql_execute2(ISC_STATUS *status,
 {
 	(void) transaction;
 	check(dialect == expected_dialect, "execute2 used the wrong SQL dialect");
+	check_cancel_publication(statement, &execute2_publication_calls,
+		"prepared execute2 did not publish its statement handle");
 	(void) input;
 	(void) output;
 	execute2_calls++;
@@ -974,6 +1029,8 @@ ISC_STATUS ISC_EXPORT test_dsql_fetch(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short dialect, XSQLDA *output)
 {
 	check(dialect == expected_dialect, "fetch used the wrong SQL dialect");
+	check_cancel_publication(statement, &fetch_publication_calls,
+		"prepared fetch did not publish its statement handle");
 	if (is_catalog_statement(statement)) {
 		fetch_calls++;
 		if (!catalog_statement_open) {
@@ -1031,6 +1088,10 @@ ISC_STATUS ISC_EXPORT test_dsql_fetch(ISC_STATUS *status,
 ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short option)
 {
+	if (expected_cancel_slot != NULL && statement != NULL &&
+		*statement == expected_cancel_statement) {
+		check_cancel_complete("prepared cancellation slot was not complete before statement cleanup");
+	}
 	if (*statement == catalog_statement) {
 		if (option == DSQL_close) {
 			catalog_close_calls++;
@@ -1919,6 +1980,133 @@ static void test_connection_close_drains_prepared_statements(void)
 		"connection close did not drain all prepared handles before detach");
 }
 
+static void test_cancel_publication_and_cleanup_order(void)
+{
+	static const char execute_query[] = "INSERT INTO T (ID) VALUES (?)";
+	static const char query_text[] = "SELECT ID FROM T WHERE ID = ?";
+	ib_cancel_slot *slot;
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+	int64_t affected;
+	uint64_t generation;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_insert;
+	connection = new_connection();
+	statement = ib_statement_prepare(connection, execute_query,
+		sizeof(execute_query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"cancel publication execute statement preparation failed");
+	ib_error_free(error);
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	slot = ib_cancel_slot_new(&error);
+	check(slot != NULL && error == NULL, "cancel publication execute slot allocation failed");
+	ib_error_free(error);
+	if (slot == NULL) {
+		error = NULL;
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	check(generation != 0U && error == NULL, "cancel publication execute slot begin failed");
+	ib_error_free(error);
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = statement->statement;
+	bindings = new_integer_binding(41);
+	error = NULL;
+	check((ib_statement_exec)(statement, bindings, slot, generation,
+		&affected, &error) == 0 && error == NULL,
+		"cancel publication prepared execute failed");
+	check(execute_publication_calls == 1,
+		"prepared execute publication was not observed exactly once");
+	check_cancel_complete("prepared execute did not complete its cancellation slot");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	ib_cancel_slot_free(slot);
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"cancel publication execute statement close failed");
+	ib_error_free(error);
+	free(connection);
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	connection = new_connection();
+	statement = ib_statement_prepare(connection, query_text, sizeof(query_text) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"cancel publication query statement preparation failed");
+	ib_error_free(error);
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	slot = ib_cancel_slot_new(&error);
+	check(slot != NULL && error == NULL, "cancel publication query slot allocation failed");
+	ib_error_free(error);
+	if (slot == NULL) {
+		error = NULL;
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	check(generation != 0U && error == NULL, "cancel publication query slot begin failed");
+	ib_error_free(error);
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = statement->statement;
+	bindings = new_integer_binding(42);
+	error = NULL;
+	cursor = (ib_statement_query)(statement, bindings, slot, generation, &error);
+	check(cursor != NULL && error == NULL,
+		"cancel publication prepared query failed");
+	check(execute2_publication_calls == 1,
+		"prepared execute2 publication was not observed exactly once");
+	check_cancel_complete("prepared execute2 did not complete its cancellation slot");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		generation = ib_cancel_slot_begin(slot, &error);
+		check(generation != 0U && error == NULL,
+			"cancel publication fetch slot begin failed");
+		ib_error_free(error);
+		expected_cancel_generation = generation;
+		error = NULL;
+		check((ib_cursor_next)(cursor, slot, generation, &error) == 1 && error == NULL,
+			"cancel publication prepared fetch failed");
+		check(fetch_publication_calls == 1,
+			"prepared fetch publication was not observed exactly once");
+		check_cancel_complete("prepared fetch did not complete its cancellation slot");
+		ib_error_free(error);
+		error = NULL;
+		check(ib_cursor_close(cursor, &error) == 0 && error == NULL,
+			"cancel publication cursor close failed");
+		ib_error_free(error);
+	}
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	ib_cancel_slot_free(slot);
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"cancel publication query statement close failed");
+	ib_error_free(error);
+	free(connection);
+}
+
 int main(void)
 {
 	test_dialect_arguments_are_propagated();
@@ -1948,6 +2136,7 @@ int main(void)
 	test_savepoint_remains_executable();
 	test_transaction_completion_closes_active_prepared_cursor();
 	test_connection_close_drains_prepared_statements();
+	test_cancel_publication_and_cleanup_order();
 	if (failures != 0) {
 		return EXIT_FAILURE;
 	}

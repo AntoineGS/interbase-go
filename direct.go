@@ -1741,10 +1741,12 @@ func (c *Cursor) Next(ctx context.Context) (bool, error) {
 		return false, errors.Join(err, c.closeLocked(true, err))
 	}
 	defer releaseNative()
-	hasRow, err := c.native.next()
+	hasRow, err := c.native.next(ctx)
 	releaseNative()
 	if err != nil {
 		operationErr := c.tx.attachment.conn.sanitizeError("direct fetch", err)
+		operationErr = classifyNativeOutcome("direct fetch", false,
+			contextCancellation(ctx), operationErr, nil)
 		closeErr := c.closeLocked(true, operationErr)
 		return false, errors.Join(operationErr, closeErr)
 	}
