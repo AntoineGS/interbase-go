@@ -23,16 +23,23 @@ static isc_stmt_handle cancel_statement;
 static ISC_STATUS cancel_result;
 static int execute_entered;
 static int execute_release;
-static int completion_started;
 static int completion_returned;
+static int completion_wait_hook_called;
+static int completion_wait_observer_done;
+static int completion_wait_observed;
 static int drop_calls;
 static ISC_STATUS execute_status_storage[20];
 static int fail_next_malloc;
 static int fail_next_mutex_unlock;
-static unsigned int event_sequence;
-static unsigned int cancel_return_order;
-static unsigned int free_return_order;
+static unsigned int boundary_sequence;
+static unsigned int cancel_reference_release_order;
+static unsigned int free_ready_order;
 static int free_started;
+
+struct ib_cancel_slot;
+static void test_completion_wait_hook(struct ib_cancel_slot *slot);
+static void test_cancel_reference_release_hook(struct ib_cancel_slot *slot);
+static void test_free_ready_hook(struct ib_cancel_slot *slot);
 
 static int injected_pthread_mutex_unlock(pthread_mutex_t *mutex)
 {
@@ -81,9 +88,16 @@ static ISC_STATUS test_isc_dsql_free_statement(ISC_STATUS *status,
 #define isc_dsql_free_statement test_isc_dsql_free_statement
 #define malloc test_malloc
 #define pthread_mutex_unlock injected_pthread_mutex_unlock
+#define IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK(slot) test_completion_wait_hook(slot)
+#define IB_CANCEL_SLOT_TEST_CALLER_RELEASE_HOOK(slot) \
+	test_cancel_reference_release_hook(slot)
+#define IB_CANCEL_SLOT_TEST_FREE_READY_HOOK(slot) test_free_ready_hook(slot)
 #include "../native.c"
 #undef malloc
 #undef pthread_mutex_unlock
+#undef IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK
+#undef IB_CANCEL_SLOT_TEST_CALLER_RELEASE_HOOK
+#undef IB_CANCEL_SLOT_TEST_FREE_READY_HOOK
 #undef isc_dsql_free_statement
 
 static void require_condition(int condition, const char *message)
@@ -103,6 +117,36 @@ static void require_pthread(int result, const char *operation)
 	}
 }
 
+static void test_completion_wait_hook(struct ib_cancel_slot *slot)
+{
+	(void) slot;
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	completion_wait_hook_called = 1;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+}
+
+static void test_cancel_reference_release_hook(struct ib_cancel_slot *slot)
+{
+	(void) slot;
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	cancel_reference_release_order = ++boundary_sequence;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+}
+
+static void test_free_ready_hook(struct ib_cancel_slot *slot)
+{
+	(void) slot;
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	free_ready_order = ++boundary_sequence;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+}
+
 static void reset_cancel_stub(ISC_STATUS result)
 {
 	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
@@ -115,13 +159,15 @@ static void reset_cancel_stub(ISC_STATUS result)
 	cancel_result = result;
 	execute_entered = 0;
 	execute_release = 0;
-	completion_started = 0;
 	completion_returned = 0;
+	completion_wait_hook_called = 0;
+	completion_wait_observer_done = 0;
+	completion_wait_observed = 0;
 	drop_calls = 0;
 	fail_next_mutex_unlock = 0;
-	event_sequence = 0;
-	cancel_return_order = 0;
-	free_return_order = 0;
+	boundary_sequence = 0;
+	cancel_reference_release_order = 0;
+	free_ready_order = 0;
 	free_started = 0;
 	(void) memset(execute_status_storage, 0, sizeof(execute_status_storage));
 	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
@@ -179,11 +225,6 @@ static void *cancel_worker(void *argument)
 
 	call->request_status = ib_cancel_slot_cancel(call->slot, call->generation,
 		&call->native_code, &call->error);
-	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
-	cancel_return_order = ++event_sequence;
-	require_pthread(pthread_cond_broadcast(&test_condition),
-		"pthread_cond_broadcast");
-	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
 	return NULL;
 }
 
@@ -204,9 +245,6 @@ static void *execute_worker(void *argument)
 		require_pthread(pthread_cond_wait(&test_condition, &test_mutex),
 			"pthread_cond_wait");
 	}
-	completion_started = 1;
-	require_pthread(pthread_cond_broadcast(&test_condition),
-		"pthread_cond_broadcast");
 	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
 
 	ib_cancel_slot_complete(call->slot, call->generation);
@@ -216,6 +254,25 @@ static void *execute_worker(void *argument)
 	require_pthread(pthread_cond_broadcast(&test_condition),
 		"pthread_cond_broadcast");
 	drop_calls++;
+	require_pthread(pthread_cond_broadcast(&test_condition),
+		"pthread_cond_broadcast");
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+	return NULL;
+}
+
+static void *completion_wait_observer(void *argument)
+{
+	struct completion_call *call = (struct completion_call *) argument;
+	int observed;
+
+	require_pthread(pthread_mutex_lock(&call->slot->mutex),
+		"pthread_mutex_lock");
+	observed = call->slot->completing && call->slot->cancel_users != 0U;
+	require_pthread(pthread_mutex_unlock(&call->slot->mutex),
+		"pthread_mutex_unlock");
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	completion_wait_observer_done = 1;
+	completion_wait_observed = observed;
 	require_pthread(pthread_cond_broadcast(&test_condition),
 		"pthread_cond_broadcast");
 	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
@@ -237,19 +294,23 @@ static void *free_worker(void *argument)
 	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
 
 	ib_cancel_slot_free(call->slot);
-
-	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
-	free_return_order = ++event_sequence;
-	require_pthread(pthread_cond_broadcast(&test_condition),
-		"pthread_cond_broadcast");
-	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
 	return NULL;
 }
 
-static void wait_for_completion_start(void)
+static void wait_for_completion_wait_hook(void)
 {
 	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
-	while (!completion_started) {
+	while (!completion_wait_hook_called) {
+		require_pthread(pthread_cond_wait(&test_condition, &test_mutex),
+			"pthread_cond_wait");
+	}
+	require_pthread(pthread_mutex_unlock(&test_mutex), "pthread_mutex_unlock");
+}
+
+static void wait_for_completion_wait_observation(void)
+{
+	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	while (!completion_wait_observer_done) {
 		require_pthread(pthread_cond_wait(&test_condition, &test_mutex),
 			"pthread_cond_wait");
 	}
@@ -333,6 +394,7 @@ static void test_active_cancel_joins_completion(void)
 	struct completion_call completion_call_data;
 	pthread_t cancel_thread;
 	pthread_t completion_thread;
+	pthread_t wait_observer_thread;
 
 	reset_cancel_stub(0);
 	slot = new_slot();
@@ -354,8 +416,14 @@ static void test_active_cancel_joins_completion(void)
 		&cancel_call_data), "pthread_create");
 	wait_for_cancel_entry();
 	release_execute_call();
-	wait_for_completion_start();
+	wait_for_completion_wait_hook();
+	require_pthread(pthread_create(&wait_observer_thread, NULL,
+		completion_wait_observer, &completion_call_data), "pthread_create");
+	wait_for_completion_wait_observation();
+	require_pthread(pthread_join(wait_observer_thread, NULL), "pthread_join");
 	require_pthread(pthread_mutex_lock(&test_mutex), "pthread_mutex_lock");
+	require_condition(completion_wait_observed,
+		"completion did not expose its cancellation join wait");
 	require_condition(!completion_returned,
 		"completion returned before the cancellation stub returned");
 	require_condition(drop_calls == 0,
@@ -484,9 +552,10 @@ static void test_free_waits_for_unpublished_cancel(void)
 		"free-lifetime cancellation returned a native status");
 	require_condition(cancel_calls == 0,
 		"free-lifetime cancellation called the native client");
-	require_condition(cancel_return_order != 0U && free_return_order != 0U &&
-		cancel_return_order < free_return_order,
-		"slot was destroyed before the waiting cancellation caller returned");
+	require_condition(cancel_reference_release_order != 0U &&
+		free_ready_order != 0U &&
+		cancel_reference_release_order < free_ready_order,
+		"slot destruction became ready before the caller reference was released");
 }
 
 static void test_completion_before_cancel_is_noop(void)

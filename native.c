@@ -691,6 +691,9 @@ static void ib_cancel_slot_cancel_caller_done(ib_cancel_slot *slot)
 		abort();
 	}
 	slot->cancel_callers--;
+#ifdef IB_CANCEL_SLOT_TEST_CALLER_RELEASE_HOOK
+	IB_CANCEL_SLOT_TEST_CALLER_RELEASE_HOOK(slot);
+#endif
 	if (pthread_cond_broadcast(&slot->condition) != 0) {
 		abort();
 	}
@@ -847,6 +850,9 @@ static void IB_MAYBE_UNUSED ib_cancel_slot_complete(ib_cancel_slot *slot,
 		abort();
 	}
 	while (slot->cancel_users != 0U) {
+#ifdef IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK
+		IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK(slot);
+#endif
 		result = pthread_cond_wait(&slot->condition, &slot->mutex);
 		if (result != 0) {
 			ib_cancel_slot_unlock_or_abort(slot);
@@ -964,6 +970,9 @@ void ib_cancel_slot_free(ib_cancel_slot *slot)
 	if (result != 0) {
 		abort();
 	}
+#ifdef IB_CANCEL_SLOT_TEST_FREE_READY_HOOK
+	IB_CANCEL_SLOT_TEST_FREE_READY_HOOK(slot);
+#endif
 	result = pthread_cond_destroy(&slot->condition);
 	if (result != 0) {
 		abort();
