@@ -49,6 +49,11 @@ type Config struct {
 	ISQL     string
 	User     string
 	Password string
+	// Server is an optional native server prefix used for fixture creation and
+	// cleanup, such as "localhost/3050". The generated database path remains a
+	// local owned path; callers should use Database.ConnectionString when they
+	// attach through a server.
+	Server string
 	// Dialect selects the SQL dialect used by isql. Zero selects Dialect 3.
 	// Set Dialect to 1 to opt into Dialect 1.
 	Dialect int
@@ -58,6 +63,9 @@ type Config struct {
 //
 // INTERBASE_DATABASE and the ordinary application credential variables are
 // intentionally ignored. An explicitly set empty password is preserved.
+// INTERBASE_TEST_SERVER optionally selects a native server prefix for the
+// disposable fixture, while ownership remains tied to the local generated
+// path.
 func FromEnv() (Config, error) {
 	return configFromLookup(os.LookupEnv)
 }
@@ -80,6 +88,9 @@ func configFromLookup(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if value, ok := lookup("INTERBASE_TEST_PASSWORD"); ok {
 		cfg.Password = value
+	}
+	if value, ok := lookup("INTERBASE_TEST_SERVER"); ok {
+		cfg.Server = value
 	}
 	if err := validateConfig(cfg); err != nil {
 		return Config{}, err
@@ -108,6 +119,9 @@ func validateConfig(cfg Config) error {
 		if hasControlCharacter(field.value) {
 			return fmt.Errorf("interbase fixture: %s contains a control character", field.name)
 		}
+	}
+	if hasControlCharacter(cfg.Server) {
+		return errors.New("interbase fixture: server contains a control character")
 	}
 	return nil
 }
@@ -153,6 +167,16 @@ type Database struct {
 	databaseExists bool
 	dropCompleted  bool
 	closed         bool
+}
+
+// ConnectionString returns the native attachment string for the owned fixture.
+// It is the local path when Config.Server is empty and a server-prefixed path
+// otherwise.
+func (db *Database) ConnectionString() string {
+	if db == nil {
+		return ""
+	}
+	return databaseAttachment(db.config.Server, db.Path)
 }
 
 // Create creates a unique local database and loads schema into it.
@@ -656,8 +680,8 @@ func redact(output string, secrets ...string) string {
 func createScript(path string, cfg Config, schema string) string {
 	var script strings.Builder
 	fmt.Fprintf(&script, "SET SQL DIALECT %d;\n", scriptDialect(cfg))
-	fmt.Fprintf(&script, "CREATE DATABASE %s USER %s PASSWORD %s DEFAULT CHARACTER SET UTF8;\n",
-		quoteSQLString(path), quoteSQLString(cfg.User), quoteSQLString(cfg.Password))
+	fmt.Fprintf(&script, "CREATE DATABASE %s USER %s PASSWORD %s WITH ADMIN OPTION DEFAULT CHARACTER SET UTF8;\n",
+		quoteSQLString(databaseAttachment(cfg.Server, path)), quoteSQLString(cfg.User), quoteSQLString(cfg.Password))
 	script.WriteString(schema)
 	if schema != "" && !strings.HasSuffix(schema, "\n") {
 		script.WriteByte('\n')
@@ -670,7 +694,14 @@ func createScript(path string, cfg Config, schema string) string {
 func dropScript(path string, cfg Config) string {
 	return fmt.Sprintf("SET SQL DIALECT %d;\nCONNECT %s USER %s PASSWORD %s;\nSELECT %s FROM RDB$DATABASE;\nDROP DATABASE;\n",
 		scriptDialect(cfg),
-		quoteSQLString(path), quoteSQLString(cfg.User), quoteSQLString(cfg.Password), quoteSQLString(dropMarker))
+		quoteSQLString(databaseAttachment(cfg.Server, path)), quoteSQLString(cfg.User), quoteSQLString(cfg.Password), quoteSQLString(dropMarker))
+}
+
+func databaseAttachment(server, path string) string {
+	if server == "" {
+		return path
+	}
+	return server + ":" + path
 }
 
 func scriptDialect(cfg Config) int {

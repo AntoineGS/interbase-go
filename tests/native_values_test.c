@@ -80,6 +80,78 @@ static void test_positional_bind_values(void)
 	ib_free_sqlda(cursor.input);
 }
 
+static void test_blob_reference_binding(void)
+{
+	ib_bindings *bindings;
+	char *error;
+
+	error = NULL;
+	bindings = ib_bindings_new(1, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"BLOB reference binding allocation failed");
+	require_success(ib_bindings_set_blob_ref(bindings, 0, 17, 29U, 1,
+		IB_CHARSET_UTF8, &error),
+		error, "BLOB reference binding setup failed");
+	require_condition(bindings->values[0].blob_high == 17 &&
+		bindings->values[0].blob_low == 29U &&
+		bindings->values[0].blob_subtype == 1 &&
+		bindings->values[0].blob_charset == IB_CHARSET_UTF8,
+		"BLOB reference binding changed its ID or descriptor");
+	ib_bindings_free(bindings);
+}
+
+static void test_text_blob_reference_without_relation_is_rejected(void)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLVAR variable;
+	ISC_QUAD blob_id;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = (isc_tr_handle) (uintptr_t) 1U;
+	memset(&variable, 0, sizeof(variable));
+	variable.sqltype = SQL_BLOB;
+	variable.sqlsubtype = 1;
+	blob_id.isc_quad_high = 7;
+	blob_id.isc_quad_low = 11U;
+	variable.sqldata = (char *) &blob_id;
+	require_condition(ib_cursor_blob_ref(&cursor, &variable, &view, &error) != 0 &&
+		error != NULL, "unattributed text BLOB expression was accepted");
+	ib_error_free(error);
+}
+
+static void test_binary_blob_reference_without_relation_is_preserved(void)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLVAR variable;
+	ISC_QUAD blob_id;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = (isc_tr_handle) (uintptr_t) 1U;
+	memset(&variable, 0, sizeof(variable));
+	variable.sqltype = SQL_BLOB;
+	variable.sqlsubtype = 0;
+	blob_id.isc_quad_high = 7;
+	blob_id.isc_quad_low = 11U;
+	variable.sqldata = (char *) &blob_id;
+	require_success(ib_cursor_blob_ref(&cursor, &variable, &view, &error),
+		error, "binary BLOB expression metadata was rejected");
+	require_condition(view.kind == IB_VALUE_BLOB_REF && view.blob_high == 7 &&
+		view.blob_low == 11U && view.blob_subtype == 0 && view.blob_charset == 0,
+		"binary BLOB expression metadata changed");
+}
+
 static void test_column_decoding(void)
 {
 	static const char fixed_text[] = { 'A', ' ', ' ', ' ', ' ' };
@@ -144,6 +216,10 @@ static void test_utf8_fixed_text_and_scaled_float_decoding(void)
 	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
 	cursor.output->sqlvar[0].sqlsubtype = 59; /* InterBase UTF8 charset. */
 	cursor.output->sqlvar[0].sqllen = (short) (sizeof(padded_text) - 1U);
+	cursor.output->sqlvar[0].relname[0] = 'T';
+	cursor.output->sqlvar[0].relname_length = 1;
+	cursor.output->sqlvar[0].sqlname[0] = 'C';
+	cursor.output->sqlvar[0].sqlname_length = 1;
 	cursor.output->sqlvar[1].sqltype = SQL_DOUBLE | 1;
 	cursor.output->sqlvar[1].sqlscale = -2;
 	error = NULL;
@@ -164,6 +240,43 @@ static void test_utf8_fixed_text_and_scaled_float_decoding(void)
 		"scaled floating decode failed");
 	require_condition(view.kind == IB_VALUE_FLOAT64 && view.float64_value == floating,
 		"scaled floating value was not decoded as a float");
+	ib_free_sqlda(cursor.output);
+}
+
+static void test_unattributed_utf8_text_preserves_literal_spaces(void)
+{
+	static const char trailing_spaces[] = {'a', ' ', ' ', ' '};
+	static const char unicode_trailing_spaces[] = {(char) 0xc3, (char) 0xa9, ' ', ' '};
+	ib_cursor cursor;
+	ib_value_view view;
+	char *error;
+
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "unattributed UTF8 output SQLDA allocation failed");
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = IB_CHARSET_UTF8;
+	cursor.output->sqlvar[0].sqllen = (short) sizeof(trailing_spaces);
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"unattributed UTF8 output storage failed");
+	cursor.fetched = 1;
+
+	memcpy(cursor.output->sqlvar[0].sqldata, trailing_spaces, sizeof(trailing_spaces));
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"ASCII literal UTF8 decode failed");
+	require_condition(view.length == sizeof(trailing_spaces) &&
+		memcmp(view.bytes, trailing_spaces, sizeof(trailing_spaces)) == 0,
+		"unattributed ASCII literal lost trailing spaces");
+
+	memcpy(cursor.output->sqlvar[0].sqldata, unicode_trailing_spaces,
+		sizeof(unicode_trailing_spaces));
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"non-ASCII literal UTF8 decode failed");
+	require_condition(view.length == sizeof(unicode_trailing_spaces) &&
+		memcmp(view.bytes, unicode_trailing_spaces, sizeof(unicode_trailing_spaces)) == 0,
+		"unattributed non-ASCII literal lost trailing spaces");
 	ib_free_sqlda(cursor.output);
 }
 
@@ -458,6 +571,37 @@ static void test_binding_converts_to_described_charset_capacity(void)
 	ib_free_sqlda(cursor.input);
 }
 
+static void test_charset_conversion_handles_a_multibyte_chunk_boundary(void)
+{
+	const size_t split = 32768U;
+	const size_t source_length = split + 2U;
+	char *source;
+	char *converted;
+	size_t converted_length;
+	char *error = NULL;
+
+	source = (char *) malloc(source_length);
+	require_condition(source != NULL, "chunked conversion input allocation failed");
+	memset(source, 'a', source_length);
+	source[split - 1U] = (char) 0xc4;
+	source[split] = (char) 0x9b; /* U+011B, one WIN1250 byte. */
+	source[split + 1U] = 'z';
+	converted = ib_convert_utf8(source, source_length, 51, &converted_length, &error);
+	require_condition(converted != NULL && error == NULL,
+		"chunked UTF8/WIN1250 conversion failed at a multibyte boundary");
+	require_condition(converted_length == split + 1U &&
+		(unsigned char) converted[split - 1U] == 0xec && converted[split] == 'z',
+		"chunked UTF8/WIN1250 conversion changed boundary data");
+	free(converted);
+	free(source);
+	error = NULL;
+	converted = ib_convert_utf8("x", (size_t) IB_MAX_BLOB_BUFFER + 1U, 51,
+		&converted_length, &error);
+	require_condition(converted == NULL && error != NULL,
+		"oversized charset conversion was not rejected before allocation");
+	ib_error_free(error);
+}
+
 static void test_configured_charset_conversion(void)
 {
 	static const char utf8[] = "\xc4\x9b\xc5\xa1\xc4\x8d";
@@ -527,6 +671,39 @@ static void test_configured_charset_conversion(void)
 		memcmp(view.bytes, utf8, sizeof(utf8) - 1U) == 0,
 		"charset output conversion changed the value");
 	ib_cursor_free_parts(&cursor);
+}
+
+static void test_supported_charset_names(void)
+{
+	static const struct {
+		const char *name;
+		short id;
+	} cases[] = {
+		{"UTF8", 59},
+		{"WIN1250", 51},
+		{"WIN1252", 53},
+		{"ISO8859_1", 21},
+		{"ASCII", 2}
+	};
+	short charset;
+	const char *name;
+	char *error = NULL;
+	 size_t index;
+
+	for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); index++) {
+		charset = 0;
+		require_condition(ib_charset_id(cases[index].name,
+			strlen(cases[index].name), &charset) == 0 && charset == cases[index].id,
+			"supported character set name was not mapped to its InterBase ID");
+		name = ib_charset_name(charset);
+		require_condition(name != NULL && strcmp(name, cases[index].name) == 0,
+			"InterBase character set ID did not return its canonical name");
+	}
+
+	charset = 0;
+	require_condition(ib_charset_id("NOPE", 4U, &charset) != 0,
+		"unsupported character set name was accepted");
+	ib_error_free(error);
 }
 
 static void test_output_nullability(void)
@@ -613,6 +790,443 @@ static void test_timestamp_and_rejections(void)
 	ib_free_sqlda(cursor.output);
 }
 
+static void test_array_binding_copies_shape_and_elements(void)
+{
+	static const char text[] = "array";
+	ib_array_bound bounds[] = {
+		{-1, 0},
+		{2, 3}
+	};
+	ib_array_element elements[] = {
+		{IB_ARRAY_ELEMENT_INT64, .int64_value = 10},
+		{IB_ARRAY_ELEMENT_INT64, .int64_value = 11},
+		{IB_ARRAY_ELEMENT_STRING, .bytes = text, .length = sizeof(text) - 1U},
+		{IB_ARRAY_ELEMENT_BOOL, .bool_value = 1}
+	};
+	ib_bindings *bindings;
+	char *error = NULL;
+
+	bindings = ib_bindings_new(1, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"array binding allocation failed");
+	require_success(ib_bindings_set_array(bindings, 0, bounds, 2, elements, 4,
+		&error), error, "array binding setup failed");
+	require_condition(bindings->values[0].kind == IB_ARGUMENT_ARRAY &&
+		bindings->values[0].array != NULL,
+		"array binding did not store an array value");
+	require_condition(bindings->values[0].array->dimensions == 2 &&
+		bindings->values[0].array->element_count == 4,
+		"array binding shape is wrong");
+	require_condition(bindings->values[0].array->bounds[0].lower == -1 &&
+		bindings->values[0].array->bounds[1].upper == 3,
+		"array binding bounds are wrong");
+	require_condition(bindings->values[0].array->elements[0].int64_value == 10 &&
+		bindings->values[0].array->elements[3].bool_value != 0,
+		"array binding scalar elements are wrong");
+	require_condition(bindings->values[0].array->elements[2].length == sizeof(text) - 1U &&
+		memcmp(bindings->values[0].array->elements[2].bytes, text, sizeof(text) - 1U) == 0,
+		"array binding string element is wrong");
+
+	bounds[0].lower = 99;
+	elements[2].bytes = "changed";
+	require_condition(bindings->values[0].array->bounds[0].lower == -1 &&
+		memcmp(bindings->values[0].array->elements[2].bytes, text, sizeof(text) - 1U) == 0,
+		"array binding aliases caller storage");
+	ib_bindings_free(bindings);
+}
+
+static void test_null_array_is_rejected_without_array_support(void)
+{
+	ib_cursor cursor;
+	ib_bindings *bindings;
+	char *error = NULL;
+
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.input = ib_alloc_sqlda(1);
+	require_condition(cursor.input != NULL,
+		"NULL array input SQLDA allocation failed");
+	cursor.input->sqld = 1;
+	cursor.input->sqlvar[0].sqltype = SQL_ARRAY;
+	bindings = ib_bindings_new(1, &error);
+	require_condition(bindings != NULL && error == NULL,
+		"NULL array binding allocation failed");
+	require_success(ib_bindings_set_null(bindings, 0, &error), error,
+		"NULL array binding setup failed");
+	error = NULL;
+	require_condition(ib_bind_input_mode(&cursor, bindings, 0, &error) != 0 &&
+		error != NULL, "database/sql accepted a NULL array parameter");
+	require_condition(cursor.input->sqlvar[0].sqldata == NULL &&
+		cursor.input->sqlvar[0].sqlind == NULL,
+		"NULL array rejection allocated native binding storage");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	ib_free_sqlda(cursor.input);
+}
+
+static void test_array_descriptor_lengths_are_validated_before_allocation(void)
+{
+	static const struct {
+		unsigned char dtype;
+		unsigned short length;
+		const char *message;
+	} invalid[] = {
+		{blr_short, 1, "SMALLINT array descriptor accepted a short element"},
+		{blr_long, 8, "INTEGER array descriptor accepted a wide element"},
+		{blr_int64, 4, "BIGINT array descriptor accepted a short element"},
+		{blr_float, 8, "FLOAT array descriptor accepted a wide element"},
+		{blr_double, 4, "DOUBLE array descriptor accepted a short element"},
+		{blr_timestamp, 4, "TIMESTAMP array descriptor accepted a short element"},
+		{blr_sql_date, 8, "DATE array descriptor accepted a wide element"},
+		{blr_sql_time, 8, "TIME array descriptor accepted a wide element"},
+		{blr_boolean_dtype, 1, "BOOLEAN array descriptor accepted a short element"},
+		{blr_text, 0, "CHAR array descriptor accepted zero storage"},
+		{blr_varying, 0, "VARCHAR array descriptor accepted zero storage"},
+		{255, sizeof(ISC_QUAD), "unsupported array descriptor type was accepted"},
+	};
+	ISC_ARRAY_DESC_V2 descriptor;
+	size_t element_size;
+	size_t element_count;
+	size_t slice_size;
+	char *error;
+	size_t index;
+
+	for (index = 0U; index < sizeof(invalid) / sizeof(invalid[0]); index++) {
+		memset(&descriptor, 0, sizeof(descriptor));
+		descriptor.array_desc_version = ARR_DESC_VERSION2;
+		descriptor.array_desc_dtype = invalid[index].dtype;
+		descriptor.array_desc_length = invalid[index].length;
+		descriptor.array_desc_dimensions = 1;
+		descriptor.array_desc_bounds[0].array_bound_lower = 0;
+		descriptor.array_desc_bounds[0].array_bound_upper = 0;
+		error = NULL;
+		require_condition(ib_array_slice_layout(&descriptor, &element_size,
+			&element_count, &slice_size, &error) != 0 && error != NULL,
+			invalid[index].message);
+		ib_error_free(error);
+	}
+
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.array_desc_version = ARR_DESC_VERSION2;
+	descriptor.array_desc_dtype = blr_short;
+	descriptor.array_desc_length = sizeof(short);
+	descriptor.array_desc_dimensions = 1;
+	descriptor.array_desc_bounds[0].array_bound_lower = -1;
+	descriptor.array_desc_bounds[0].array_bound_upper = 1;
+	error = NULL;
+	require_success(ib_array_slice_layout(&descriptor, &element_size,
+		&element_count, &slice_size, &error), error,
+		"valid SMALLINT array descriptor was rejected");
+	require_condition(element_size == sizeof(short) && element_count == 3U &&
+		slice_size == 3U * sizeof(short), "valid array layout is wrong");
+
+	{
+		char source[4] = {'a', 'b', 'c', 'd'};
+		char destination[sizeof(int64_t)];
+		ib_array_element element;
+		ib_value_view view;
+		char *owned = NULL;
+
+		memset(&descriptor, 0, sizeof(descriptor));
+		descriptor.array_desc_version = ARR_DESC_VERSION2;
+		descriptor.array_desc_dtype = blr_text;
+		descriptor.array_desc_length = sizeof(source);
+		error = NULL;
+		require_condition(ib_array_decode_element(&descriptor, 0, source, 2U,
+			&view, &owned, &error) != 0 && error != NULL,
+			"array decoder accepted undersized character storage");
+		ib_error_free(error);
+		free(owned);
+
+		memset(&descriptor, 0, sizeof(descriptor));
+		descriptor.array_desc_version = ARR_DESC_VERSION2;
+		descriptor.array_desc_dtype = blr_varying;
+		descriptor.array_desc_length = sizeof(source);
+		memset(&element, 0, sizeof(element));
+		element.kind = IB_ARRAY_ELEMENT_BYTES;
+		element.bytes = source;
+		element.length = sizeof(source);
+		error = NULL;
+		require_success(ib_array_encode_element(&descriptor, 1, &element, destination,
+			sizeof(source) + sizeof(unsigned short), 0, &error), error,
+			"OCTETS varying array element was rejected");
+		require_condition(memcmp(destination, "abcd\0\0", sizeof(source) + sizeof(unsigned short)) == 0,
+			"OCTETS varying array element used a length prefix");
+		memset(&element, 0, sizeof(element));
+		element.kind = IB_ARRAY_ELEMENT_BYTES;
+		element.bytes = "abcde";
+		element.length = 5U;
+		error = NULL;
+		require_condition(ib_array_encode_element(&descriptor, 1, &element, destination,
+			sizeof(source) + sizeof(unsigned short), 0, &error) != 0 && error != NULL,
+			"OCTETS varying array element exceeded its declared payload capacity");
+		ib_error_free(error);
+
+		memset(&element, 0, sizeof(element));
+		element.kind = IB_ARRAY_ELEMENT_STRING;
+		element.bytes = "a";
+		element.length = 1U;
+		error = NULL;
+		require_success(ib_array_encode_element(&descriptor, IB_CHARSET_UTF8, &element,
+			destination, sizeof(source) + sizeof(unsigned short), 0, &error), error,
+			"UTF8 varying array string was rejected");
+		require_condition(memcmp(destination, "a\0\0\0\0\0", sizeof(source) + sizeof(unsigned short)) == 0,
+			"UTF8 varying array string was padded with spaces");
+
+		memcpy(destination, "abcd\0\0", sizeof(source) + sizeof(unsigned short));
+		error = NULL;
+		require_success(ib_array_decode_element(&descriptor, 1, destination,
+			sizeof(source) + sizeof(unsigned short), &view, &owned, &error), error,
+			"OCTETS varying array result was rejected");
+		require_condition(view.kind == IB_VALUE_BYTES && view.length == sizeof(source) &&
+			memcmp(view.bytes, source, sizeof(source)) == 0,
+			"OCTETS varying array result changed its raw payload");
+		free(owned);
+
+		memset(&element, 0, sizeof(element));
+		element.kind = IB_ARRAY_ELEMENT_INT64;
+		element.int64_value = 1;
+		descriptor.array_desc_dtype = blr_long;
+		descriptor.array_desc_length = sizeof(ISC_LONG);
+		error = NULL;
+		require_condition(ib_array_encode_element(&descriptor, 0, &element, destination,
+			2U, 0, &error) != 0 && error != NULL,
+			"array encoder accepted undersized integer storage");
+		ib_error_free(error);
+	}
+}
+
+static void test_varying_array_rejects_embedded_nul_and_preserves_empty(void)
+{
+	ISC_ARRAY_DESC_V2 descriptor;
+	ib_array_element element;
+	ib_value_view view;
+	char destination[sizeof("abcd\0\0") - 1U];
+	const char embedded[] = {'a', '\0', 'b'};
+	char *owned = NULL;
+	char *error;
+
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.array_desc_version = ARR_DESC_VERSION2;
+	descriptor.array_desc_dtype = blr_varying;
+	descriptor.array_desc_length = 4;
+
+	memset(&element, 0, sizeof(element));
+	element.kind = IB_ARRAY_ELEMENT_BYTES;
+	element.bytes = embedded;
+	element.length = sizeof(embedded);
+	error = NULL;
+	require_condition(ib_array_encode_element(&descriptor, 1, &element,
+		destination, sizeof(destination), 0, &error) != 0 && error != NULL,
+		"varying OCTETS array accepted an embedded NUL");
+	ib_error_free(error);
+
+	memset(&element, 0, sizeof(element));
+	element.kind = IB_ARRAY_ELEMENT_STRING;
+	element.bytes = embedded;
+	element.length = sizeof(embedded);
+	error = NULL;
+	require_condition(ib_array_encode_element(&descriptor, IB_CHARSET_UTF8, &element,
+		destination, sizeof(destination), 0, &error) != 0 && error != NULL,
+		"varying text array accepted an embedded NUL");
+	ib_error_free(error);
+
+	memset(&element, 0, sizeof(element));
+	element.kind = IB_ARRAY_ELEMENT_BYTES;
+	element.bytes = NULL;
+	element.length = 0;
+	error = NULL;
+	require_success(ib_array_encode_element(&descriptor, 1, &element,
+		destination, sizeof(destination), 0, &error), error,
+		"empty varying OCTETS array element was rejected");
+	require_condition(memcmp(destination, "\0\0\0\0\0\0", sizeof(destination)) == 0,
+		"empty varying OCTETS array element was not zero-filled");
+	error = NULL;
+	require_success(ib_array_decode_element(&descriptor, 1, destination,
+		sizeof(destination), &view, &owned, &error), error,
+		"empty varying OCTETS array result was rejected");
+	require_condition(view.kind == IB_VALUE_BYTES && view.length == 0,
+		"empty varying OCTETS array result was not preserved");
+	free(owned);
+
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.array_desc_version = ARR_DESC_VERSION2;
+	descriptor.array_desc_dtype = blr_text;
+	descriptor.array_desc_length = 4;
+	element.kind = IB_ARRAY_ELEMENT_BYTES;
+	element.bytes = embedded;
+	element.length = sizeof(embedded);
+	error = NULL;
+	require_success(ib_array_encode_element(&descriptor, 1, &element,
+		destination, 4U, 0, &error), error,
+		"fixed-width OCTETS array element with an embedded NUL was rejected");
+	require_condition(memcmp(destination, "a\0b\0", 4U) == 0,
+		"fixed-width OCTETS array element changed its zero bytes");
+}
+
+static void test_utf8_array_character_capacity_preserves_non_ascii_values(void)
+{
+	ISC_ARRAY_DESC_V2 descriptor;
+	char *data;
+	ib_value_view view;
+	char *owned = NULL;
+	char *error = NULL;
+	const size_t length = 32768U;
+
+	data = (char *) malloc(length);
+	require_condition(data != NULL, "UTF8 array result allocation failed");
+	memset(data, ' ', length);
+	data[0] = (char) 0xc3;
+	data[1] = (char) 0xa9;
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.array_desc_version = ARR_DESC_VERSION2;
+	descriptor.array_desc_dtype = blr_text;
+	descriptor.array_desc_subtype = IB_CHARSET_UTF8;
+	descriptor.array_desc_length = (unsigned short) length;
+	require_success(ib_array_decode_element(&descriptor, IB_CHARSET_UTF8, data, length, &view,
+		&owned, &error), error,
+		"UTF8 array character capacity rejected a non-ASCII value");
+	require_condition(view.kind == IB_VALUE_STRING && view.length == 8193U &&
+		memcmp(view.bytes, "\xc3\xa9", 2U) == 0 && view.bytes[2] == ' ',
+		"UTF8 array character capacity truncated a non-ASCII value");
+	free(owned);
+	free(data);
+}
+
+static void test_scaled_array_elements_keep_exact_integer_precision(void)
+{
+	static const struct {
+		unsigned char dtype;
+		unsigned short length;
+		char scale;
+		const char *value;
+		int64_t want;
+		int precision;
+		const char *message;
+	} accepted[] = {
+		{blr_int64, sizeof(int64_t), -4, "12345678901234.5678",
+			INT64_C(123456789012345678), 18, "wide scaled array value changed"},
+		{blr_int64, sizeof(int64_t), -1, "-922337203685477580.8",
+			INT64_MIN, 19, "minimum scaled array value changed"},
+		{blr_long, sizeof(ISC_LONG), -2, "21474836.47",
+			INT32_MAX, 10, "INTEGER scaled array value changed"},
+	};
+	static const char *const rejected[] = {
+		"922337203685477580.9",
+		"922337203685477580.8",
+		"1.001",
+	};
+	ISC_ARRAY_DESC_V2 descriptor;
+	ib_array_element element;
+	char destination[sizeof(int64_t)];
+	int64_t value;
+	char *error;
+	size_t index;
+
+	for (index = 0U; index < sizeof(accepted) / sizeof(accepted[0]); index++) {
+		memset(&descriptor, 0, sizeof(descriptor));
+		descriptor.array_desc_version = ARR_DESC_VERSION2;
+		descriptor.array_desc_dtype = accepted[index].dtype;
+		descriptor.array_desc_length = accepted[index].length;
+		descriptor.array_desc_scale = accepted[index].scale;
+		descriptor.array_desc_subtype = 2;
+		memset(&element, 0, sizeof(element));
+		element.kind = IB_ARRAY_ELEMENT_STRING;
+		element.bytes = accepted[index].value;
+		element.length = strlen(accepted[index].value);
+		error = NULL;
+		require_success(ib_array_encode_element(&descriptor, 0, &element, destination,
+			accepted[index].length, accepted[index].precision, &error), error,
+			accepted[index].message);
+		value = 0;
+		memcpy(&value, destination, accepted[index].length);
+		require_condition(value == accepted[index].want, accepted[index].message);
+	}
+
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.array_desc_version = ARR_DESC_VERSION2;
+	descriptor.array_desc_dtype = blr_int64;
+	descriptor.array_desc_length = sizeof(int64_t);
+		descriptor.array_desc_scale = -1;
+		descriptor.array_desc_subtype = 2;
+	for (index = 0U; index < sizeof(rejected) / sizeof(rejected[0]); index++) {
+		memset(&element, 0, sizeof(element));
+		element.kind = IB_ARRAY_ELEMENT_STRING;
+		element.bytes = rejected[index];
+		element.length = strlen(rejected[index]);
+		error = NULL;
+		require_condition(ib_array_encode_element(&descriptor, 0, &element, destination,
+			sizeof(int64_t), 18, &error) != 0 && error != NULL,
+		"out-of-range scaled array value was accepted");
+		ib_error_free(error);
+	}
+}
+
+static void test_scaled_array_integer_elements_apply_scale_and_precision(void)
+{
+	ISC_ARRAY_DESC_V2 descriptor;
+	ib_array_element element;
+	char destination[sizeof(int64_t)];
+	int64_t value;
+	char *error = NULL;
+
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.array_desc_version = ARR_DESC_VERSION2;
+	descriptor.array_desc_dtype = blr_int64;
+	descriptor.array_desc_length = sizeof(int64_t);
+	descriptor.array_desc_scale = -2;
+	descriptor.array_desc_subtype = 1;
+	memset(&element, 0, sizeof(element));
+	element.kind = IB_ARRAY_ELEMENT_INT64;
+	element.int64_value = 12;
+	require_success(ib_array_encode_element(&descriptor, 0, &element, destination,
+		sizeof(destination), 4, &error), error,
+		"scaled integer array element was rejected");
+	memcpy(&value, destination, sizeof(value));
+	require_condition(value == 1200,
+		"scaled integer array element did not apply its decimal scale");
+
+	element.int64_value = 100;
+	error = NULL;
+	require_condition(ib_array_encode_element(&descriptor, 0, &element, destination,
+		sizeof(destination), 4, &error) != 0 && error != NULL,
+		"scaled integer array element exceeded declared precision");
+	ib_error_free(error);
+}
+
+static void test_utf8_array_encoding_enforces_character_capacity(void)
+{
+	static const char *const overlong[] = {"12345", "ééééé"};
+	ISC_ARRAY_DESC_V2 descriptor;
+	ib_array_element element;
+	char destination[16];
+	char *error;
+	size_t index;
+
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.array_desc_version = ARR_DESC_VERSION2;
+	descriptor.array_desc_dtype = blr_text;
+	descriptor.array_desc_subtype = IB_CHARSET_UTF8;
+	descriptor.array_desc_length = sizeof(destination);
+	memset(&element, 0, sizeof(element));
+	element.kind = IB_ARRAY_ELEMENT_STRING;
+	for (index = 0U; index < sizeof(overlong) / sizeof(overlong[0]); index++) {
+		element.bytes = overlong[index];
+		element.length = strlen(overlong[index]);
+		error = NULL;
+		require_condition(ib_array_encode_element(&descriptor, IB_CHARSET_UTF8, &element, destination,
+			sizeof(destination), 0, &error) != 0 && error != NULL,
+			"UTF8 array encoder accepted a value beyond character capacity");
+		ib_error_free(error);
+	}
+
+	element.bytes = "éééé";
+	element.length = strlen(element.bytes);
+	error = NULL;
+	require_success(ib_array_encode_element(&descriptor, IB_CHARSET_UTF8, &element, destination,
+		sizeof(destination), 0, &error), error,
+		"UTF8 array encoder rejected a value within character capacity");
+}
+
 static int bind_temporal_for_type(short type, int64_t year, char **error)
 {
 	ib_cursor cursor;
@@ -686,20 +1300,103 @@ static void test_temporal_binding_target_validation(void)
 	ib_error_free(error);
 }
 
+static void test_fixed_char_expression_attribution_is_conservative(void)
+{
+	const char *partial_expression =
+		"SELECT CAST('x' AS CHAR(3)) || 'abcdefghijkl' FROM RDB$DATABASE";
+	const char *union_expression =
+		"SELECT CAST('x' AS CHAR(3)) FROM RDB$DATABASE "
+		"UNION SELECT CAST('y' AS CHAR(3)) FROM RDB$DATABASE";
+	const char *star_expression =
+		"SELECT CAST('x' AS CHAR(3)), D.* FROM T D";
+	const char *valid_expression =
+		"SELECT CAST('x' AS CHAR(3)) FROM RDB$DATABASE";
+	const char *quoted_alias_expression =
+		"SELECT CAST('x' AS CHAR(3)) AS \"R\"\"ESULT\" FROM RDB$DATABASE";
+	const char *invalid_length_expression =
+		"SELECT CAST('x' AS CHAR(0)) FROM RDB$DATABASE";
+	XSQLVAR variable;
+	size_t fixed[1];
+
+	memset(fixed, 0, sizeof(fixed));
+	ib_sql_describe_fixed_text_columns(partial_expression,
+		strlen(partial_expression), fixed, 1U);
+	require_condition(fixed[0] == 0,
+		"partial fixed CHAR expression was attributed");
+
+	memset(fixed, 0, sizeof(fixed));
+	ib_sql_describe_fixed_text_columns(union_expression,
+		strlen(union_expression), fixed, 1U);
+	require_condition(fixed[0] == 0,
+		"UNION fixed CHAR expression was attributed");
+
+	memset(fixed, 0, sizeof(fixed));
+	ib_sql_describe_fixed_text_columns(star_expression,
+		strlen(star_expression), fixed, 1U);
+	require_condition(fixed[0] == 0,
+		"star-expanded SELECT list attributed a fixed CHAR expression");
+
+	memset(fixed, 0, sizeof(fixed));
+	ib_sql_describe_fixed_text_columns(valid_expression,
+		strlen(valid_expression), fixed, 1U);
+	require_condition(fixed[0] == 3U,
+		"valid fixed CHAR expression did not retain its declared length");
+
+	memset(fixed, 0, sizeof(fixed));
+	ib_sql_describe_fixed_text_columns(quoted_alias_expression,
+		strlen(quoted_alias_expression), fixed, 1U);
+	require_condition(fixed[0] == 3U,
+		"quoted alias prevented fixed CHAR attribution");
+
+	memset(fixed, 0, sizeof(fixed));
+	ib_sql_describe_fixed_text_columns(invalid_length_expression,
+		strlen(invalid_length_expression), fixed, 1U);
+	require_condition(fixed[0] == 0U,
+		"invalid fixed CHAR declaration was attributed");
+
+	memset(&variable, 0, sizeof(variable));
+	variable.sqltype = SQL_TEXT;
+	variable.sqlsubtype = IB_CHARSET_UTF8;
+	variable.sqllen = 12;
+	require_condition(ib_sql_fixed_text_descriptor_compatible(&variable, 3U),
+		"compatible UTF8 fixed CHAR descriptor was rejected");
+	variable.sqllen = 8;
+	require_condition(!ib_sql_fixed_text_descriptor_compatible(&variable, 3U),
+		"short UTF8 fixed CHAR descriptor was accepted");
+	variable.sqltype = SQL_VARYING;
+	require_condition(!ib_sql_fixed_text_descriptor_compatible(&variable, 3U),
+		"varying descriptor was accepted as fixed CHAR");
+}
+
 int main(void)
 {
 	test_positional_bind_values();
+	test_blob_reference_binding();
+	test_text_blob_reference_without_relation_is_rejected();
+	test_binary_blob_reference_without_relation_is_preserved();
 	test_column_decoding();
 	test_utf8_fixed_text_and_scaled_float_decoding();
+	test_unattributed_utf8_text_preserves_literal_spaces();
 	test_fixed_text_output_is_space_initialized();
 	test_octets_bind_and_decode_as_bytes();
 	test_exact_scaled_integer_binding();
 	test_temporal_binding_target_validation();
 	test_text_binding_converts_to_described_charset();
 	test_binding_converts_to_described_charset_capacity();
+	test_charset_conversion_handles_a_multibyte_chunk_boundary();
 	test_configured_charset_conversion();
+	test_supported_charset_names();
 	test_output_nullability();
 	test_timestamp_and_rejections();
+	test_array_binding_copies_shape_and_elements();
+	test_null_array_is_rejected_without_array_support();
+	test_array_descriptor_lengths_are_validated_before_allocation();
+	test_varying_array_rejects_embedded_nul_and_preserves_empty();
+	test_utf8_array_character_capacity_preserves_non_ascii_values();
+	test_scaled_array_elements_keep_exact_integer_precision();
+	test_scaled_array_integer_elements_apply_scale_and_precision();
+	test_utf8_array_encoding_enforces_character_capacity();
+	test_fixed_char_expression_attribution_is_conservative();
 	(void) puts("native values tests passed");
 	return EXIT_SUCCESS;
 }

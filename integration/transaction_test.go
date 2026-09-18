@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	interbase "interbase-go"
 	"reflect"
 	"testing"
 )
@@ -246,6 +247,70 @@ func TestTransactionReadOnlyOption(t *testing.T) {
 	}
 	if got := queryWriteRows(t, db, ctx); !reflect.DeepEqual(got, wantSeed) {
 		t.Fatalf("rows after read-only rollback = %#v, want %#v", got, wantSeed)
+	}
+}
+
+func TestTransactionStandardIsolationLevelsMapToNativeTPBs(t *testing.T) {
+	for _, level := range []struct {
+		name  string
+		level sql.IsolationLevel
+	}{
+		{name: "read committed", level: sql.LevelReadCommitted},
+		{name: "repeatable read", level: sql.LevelRepeatableRead},
+		{name: "snapshot", level: sql.LevelSnapshot},
+		{name: "serializable", level: sql.LevelSerializable},
+	} {
+		t.Run(level.name, func(t *testing.T) {
+			db := newDatabase(t)
+			ctx := readContext(t)
+			tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: level.level})
+			if err != nil {
+				t.Fatalf("begin %s transaction: %v", level.name, err)
+			}
+			registerTransactionRollback(t, tx)
+
+			var value int64
+			if err := tx.QueryRowContext(ctx, "SELECT CAST(1 AS INTEGER) FROM RDB$DATABASE").Scan(&value); err != nil {
+				t.Fatalf("query in %s transaction: %v", level.name, err)
+			}
+			if value != 1 {
+				t.Fatalf("query in %s transaction = %d, want 1", level.name, value)
+			}
+			if err := tx.Rollback(); err != nil {
+				t.Fatalf("rollback %s transaction: %v", level.name, err)
+			}
+		})
+	}
+}
+
+func TestTransactionConnectorOptionsAreAcceptedByNativeClient(t *testing.T) {
+	db := newDatabaseWithTransactionOptions(t, interbase.TransactionOptions{
+		NoWait:          true,
+		NoRecordVersion: true,
+		TableReservations: []interbase.TableReservation{
+			{
+				Table:       "GO_COUNTRY",
+				SharingMode: interbase.TableSharingShared,
+				AccessMode:  interbase.TableAccessRead,
+			},
+		},
+	})
+	ctx := readContext(t)
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		t.Fatalf("begin configured transaction: %v", err)
+	}
+	registerTransactionRollback(t, tx)
+
+	var country string
+	if err := tx.QueryRowContext(ctx, "SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?", int64(1)).Scan(&country); err != nil {
+		t.Fatalf("query in configured transaction: %v", err)
+	}
+	if country != "USA" {
+		t.Fatalf("configured transaction country = %q, want USA", country)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback configured transaction: %v", err)
 	}
 }
 

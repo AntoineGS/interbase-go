@@ -6,28 +6,18 @@
 package integration_test
 
 import (
-	"context"
 	"database/sql"
-	"errors"
 	"testing"
 
 	interbase "interbase-go"
-	"interbase-go/internal/testfixture"
 )
 
 // Source mapping: TestCharsetConversion.test_utf82win1250. Unlike the
 // nested-cast regression, this preserves the upstream persisted-row contract.
 func TestCharsetUTF8InsertReadAcrossAttachments(t *testing.T) {
-	cfg, err := testfixture.FromEnv()
-	if err != nil {
-		t.Fatalf("fixture configuration: %v", err)
-	}
-	cfg.Dialect = 1
-	setupContext, cancel := context.WithTimeout(context.Background(), fixtureSetupTimeout)
-	defer cancel()
 	// Only the five columns used by the upstream test are needed here; their
 	// names, lengths, and character sets match the original T4 schema.
-	fixture, createErr := testfixture.Create(setupContext, cfg, `
+	fixture, cfg, cleanup := createFixture(t, 1, `
 		CREATE TABLE T4 (
 			C1 INTEGER,
 			C_WIN1250 CHAR(5) CHARACTER SET WIN1250,
@@ -36,42 +26,9 @@ func TestCharsetUTF8InsertReadAcrossAttachments(t *testing.T) {
 			V_UTF8 VARCHAR(30) CHARACTER SET UTF8);
 	`)
 	var databases [2]*sql.DB
-	if fixture != nil {
-		t.Cleanup(func() {
-			closeDatabases := func() error {
-				var closeErr error
-				for _, db := range databases {
-					if db != nil {
-						closeErr = errors.Join(closeErr, db.Close())
-					}
-				}
-				return closeErr
-			}
-			if err := cleanupDatabaseAndFixture(closeDatabases, fixture.Close, fixture.Path); err != nil {
-				t.Errorf("charset fixture cleanup: %v", err)
-			}
-		})
-	}
-	if createErr != nil {
-		t.Fatalf("create charset fixture: %v", createErr)
-	}
 	for i, charset := range []string{"UTF8", "WIN1250"} {
-		connector, err := interbase.NewConnector(interbase.Config{
-			Database: fixture.Path,
-			User:     cfg.User,
-			Password: cfg.Password,
-			Charset:  charset,
-			Dialect:  1,
-		})
-		if err != nil {
-			t.Fatalf("%s connector: %v", charset, err)
-		}
-		databases[i] = sql.OpenDB(connector)
-		databases[i].SetMaxOpenConns(1)
-		databases[i].SetMaxIdleConns(1)
-		if err := pingDatabase(setupContext, databases[i]); err != nil {
-			t.Fatalf("%s fixture ping: %v", charset, err)
-		}
+		databases[i] = openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, charset, 1,
+			interbase.TransactionOptions{})
 	}
 
 	want := struct {
@@ -131,5 +88,119 @@ func TestCharsetUTF8InsertReadAcrossAttachments(t *testing.T) {
 			}
 			finishReadRows(t, rows)
 		})
+	}
+}
+
+func TestCharsetAdditionalAttachmentsRoundTrip(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3, `
+		CREATE TABLE GO_CHARSET_MATRIX (
+			ID INTEGER NOT NULL PRIMARY KEY,
+			WIN1252_VALUE VARCHAR(40) CHARACTER SET WIN1252,
+			ISO8859_1_VALUE VARCHAR(40) CHARACTER SET ISO8859_1,
+			ASCII_VALUE VARCHAR(40) CHARACTER SET ASCII);`)
+
+	attachments := make(map[string]*sql.DB, 4)
+	for _, charset := range []string{"UTF8", "WIN1252", "ISO8859_1", "ASCII"} {
+		attachments[charset] = openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password,
+			charset, 3, interbase.TransactionOptions{})
+	}
+
+	ctx := readContext(t)
+	cases := []struct {
+		id      int64
+		charset string
+		column  string
+		value   string
+	}{
+		{id: 1, charset: "WIN1252", column: "WIN1252_VALUE", value: "caf\u00e9 \u20ac"},
+		{id: 2, charset: "ISO8859_1", column: "ISO8859_1_VALUE", value: "caf\u00e9"},
+		{id: 3, charset: "ASCII", column: "ASCII_VALUE", value: "plain ASCII  "},
+	}
+	for _, test := range cases {
+		t.Run(test.charset+" persisted value", func(t *testing.T) {
+			db := attachments[test.charset]
+			if db == nil {
+				t.Fatalf("missing %s attachment", test.charset)
+			}
+			if _, err := db.ExecContext(ctx,
+				"INSERT INTO GO_CHARSET_MATRIX (ID, "+test.column+") VALUES (?, ?)",
+				test.id, test.value); err != nil {
+				t.Fatalf("insert through %s attachment: %v", test.charset, err)
+			}
+		})
+	}
+
+	for _, test := range cases {
+		for _, readerCharset := range []string{"UTF8", test.charset} {
+			readerCharset := readerCharset
+			t.Run(test.charset+" read through "+readerCharset, func(t *testing.T) {
+				attachment := attachments[readerCharset]
+				var got string
+				query := "SELECT " + test.column + " FROM GO_CHARSET_MATRIX WHERE ID = ?"
+				if err := attachment.QueryRowContext(ctx, query, test.id).Scan(&got); err != nil {
+					t.Fatalf("read %s through %s attachment: %v", test.charset, readerCharset, err)
+				}
+				if got != test.value {
+					t.Fatalf("%s through %s = %q, want %q", test.charset, readerCharset, got, test.value)
+				}
+			})
+		}
+	}
+}
+
+func TestCharsetAdditionalParameterRoundTrips(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3)
+	ctx := readContext(t)
+	tests := []struct {
+		charset string
+		value   string
+	}{
+		{charset: "WIN1252", value: "caf\u00e9 \u20ac"},
+		{charset: "ISO8859_1", value: "caf\u00e9"},
+		{charset: "ASCII", value: "plain ASCII  "},
+	}
+	for _, test := range tests {
+		t.Run(test.charset, func(t *testing.T) {
+			db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password,
+				test.charset, 3, interbase.TransactionOptions{})
+			var got string
+			query := "SELECT CAST(? AS VARCHAR(40) CHARACTER SET " + test.charset + ") FROM RDB$DATABASE"
+			if err := db.QueryRowContext(ctx, query, test.value).Scan(&got); err != nil {
+				t.Fatalf("%s parameter query: %v", test.charset, err)
+			}
+			if got != test.value {
+				t.Fatalf("%s parameter = %q, want %q", test.charset, got, test.value)
+			}
+		})
+	}
+}
+
+func TestCharsetASCIIRejectsNonRepresentableParameter(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3)
+	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password,
+		"ASCII", 3, interbase.TransactionOptions{})
+	ctx := readContext(t)
+
+	var got string
+	err := db.QueryRowContext(ctx,
+		"SELECT CAST(? AS VARCHAR(40) CHARACTER SET ASCII) FROM RDB$DATABASE",
+		"caf\u00e9").Scan(&got)
+	if err == nil {
+		t.Fatalf("ASCII accepted non-representable parameter as %q", got)
+	}
+}
+
+func TestCharsetASCIIRejectsNonRepresentableStoredValue(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3, `
+CREATE TABLE GO_ASCII_NEGATIVE (
+    ID INTEGER NOT NULL PRIMARY KEY,
+    VALUE_TEXT VARCHAR(40) CHARACTER SET ASCII);`)
+	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password,
+		"ASCII", 3, interbase.TransactionOptions{})
+	ctx := readContext(t)
+
+	if _, err := db.ExecContext(ctx,
+		"INSERT INTO GO_ASCII_NEGATIVE (ID, VALUE_TEXT) VALUES (?, ?)", 1, "caf\u00e9"); err == nil {
+		t.Fatal("ASCII accepted non-representable stored value")
 	}
 }

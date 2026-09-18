@@ -19,6 +19,8 @@ setup_runner_test() {
   TEST_BIN="${TEST_SANDBOX}/bin"
   TEST_TMP="${TEST_SANDBOX}/tmp"
   mkdir -p -- "$TEST_BIN" "$TEST_TMP"
+  mkdir -p -- "$TEST_TMP/include"
+  printf '%s\n' '/* controlled SDK header */' > "$TEST_TMP/include/ibase.h"
 
   export FAKE_DOCKER_LOG="${TEST_SANDBOX}/docker.log"
   export FAKE_TIMEOUT_LOG="${TEST_SANDBOX}/timeout.log"
@@ -32,6 +34,7 @@ setup_runner_test() {
   export FAKE_REAL_TIMEOUT
   export PATH="${TEST_BIN}:${PATH}"
   export TMPDIR="$TEST_TMP"
+  export INTERBASE_INCLUDE="$TEST_TMP/include"
   export IMAGE="example.invalid/interbase:fixture"
   export INTERBASE_DATABASE="/srv/interbase/operational.ib"
   export INTERBASE_USER="operational-user"
@@ -40,10 +43,15 @@ setup_runner_test() {
   export INTERBASE_TEST_USER="override-user"
   export INTERBASE_TEST_PASSWORD="override-password"
   export INTERBASE_TEST_EXTRA="override-extra"
+  unset CGO_CFLAGS CGO_LDFLAGS SERVICES_NATIVE_TRACE
   unset FAKE_DOCKER_INSPECT_FAIL FAKE_DOCKER_RUN_FAIL FAKE_DOCKER_CP_FAIL \
     FAKE_DOCKER_STOP_FAIL FAKE_DOCKER_STOP_SLEEP FAKE_DOCKER_RM_FAIL \
     FAKE_GO_FAIL_MODE FAKE_GO_READINESS_FAILURES FAKE_GO_READINESS_MODE \
-    FAKE_GO_WRONG_ERROR_MODE FAKE_GO_CREATE_RETAINED FAKE_GO_SLEEP
+    FAKE_GO_WRONG_ERROR_MODE FAKE_GO_CREATE_RETAINED FAKE_GO_SLEEP \
+    FAKE_GO_REQUIRE_QUOTED_CGO_PATHS
+  unset INTERBASE_PERF INTERBASE_SOAK INTERBASE_SOAK_DURATION \
+    INTERBASE_SOAK_WORKERS INTERBASE_SOAK_SAMPLE_INTERVAL \
+    INTERBASE_NATIVE_LIFECYCLE_RACE INTERBASE_UNSAFE_WORKLOAD_OVERRIDE
 
   : > "$FAKE_DOCKER_LOG"
   : > "$FAKE_TIMEOUT_LOG"
@@ -53,6 +61,7 @@ setup_runner_test() {
   create_fake_docker
   create_fake_timeout
   create_fake_go
+  export FAKE_GO_RUNTIME="$TEST_BIN/go"
 }
 
 teardown_runner_test() {
@@ -87,7 +96,6 @@ log_docker_call() {
 log_docker_call "$@"
 
 if [[ -n "${INTERBASE_DATABASE-}${INTERBASE_USER-}${INTERBASE_PASSWORD-}" ||
-  -n "${INTERBASE_TEST_ISQL-}${INTERBASE_TEST_USER-}${INTERBASE_TEST_PASSWORD-}${INTERBASE_TEST_EXTRA-}" ||
   -n "${IB_SYSDBA_USER-}${IB_SYSDBA_PASSWORD-}${IB_DATA_DIR-}${IB_BACKUP_DIR-}" ]]; then
   printf 'host-operational-vars=present\n' >> "$FAKE_DOCKER_LOG"
 else
@@ -152,6 +160,27 @@ case "${1-}" in
         ;;
     esac
     ;;
+  exec)
+    shift
+    while (($# > 0)) && [[ "$1" == --env ]]; do
+      [[ $# -ge 2 ]]
+      if [[ "$2" == *=* ]]; then
+        export "$2"
+      elif [[ -v "$2" ]]; then
+        export "$2"
+      else
+        printf -v "$2" '%s' ''
+        export "$2"
+      fi
+      shift 2
+    done
+    [[ $# -ge 2 ]]
+    container_id="$1"
+    test_binary="$2"
+    shift 2
+    [[ -n "$container_id" && -x "$test_binary" ]]
+    "$FAKE_GO_RUNTIME" "$@"
+    ;;
   stop)
     if [[ "${FAKE_DOCKER_STOP_FAIL:-0}" == 1 ]]; then
       exit 35
@@ -204,9 +233,38 @@ log_go_call() {
 }
 
 log_go_call "$@"
+
+is_build=0
+output_file=''
+previous=''
+for argument in "$@"; do
+  if [[ "$argument" == -c ]]; then
+    is_build=1
+  elif [[ "$previous" == -o ]]; then
+    output_file="$argument"
+  fi
+  previous="$argument"
+done
+if [[ "$is_build" -eq 1 ]]; then
+  [[ -n "$output_file" ]]
+  printf 'build-cflags=%s\n' "${CGO_CFLAGS-}" >> "$FAKE_GO_LOG"
+  printf 'build-ldflags=%s\n' "${CGO_LDFLAGS-}" >> "$FAKE_GO_LOG"
+  if [[ "${FAKE_GO_REQUIRE_QUOTED_CGO_PATHS:-0}" == 1 ]]; then
+    expected_include="\"-I${INTERBASE_INCLUDE}\""
+    build_root="${output_file%/*}"
+    expected_root="\"-L${build_root}\" \"-Wl,-rpath,${build_root}\""
+    [[ "${CGO_CFLAGS-}" == "$expected_include" ]]
+    [[ "${CGO_LDFLAGS-}" == "$expected_root" ]]
+  fi
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$output_file"
+  chmod 700 "$output_file"
+  exit 0
+fi
+
 printf 'database=%s user=%s test-isql=%s\n' \
   "${INTERBASE_DATABASE+present}" "${INTERBASE_USER+present}" \
   "${INTERBASE_TEST_ISQL+present}" >> "$FAKE_GO_LOG"
+printf 'server=%s\n' "${INTERBASE_TEST_SERVER-}" >> "$FAKE_GO_LOG"
 if [[ "${INTERBASE_TEST_ISQL-}" == "$TMPDIR/isql" ]]; then
   printf 'test-isql-path=owned\n' >> "$FAKE_GO_LOG"
 else
@@ -223,16 +281,26 @@ else
   printf 'unexpected\n' >> "$FAKE_GO_LOG"
   password_state=unexpected
 fi
+printf 'workload-env perf=%s soak=%s duration=%s workers=%s sample=%s native=%s\n' \
+  "${INTERBASE_PERF-}" "${INTERBASE_SOAK-}" \
+  "${INTERBASE_SOAK_DURATION-}" "${INTERBASE_SOAK_WORKERS-}" \
+  "${INTERBASE_SOAK_SAMPLE_INTERVAL-}" \
+  "${INTERBASE_NATIVE_LIFECYCLE_RACE-}" >> "$FAKE_GO_LOG"
 printf '%s\n' "$TMPDIR" > "$FAKE_ROOT_FILE"
 
 is_smoke=0
+is_service=0
 for argument in "$@"; do
   if [[ "$argument" == '^TestReadFixtureSmoke$' ]]; then
     is_smoke=1
+  elif [[ "$argument" == '^TestNativeService('* ]]; then
+    is_service=1
   fi
 done
 
-if [[ "$is_smoke" -eq 1 && "$password_state" == default ]]; then
+if [[ "$is_service" -eq 1 ]]; then
+  printf 'service-precheck\n' >> "$FAKE_GO_PHASE_LOG"
+elif [[ "$is_smoke" -eq 1 && "$password_state" == default ]]; then
   printf 'readiness-default\n' >> "$FAKE_GO_PHASE_LOG"
 elif [[ "$is_smoke" -eq 1 && "$password_state" == wrong ]]; then
   printf 'readiness-wrong\n' >> "$FAKE_GO_PHASE_LOG"
@@ -277,7 +345,7 @@ if [[ "$password_state" == wrong ]]; then
   exit 41
 fi
 
-if [[ "${FAKE_GO_FAIL_MODE:-}" == requested && "$is_smoke" -eq 0 ]]; then
+if [[ "${FAKE_GO_FAIL_MODE:-}" == requested && "$is_smoke" -eq 0 && "$is_service" -eq 0 ]]; then
   printf 'controlled test failure\n' >&2
   exit 23
 fi

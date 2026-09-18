@@ -75,6 +75,7 @@ static int describe_calls;
 static int execute_calls;
 static int execute2_calls;
 static int execute2_open;
+static int open_selects;
 static int fetch_rows_remaining;
 static int fetch_calls;
 static int free_statement_calls;
@@ -101,12 +102,21 @@ static int fail_catalog_drop;
 static int catalog_drop_left_handle;
 static int failed_drop_left_handle;
 static int describe_user_column_relation;
+static int describe_user_charset_identifier;
+static int describe_user_column_alias;
+static int describe_procedure_decimal;
+static int describe_procedure_source;
 static int user_execute2_calls;
 static int64_t last_execute_value;
 static char database_token;
 static char transaction_tokens[32];
 static char statement_tokens[32];
 static isc_stmt_handle catalog_statement;
+static int procedure_catalog_statement;
+static int procedure_catalog_precision;
+static int procedure_catalog_scale;
+static int catalog_charset_identifier;
+static int catalog_lookup_bytes_ok;
 static unsigned short expected_dialect;
 
 static void check(int condition, const char *message)
@@ -126,6 +136,17 @@ static void set_catalog_text(XSQLVAR *variable, const char *value)
 {
 	size_t length = strlen(value);
 
+	memset(variable->sqldata, ' ', (size_t) variable->sqllen);
+	if (length > (size_t) variable->sqllen) {
+		length = (size_t) variable->sqllen;
+	}
+	memcpy(variable->sqldata, value, length);
+	*variable->sqlind = 0;
+}
+
+static void set_catalog_bytes(XSQLVAR *variable, const unsigned char *value,
+	size_t length)
+{
 	memset(variable->sqldata, ' ', (size_t) variable->sqllen);
 	if (length > (size_t) variable->sqllen) {
 		length = (size_t) variable->sqllen;
@@ -165,6 +186,7 @@ static void reset_mocks(void)
 	execute_calls = 0;
 	execute2_calls = 0;
 	execute2_open = 0;
+	open_selects = 0;
 	fetch_rows_remaining = 0;
 	fetch_calls = 0;
 	free_statement_calls = 0;
@@ -190,8 +212,17 @@ static void reset_mocks(void)
 	catalog_drop_left_handle = 0;
 	failed_drop_left_handle = 0;
 	describe_user_column_relation = 0;
+	describe_user_charset_identifier = 0;
+	describe_user_column_alias = 0;
+	describe_procedure_decimal = 0;
+	describe_procedure_source = 0;
 	user_execute2_calls = 0;
 	catalog_statement = NULL;
+	procedure_catalog_statement = 0;
+	procedure_catalog_precision = 0;
+	procedure_catalog_scale = 0;
+	catalog_charset_identifier = 0;
+	catalog_lookup_bytes_ok = 0;
 	expected_dialect = SQL_DIALECT_V5;
 	last_execute_value = 0;
 	statement_type = isc_info_sql_stmt_insert;
@@ -351,6 +382,12 @@ ISC_STATUS ISC_EXPORT test_dsql_prepare(ISC_STATUS *status,
 	prepare_calls++;
 	if (query != NULL && strstr(query, "RDB$RELATION_FIELDS") != NULL) {
 		catalog_statement = *statement;
+		procedure_catalog_statement = 0;
+	} else if (query != NULL && strstr(query, "RDB$PROCEDURE_PARAMETERS") != NULL) {
+		check(strstr(query, "RDB$PARAMETER_TYPE = 1") != NULL,
+			"procedure catalog query did not restrict output parameters");
+		catalog_statement = *statement;
+		procedure_catalog_statement = 1;
 	}
 	if ((fail_prepare || (fail_prepare_on_call != 0 &&
 		prepare_calls == fail_prepare_on_call)) && fail_rollback) {
@@ -366,12 +403,14 @@ ISC_STATUS ISC_EXPORT test_dsql_describe_bind(ISC_STATUS *status,
 	(void) statement;
 	check(dialect == expected_dialect, "describe bind used the wrong SQL dialect");
 	describe_bind_calls++;
-	input->sqld = 1;
-	input->sqlvar[0].sqltype = SQL_INT64 | 1;
-	input->sqlvar[0].sqlscale = 0;
-	input->sqlvar[0].sqlsubtype = 0;
-	input->sqlvar[0].sqlprecision = 0;
-	input->sqlvar[0].sqllen = (short) sizeof(ISC_INT64);
+	input->sqld = procedure_catalog_statement ? 2 : 1;
+	for (short index = 0; index < input->sqln && index < input->sqld; index++) {
+		input->sqlvar[index].sqltype = SQL_INT64 | 1;
+		input->sqlvar[index].sqlscale = 0;
+		input->sqlvar[index].sqlsubtype = 0;
+		input->sqlvar[index].sqlprecision = 0;
+		input->sqlvar[index].sqllen = (short) sizeof(ISC_INT64);
+	}
 	return status_result(status, 0);
 }
 
@@ -383,7 +422,7 @@ ISC_STATUS ISC_EXPORT test_dsql_describe(ISC_STATUS *status,
 	if (is_catalog_statement(statement)) {
 		short index;
 
-		output->sqld = 10;
+		output->sqld = procedure_catalog_statement ? 7 : 10;
 		for (index = 0; index < output->sqln && index < output->sqld; index++) {
 			if (index < 2) {
 				output->sqlvar[index].sqltype = SQL_TEXT | 1;
@@ -405,12 +444,38 @@ ISC_STATUS ISC_EXPORT test_dsql_describe(ISC_STATUS *status,
 	output->sqlvar[0].sqlsubtype = 0;
 	output->sqlvar[0].sqlprecision = 0;
 	output->sqlvar[0].sqllen = (short) sizeof(ISC_INT64);
+	if (describe_procedure_decimal && statement_type == isc_info_sql_stmt_exec_procedure) {
+		output->sqlvar[0].sqlsubtype = 1;
+		output->sqlvar[0].sqlscale = -2;
+		output->sqlvar[0].sqlprecision = 18;
+	}
 	if (describe_user_column_relation && statement_type == isc_info_sql_stmt_select) {
 		output->sqlvar[0].relname_length = 1;
 		output->sqlvar[0].relname[0] = 'T';
 		output->sqlvar[0].sqlname_length = 2;
 		output->sqlvar[0].sqlname[0] = 'I';
 		output->sqlvar[0].sqlname[1] = 'D';
+	}
+	if (describe_user_charset_identifier && statement_type == isc_info_sql_stmt_select) {
+		static const unsigned char relation[] = {0x8e};
+		static const unsigned char field[] = {0x8a};
+		memcpy(output->sqlvar[0].relname, relation, sizeof(relation));
+		output->sqlvar[0].relname_length = (short) sizeof(relation);
+		memcpy(output->sqlvar[0].sqlname, field, sizeof(field));
+		output->sqlvar[0].sqlname_length = (short) sizeof(field);
+	}
+	if (describe_user_column_alias && statement_type == isc_info_sql_stmt_select) {
+		static const unsigned char alias[] = {'P', 0xf8, 0xed, 'l', 'i', 0x9a};
+		memcpy(output->sqlvar[0].aliasname, alias, sizeof(alias));
+		output->sqlvar[0].aliasname_length = (short) sizeof(alias);
+	}
+	if (describe_procedure_source && statement_type == isc_info_sql_stmt_exec_procedure) {
+		static const char procedure_name[] = "P";
+		static const char parameter_name[] = "OUT";
+		memcpy(output->sqlvar[0].relname, procedure_name, sizeof(procedure_name) - 1U);
+		output->sqlvar[0].relname_length = (short) (sizeof(procedure_name) - 1U);
+		memcpy(output->sqlvar[0].sqlname, parameter_name, sizeof(parameter_name) - 1U);
+		output->sqlvar[0].sqlname_length = (short) (sizeof(parameter_name) - 1U);
 	}
 	return status_result(status, 0);
 }
@@ -473,6 +538,14 @@ ISC_STATUS ISC_EXPORT test_dsql_execute2(ISC_STATUS *status,
 	(void) output;
 	execute2_calls++;
 	if (is_catalog_statement(statement)) {
+		if (catalog_charset_identifier && input != NULL && input->sqld == 1 &&
+			input->sqlvar[0].sqldata != NULL &&
+			ib_sql_type(&input->sqlvar[0]) == SQL_TEXT &&
+			input->sqlvar[0].sqllen == 1 &&
+			(unsigned char) input->sqlvar[0].sqldata[0] == 0x8e &&
+			ib_text_charset(&input->sqlvar[0]) == 51) {
+			catalog_lookup_bytes_ok = 1;
+		}
 		catalog_statement_open = 1;
 		catalog_fetch_rows_remaining = 1;
 		return status_result(status, 0);
@@ -489,9 +562,7 @@ ISC_STATUS ISC_EXPORT test_dsql_execute2(ISC_STATUS *status,
 	if (statement_type == isc_info_sql_stmt_exec_procedure) {
 		return status_result(status, 0);
 	}
-	if (execute2_open) {
-		return status_result(status, 1);
-	}
+	open_selects++;
 	execute2_open = 1;
 	fetch_rows_remaining = 1;
 	return status_result(status, 0);
@@ -703,8 +774,50 @@ static void test_catalog_metadata_cleanup_drops_owned_statement(void)
 	check(catalog_drop_calls == 1 && catalog_close_calls == 0,
 		"catalog-owned statement was closed instead of dropped");
 	ib_error_free(error);
-	free(cursor.metadata);
-	ib_free_sqlda(cursor.output);
+	ib_cursor_free_parts(&cursor);
+	free(connection);
+}
+
+static void test_catalog_metadata_respects_connection_charset(void)
+{
+	static const unsigned char relation[] = {0x8e};
+	static const unsigned char field[] = {0x8a};
+	ib_connection *connection;
+	ib_cursor cursor = {0};
+	char *error = NULL;
+
+	reset_mocks();
+	describe_user_charset_identifier = 1;
+	catalog_charset_identifier = 1;
+	connection = new_connection();
+	connection->charset = 51;
+	cursor.connection = connection;
+	cursor.transaction = &transaction_tokens[0];
+	cursor.output = ib_alloc_sqlda(1);
+	check(cursor.output != NULL, "charset catalog metadata output allocation failed");
+	if (cursor.output == NULL) {
+		free(connection);
+		return;
+	}
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_LONG | 1;
+	cursor.output->sqlvar[0].sqllen = (short) sizeof(ISC_LONG);
+	memcpy(cursor.output->sqlvar[0].relname, relation, sizeof(relation));
+	cursor.output->sqlvar[0].relname_length = (short) sizeof(relation);
+	memcpy(cursor.output->sqlvar[0].sqlname, field, sizeof(field));
+	cursor.output->sqlvar[0].sqlname_length = (short) sizeof(field);
+
+	check(ib_cursor_describe_metadata(&cursor, &error) == 0 && error == NULL,
+		"charset catalog metadata lookup failed");
+	check(cursor.column_names != NULL &&
+		strcmp(cursor.column_names[0], "\xc5\xa0") == 0,
+		"catalog metadata did not decode the connection-charset column name");
+	check(catalog_lookup_bytes_ok,
+		"catalog metadata did not retain raw connection-charset lookup bytes");
+	check(cursor.metadata != NULL && cursor.metadata[0].sql_precision == 9,
+		"charset catalog metadata lookup did not apply the matching field");
+	ib_error_free(error);
+	ib_cursor_free_parts(&cursor);
 	free(connection);
 }
 
@@ -727,7 +840,7 @@ static void test_procedure_commit_failure_rolls_back_live_handle(void)
 	cursor->transaction = &transaction_tokens[0];
 	cursor->owns_transaction = 1;
 	cursor->procedure = 1;
-	connection->active_cursor = cursor;
+	ib_cursor_register(cursor);
 	fail_commit = 1;
 	fail_rollback = 1;
 	result = ib_cursor_close(cursor, &error);
@@ -773,8 +886,8 @@ static void test_direct_procedure_transition_failures_free_query(void)
 		connection = new_connection();
 		bindings = new_integer_binding((int64_t) index + 1);
 		cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
-			bindings, &error);
-		check(cursor == NULL && error != NULL && connection->active_cursor == NULL,
+			bindings, 0, &error);
+		check(cursor == NULL && error != NULL && connection->cursors == NULL,
 			cases[index].name);
 		ib_error_free(error);
 		ib_bindings_free(bindings);
@@ -797,7 +910,7 @@ static void test_procedure_transition_drop_failure_retires_connection(void)
 	connection = new_connection();
 	bindings = new_integer_binding(9);
 	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
-		bindings, &error);
+		bindings, 0, &error);
 	check(cursor == NULL && error != NULL && rollback_calls == 1 &&
 		failed_drop_left_handle && connection->broken,
 		"procedure transition drop failure did not retire the connection");
@@ -810,7 +923,7 @@ static void test_procedure_transition_drop_failure_retires_connection(void)
 	error = NULL;
 	bindings = new_integer_binding(10);
 	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
-		bindings, &error);
+		bindings, 0, &error);
 	check(cursor == NULL && error != NULL && prepare_calls == prepare_count &&
 		execute2_calls == 0,
 		"broken connection reused a live procedure transition handle");
@@ -841,7 +954,7 @@ static void test_catalog_drop_failure_stops_user_execution(void)
 		return;
 	}
 	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
-		bindings, &error);
+		bindings, 0, &error);
 	check(catalog_drop_calls == 1 && catalog_drop_left_handle,
 		"catalog drop fault injection did not leave its handle live");
 	check(cursor == NULL, "catalog drop failure returned a user cursor");
@@ -868,16 +981,37 @@ ISC_STATUS ISC_EXPORT test_dsql_fetch(ISC_STATUS *status,
 		}
 		if (catalog_fetch_rows_remaining > 0) {
 			catalog_fetch_rows_remaining--;
-			set_catalog_text(&output->sqlvar[0], "T");
-			set_catalog_text(&output->sqlvar[1], "ID");
-			set_catalog_integer(&output->sqlvar[2], 8);
-			set_catalog_integer(&output->sqlvar[3], 0);
-			set_catalog_integer(&output->sqlvar[4], (ISC_LONG) sizeof(ISC_LONG));
-			set_catalog_integer(&output->sqlvar[5], 0);
-			set_catalog_null(&output->sqlvar[6]);
-			set_catalog_null(&output->sqlvar[7]);
-			set_catalog_null(&output->sqlvar[8]);
-			set_catalog_integer(&output->sqlvar[9], 1);
+			if (procedure_catalog_statement) {
+				set_catalog_text(&output->sqlvar[0], "P");
+				set_catalog_text(&output->sqlvar[1], "OUT");
+				set_catalog_integer(&output->sqlvar[2], 16);
+				set_catalog_integer(&output->sqlvar[3], 1);
+				set_catalog_integer(&output->sqlvar[4], procedure_catalog_scale);
+				set_catalog_integer(&output->sqlvar[5], procedure_catalog_precision);
+				set_catalog_null(&output->sqlvar[6]);
+			} else {
+				if (catalog_charset_identifier) {
+					static const unsigned char relation[] = {0x8e};
+					static const unsigned char field[] = {0x8a};
+					set_catalog_bytes(&output->sqlvar[0], relation, sizeof(relation));
+					set_catalog_bytes(&output->sqlvar[1], field, sizeof(field));
+				} else {
+					set_catalog_text(&output->sqlvar[0], "T");
+					set_catalog_text(&output->sqlvar[1], "ID");
+				}
+				set_catalog_integer(&output->sqlvar[2], 8);
+				set_catalog_integer(&output->sqlvar[3], 0);
+				set_catalog_integer(&output->sqlvar[4], (ISC_LONG) sizeof(ISC_LONG));
+				set_catalog_integer(&output->sqlvar[5], 0);
+				if (catalog_charset_identifier) {
+					set_catalog_integer(&output->sqlvar[6], 9);
+				} else {
+					set_catalog_null(&output->sqlvar[6]);
+				}
+				set_catalog_null(&output->sqlvar[7]);
+				set_catalog_null(&output->sqlvar[8]);
+				set_catalog_integer(&output->sqlvar[9], 1);
+			}
 			return status_result(status, 0);
 		}
 		return status_result(status, 0) == 0 ? 100 : -1;
@@ -915,10 +1049,12 @@ ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 	if (option == DSQL_close) {
 		check(execute2_open, "cursor cleanup must close an open prepared SELECT");
 		close_calls++;
-		execute2_open = 0;
+		if (open_selects > 0) {
+			open_selects--;
+		}
+		execute2_open = open_selects != 0;
 	} else {
 		check(option == DSQL_drop, "statement cleanup must drop the prepared handle");
-		check(!execute2_open, "statement cleanup dropped an open prepared SELECT");
 		free_statement_calls++;
 		if (fail_drop) {
 			failed_drop_left_handle = *statement != NULL;
@@ -1143,6 +1279,291 @@ static void test_query_cursor_does_not_drop_statement(void)
 	free(connection);
 }
 
+static void test_descriptor_aliases_are_exposed_as_utf8(void)
+{
+	static const char query[] = "SELECT ID AS ALIAS FROM T";
+	static const char want[] = "P\xc5\x99\xc3\xadli\xc5\xa1";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	const char *name;
+	size_t name_length;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_alias = 1;
+	connection = new_connection();
+	connection->charset = 51;
+	statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(statement != NULL && error == NULL, "WIN1250 alias statement preparation failed");
+	ib_error_free(error);
+	error = NULL;
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+
+	bindings = new_integer_binding(1);
+	check(bindings != NULL && error == NULL, "WIN1250 alias bindings allocation failed");
+	ib_error_free(error);
+	error = NULL;
+	cursor = bindings == NULL ? NULL : ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL, "WIN1250 alias query failed");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		name = ib_cursor_column_name(cursor, 0U, &name_length);
+		check(name != NULL && name_length == sizeof(want) - 1U &&
+			memcmp(name, want, name_length) == 0,
+			"WIN1250 descriptor alias was not converted to UTF-8");
+		error = NULL;
+		(void) ib_cursor_close(cursor, &error);
+		ib_error_free(error);
+	}
+	error = NULL;
+	(void) ib_statement_close(statement, &error);
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_procedure_descriptor_without_source_remains_unknown(void)
+{
+	static const char query[] = "EXECUTE PROCEDURE P(?)";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	ib_column_metadata metadata;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	describe_procedure_decimal = 1;
+	connection = new_connection();
+	statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"procedure precision statement preparation failed");
+	ib_error_free(error);
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	error = NULL;
+	bindings = new_integer_binding(1);
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL, "procedure precision query failed");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_column_metadata(cursor, 0U, &metadata, &error) == 0 &&
+			error == NULL && metadata.sql_type == IB_METADATA_BIGINT &&
+			metadata.sql_subtype == 1 && metadata.sql_scale == -2 &&
+			metadata.sql_precision == 18 && metadata.precision == 0 &&
+			metadata.scale == 0 && metadata.has_precision_scale == 0,
+			"procedure descriptor without a source was treated as declared metadata");
+		ib_error_free(error);
+		error = NULL;
+		(void) ib_cursor_close(cursor, &error);
+		ib_error_free(error);
+	}
+	error = NULL;
+	(void) ib_statement_close(statement, &error);
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_broken_close_aborts_pending_procedure_sibling(void)
+{
+	static const char procedure_query[] = "EXECUTE PROCEDURE P(?)";
+	static const char select_query[] = "SELECT ID FROM T WHERE ID = ?";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+	int commit_before_failure;
+	int rollback_before_failure;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	procedure_output_count = 1;
+	connection = new_connection();
+	statement = ib_statement_prepare(connection, procedure_query,
+		sizeof(procedure_query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"pending procedure statement preparation failed");
+	ib_error_free(error);
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+
+	bindings = new_integer_binding(1);
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL,
+		"pending procedure query failed");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor == NULL) {
+		error = NULL;
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+	commit_before_failure = commit_calls;
+	rollback_before_failure = rollback_calls;
+
+	statement_type = isc_info_sql_stmt_select;
+	fail_start_on_call = start_calls + 1;
+	bindings = new_integer_binding(2);
+	error = NULL;
+	check(ib_connection_query(connection, select_query, sizeof(select_query) - 1U,
+			bindings, 0, &error) == NULL && error != NULL && connection->broken,
+		"sibling transaction-start failure did not invalidate the connection");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+
+	error = NULL;
+	check(ib_connection_close(connection, &error) == 0 && error == NULL,
+		"broken connection cleanup failed");
+	check(commit_calls == commit_before_failure &&
+		rollback_calls == rollback_before_failure + 2,
+		"broken connection cleanup committed a pending procedure sibling");
+	ib_error_free(error);
+}
+
+static void test_cursor_close_failure_aborts_later_procedure_sibling(void)
+{
+	static const char procedure_query[] = "EXECUTE PROCEDURE P(?)";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *procedure_cursor;
+	ib_cursor *failing_cursor;
+	char *error = NULL;
+	int commit_before_failure;
+	int rollback_before_failure;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	procedure_output_count = 1;
+	connection = new_connection();
+	statement = ib_statement_prepare(connection, procedure_query,
+		sizeof(procedure_query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"cursor-close sibling procedure preparation failed");
+	ib_error_free(error);
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+
+	bindings = new_integer_binding(1);
+	procedure_cursor = ib_statement_query(statement, bindings, &error);
+	check(procedure_cursor != NULL && error == NULL,
+		"cursor-close sibling procedure query failed");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (procedure_cursor == NULL) {
+		error = NULL;
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+
+	/* Register a cursor that fails first. Cleanup marks the connection broken;
+	 * the later procedure must then roll back rather than commit. */
+	failing_cursor = (ib_cursor *) calloc(1U, sizeof(*failing_cursor));
+	check(failing_cursor != NULL, "cursor-close sibling failure cursor allocation failed");
+	if (failing_cursor == NULL) {
+		error = NULL;
+		(void) ib_cursor_close(procedure_cursor, &error);
+		ib_error_free(error);
+		error = NULL;
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+	failing_cursor->connection = connection;
+	failing_cursor->transaction = &transaction_tokens[5];
+	failing_cursor->owns_transaction = 1;
+	ib_cursor_register(failing_cursor);
+
+	commit_before_failure = commit_calls;
+	rollback_before_failure = rollback_calls;
+	fail_rollback = 1;
+	error = NULL;
+	check(ib_close_all_cursors(connection, &error, 1) != 0 &&
+		connection->broken,
+		"cursor-close sibling failure did not invalidate the connection");
+	ib_error_free(error);
+	check(commit_calls == commit_before_failure &&
+		rollback_calls == rollback_before_failure + 2,
+		"cursor-close failure committed a later procedure sibling");
+
+	fail_rollback = 0;
+	error = NULL;
+	check(ib_connection_close(connection, &error) == 0 && error == NULL,
+		"cursor-close sibling failure cleanup failed");
+	ib_error_free(error);
+}
+
+static void test_procedure_catalog_precision_overrides_sqlda(void)
+{
+	static const char query[] = "EXECUTE PROCEDURE P(?)";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	ib_column_metadata metadata;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_exec_procedure;
+	describe_procedure_decimal = 1;
+	describe_procedure_source = 1;
+	procedure_catalog_precision = 4;
+	procedure_catalog_scale = -2;
+	connection = new_connection();
+	statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"procedure catalog precision statement preparation failed");
+	ib_error_free(error);
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+
+	bindings = new_integer_binding(1);
+	error = NULL;
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL, "procedure catalog precision query failed");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_column_metadata(cursor, 0U, &metadata, &error) == 0 &&
+			error == NULL && metadata.sql_precision == 4 && metadata.precision == 4 &&
+			metadata.sql_scale == -2 && metadata.scale == -2 &&
+			metadata.has_precision_scale != 0,
+			"procedure catalog metadata did not override the reserved SQLDA precision");
+		ib_error_free(error);
+		error = NULL;
+		(void) ib_cursor_close(cursor, &error);
+		ib_error_free(error);
+	}
+	error = NULL;
+	(void) ib_statement_close(statement, &error);
+	ib_error_free(error);
+	free(connection);
+}
+
 static void test_explicit_transaction_is_not_cursor_owned(void)
 {
 	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
@@ -1183,6 +1604,195 @@ static void test_explicit_transaction_is_not_cursor_owned(void)
 	error = NULL;
 	check(ib_statement_close(statement, &error) == 0 && error == NULL,
 		"explicit transaction statement close failed");
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_cursors_do_not_use_a_connection_global_lock(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+	static const char write_query[] = "INSERT INTO T (ID) VALUES (?)";
+	ib_connection *connection;
+	ib_statement *first_statement;
+	ib_statement *second_statement;
+	ib_statement *write_statement;
+	ib_bindings *bindings;
+	ib_cursor *first_cursor;
+	ib_cursor *second_cursor;
+	ib_cursor *rejected_cursor;
+	char *error = NULL;
+	int64_t affected;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	connection = new_connection();
+	first_statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(first_statement != NULL && error == NULL,
+		"first cursor-lock statement preparation failed");
+	ib_error_free(error);
+	if (first_statement == NULL) {
+		free(connection);
+		return;
+	}
+	error = NULL;
+	second_statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(second_statement != NULL && error == NULL,
+		"second cursor-lock statement preparation failed");
+	ib_error_free(error);
+	if (second_statement == NULL) {
+		error = NULL;
+		(void) ib_statement_close(first_statement, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+
+	bindings = new_integer_binding(1);
+	first_cursor = ib_statement_query(first_statement, bindings, &error);
+	check(first_cursor != NULL && error == NULL,
+		"first prepared cursor failed");
+	ib_error_free(error);
+	error = NULL;
+	ib_bindings_free(bindings);
+	if (first_cursor == NULL) {
+		error = NULL;
+		(void) ib_statement_close(second_statement, &error);
+		ib_error_free(error);
+		error = NULL;
+		(void) ib_statement_close(first_statement, &error);
+		ib_error_free(error);
+		free(connection);
+		return;
+	}
+
+	bindings = new_integer_binding(2);
+	second_cursor = ib_statement_query(second_statement, bindings, &error);
+	check(second_cursor != NULL && error == NULL && open_selects == 2,
+		"second prepared cursor was blocked by another cursor");
+	ib_error_free(error);
+	error = NULL;
+	ib_bindings_free(bindings);
+
+	bindings = new_integer_binding(3);
+	error = NULL;
+	rejected_cursor = ib_statement_query(first_statement, bindings, &error);
+	check(rejected_cursor == NULL && error != NULL,
+		"one prepared statement allowed two active executions");
+	ib_error_free(error);
+	error = NULL;
+	ib_bindings_free(bindings);
+
+	statement_type = isc_info_sql_stmt_insert;
+	write_statement = ib_statement_prepare(connection, write_query,
+		sizeof(write_query) - 1U, &error);
+	check(write_statement != NULL && error == NULL,
+		"write statement preparation with active cursors failed");
+	ib_error_free(error);
+	error = NULL;
+	if (write_statement != NULL) {
+		bindings = new_integer_binding(4);
+		error = NULL;
+		check(ib_statement_exec(write_statement, bindings, &affected, &error) == 0 &&
+			error == NULL && affected == 1,
+			"write execution was blocked by active cursors");
+		ib_error_free(error);
+		ib_bindings_free(bindings);
+		error = NULL;
+		(void) ib_statement_close(write_statement, &error);
+		ib_error_free(error);
+	}
+
+	if (first_cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_close(first_cursor, &error) == 0 && error == NULL,
+			"first prepared cursor close failed");
+		ib_error_free(error);
+	}
+	if (second_cursor != NULL) {
+		error = NULL;
+		check(ib_cursor_next(second_cursor, &error) == 1 && error == NULL,
+			"second prepared cursor was invalidated by first cursor close");
+		ib_error_free(error);
+		error = NULL;
+		check(ib_cursor_close(second_cursor, &error) == 0 && error == NULL,
+			"second prepared cursor close failed");
+		ib_error_free(error);
+	}
+	check(open_selects == 0, "prepared cursor close leaked an open server cursor");
+	error = NULL;
+	(void) ib_statement_close(second_statement, &error);
+	ib_error_free(error);
+	error = NULL;
+	(void) ib_statement_close(first_statement, &error);
+	ib_error_free(error);
+	free(connection);
+}
+
+static void test_select_for_update_requires_explicit_writable_transaction(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ? WITH LOCK";
+	ib_connection *connection;
+	ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select_for_upd;
+	connection = new_connection();
+	bindings = new_integer_binding(1);
+	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
+		bindings, 0, &error);
+	check(cursor == NULL && error != NULL && execute2_calls == 0 &&
+		start_calls == 1 && rollback_calls == 1 && connection->cursors == NULL,
+		"direct SELECT FOR UPDATE was not rejected without an explicit writable transaction");
+	ib_error_free(error);
+	error = NULL;
+	ib_bindings_free(bindings);
+	free(connection);
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select_for_upd;
+	connection = new_connection();
+	connection->transaction = &transaction_tokens[0];
+	connection->transaction_read_only = 1;
+	bindings = new_integer_binding(2);
+	cursor = ib_connection_query(connection, query, sizeof(query) - 1U,
+		bindings, 0, &error);
+	check(cursor == NULL && error != NULL && execute2_calls == 0 &&
+		start_calls == 0 && connection->cursors == NULL,
+		"direct SELECT FOR UPDATE was not rejected in a read-only transaction");
+	ib_error_free(error);
+	error = NULL;
+	ib_bindings_free(bindings);
+	free(connection);
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select_for_upd;
+	connection = new_connection();
+	connection->transaction = &transaction_tokens[0];
+	statement = ib_statement_prepare(connection, query, sizeof(query) - 1U, &error);
+	check(statement != NULL && error == NULL,
+		"SELECT FOR UPDATE prepared statement preparation failed");
+	ib_error_free(error);
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	bindings = new_integer_binding(3);
+	error = NULL;
+	cursor = ib_statement_query(statement, bindings, &error);
+	check(cursor != NULL && error == NULL && execute2_calls == 1,
+		"SELECT FOR UPDATE was rejected in an explicit writable transaction");
+	ib_error_free(error);
+	ib_bindings_free(bindings);
+	if (cursor != NULL) {
+		error = NULL;
+		(void) ib_cursor_close(cursor, &error);
+		ib_error_free(error);
+	}
+	error = NULL;
+	(void) ib_statement_close(statement, &error);
 	ib_error_free(error);
 	free(connection);
 }
@@ -1239,7 +1849,7 @@ static void test_savepoint_remains_executable(void)
 	connection = new_connection();
 	bindings = new_integer_binding(1);
 	check(ib_connection_exec(connection, query, sizeof(query) - 1U, bindings,
-		&affected, &error) == 0 && error == NULL && execute_calls == 1 &&
+		&affected, 0, &error) == 0 && error == NULL && execute_calls == 1 &&
 		start_calls == 1 && commit_calls == 1,
 		"SAVEPOINT was incorrectly classified as transaction control");
 	ib_error_free(error);
@@ -1269,7 +1879,7 @@ static void test_transaction_completion_closes_active_prepared_cursor(void)
 	}
 	bindings = new_integer_binding(5);
 	cursor = ib_statement_query(statement, bindings, &error);
-	check(cursor != NULL && error == NULL && connection->active_cursor == cursor,
+	check(cursor != NULL && error == NULL && statement->active_cursor == cursor,
 		"active prepared cursor was not registered on the connection");
 	ib_error_free(error);
 	ib_bindings_free(bindings);
@@ -1277,7 +1887,8 @@ static void test_transaction_completion_closes_active_prepared_cursor(void)
 	check(ib_connection_commit(connection, &error) == 0 && error == NULL,
 		"transaction completion with active prepared cursor failed");
 	ib_error_free(error);
-	check(connection->active_cursor == NULL && free_statement_calls == 0 &&
+	check(connection->cursors == NULL && statement->active_cursor == NULL &&
+		free_statement_calls == 0 &&
 		rollback_calls == 0 && commit_calls == 1,
 		"transaction completion dropped the statement or rolled back a borrowed transaction");
 	error = NULL;
@@ -1315,6 +1926,7 @@ int main(void)
 	test_executable_procedure_exec_contracts();
 	test_executable_procedure_failure_and_abort_rollback();
 	test_catalog_metadata_cleanup_drops_owned_statement();
+	test_catalog_metadata_respects_connection_charset();
 	test_procedure_commit_failure_rolls_back_live_handle();
 	test_direct_procedure_transition_failures_free_query();
 	test_procedure_transition_drop_failure_retires_connection();
@@ -1324,7 +1936,14 @@ int main(void)
 	test_prepare_failure_releases_handle_and_transaction();
 	test_failed_prepare_rollback_marks_connection_broken();
 	test_query_cursor_does_not_drop_statement();
+	test_descriptor_aliases_are_exposed_as_utf8();
+	test_procedure_descriptor_without_source_remains_unknown();
+	test_broken_close_aborts_pending_procedure_sibling();
+	test_cursor_close_failure_aborts_later_procedure_sibling();
+	test_procedure_catalog_precision_overrides_sqlda();
 	test_explicit_transaction_is_not_cursor_owned();
+	test_cursors_do_not_use_a_connection_global_lock();
+	test_select_for_update_requires_explicit_writable_transaction();
 	test_transaction_control_is_rejected_before_execution();
 	test_savepoint_remains_executable();
 	test_transaction_completion_closes_active_prepared_cursor();

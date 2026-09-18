@@ -29,6 +29,12 @@ readonly READINESS_COMMAND_TIMEOUT='15s'
 readonly COMMAND_TIMEOUT='30s'
 readonly REQUESTED_TEST_TIMEOUT='10m'
 readonly REQUESTED_COMMAND_TIMEOUT='11m'
+readonly REQUESTED_TEST_TIMEOUT_SECONDS=600
+readonly REQUESTED_COMMAND_GRACE_SECONDS=60
+readonly SOAK_SETUP_GRACE_SECONDS=60
+readonly SOAK_DEFAULT_RUNTIME_SECONDS=15
+readonly SOAK_MAX_DURATION_SECONDS=86400
+readonly SOAK_MAX_WORKERS=64
 readonly AUTH_FAILURE_REGEX='(335544472|SQLSTATE[[:space:]]*[:=][[:space:]]*28000|[Yy]our[[:space:]]+[Uu]ser[[:space:]]+name[[:space:]]+and[[:space:]]+[Pp]assword[[:space:]]+are[[:space:]]+not[[:space:]]+defined)'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -37,6 +43,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
 readonly REPO_ROOT
 
 IMAGE="${IMAGE:-}"
+INTERBASE_INCLUDE="${INTERBASE_INCLUDE:-}"
 DOCKER_BIN=''
 GO_BIN=''
 TEMP_PARENT=''
@@ -51,9 +58,31 @@ DOCKER_OUTPUT=''
 GO_OUTPUT=''
 ISQL_FILE=''
 LIB_FILE=''
+INTEGRATION_BIN=''
+SERVICES_BIN=''
 declare -a GO_ARGS=()
+declare -a GO_BUILD_ARGS=()
+declare -a GO_TEST_ARGS=()
 declare -a FULL_GO_ARGS=()
+declare -a TEST_ARGS=()
+declare -a REQUESTED_WORKLOAD_ENV_ARGS=()
 declare -a OWNED_FILES=()
+
+PERFORMANCE_ENABLED=0
+SOAK_ENABLED=0
+SOAK_DURATION=''
+SOAK_WORKERS=''
+SOAK_SAMPLE_INTERVAL=''
+NATIVE_LIFECYCLE_ENABLED=0
+EFFECTIVE_REQUESTED_TEST_TIMEOUT="${REQUESTED_TEST_TIMEOUT}"
+REQUESTED_COMMAND_DURATION="${REQUESTED_COMMAND_TIMEOUT}"
+SOAK_DURATION_SECONDS=0
+REQUESTED_GO_TIMEOUT_SECONDS=0
+REQUESTED_TIMEOUT_EXPLICIT=0
+REQUESTED_TIMEOUT_VALUE=''
+PARSED_DURATION_SECONDS=0
+PARSED_DURATION_NONZERO=0
+NORMALIZED_DECIMAL=''
 
 log_info() {
   printf '[%(%Y-%m-%dT%H:%M:%SZ)T] INFO %s\n' -1 "$*" >&2
@@ -75,12 +104,26 @@ usage() {
     '' \
     'Required environment:' \
     '  IMAGE         Existing local Docker image reference (never pulled).' \
+    '  INTERBASE_INCLUDE  Host directory containing the matching ibase.h.' \
     '' \
     'Runner options:' \
     '  -h, --help    Show this help.' \
+    '      --performance  Enable live benchmarks for the requested test command.' \
+    '      --soak  Enable the concurrent live soak workload.' \
+    '      --soak-duration=DURATION  Soak duration; positive integer duration using s, m, or h, max 24h.' \
+    '      --soak-workers=WORKERS  Soak workers; an integer between 1 and 64.' \
+    '      --soak-sample-interval=DURATION  Soak sample interval; positive integer duration using s, m, or h, max 24h.' \
+    '      --native-lifecycle  Enable the native lifecycle race for the requested test command.' \
     '      --        End runner options; pass the rest to go test.' \
     '' \
+    'Supported compiled-binary flag: -race.' \
+    'Runtime flags such as -run, -v, -benchmem, and -memprofilerate are translated' \
+    'to the -test.* form accepted by the compiled binary.' \
+    '' \
     'Defaults for the requested run are -count=1 -timeout=10m.' \
+    'For soak runs, the default Go timeout is extended past the soak duration' \
+    'with setup grace, and the external deadline adds another 60 seconds.' \
+    'An explicit -timeout shorter than the soak duration is rejected.' \
     'Example: IMAGE=sha256:... ./scripts/test-integration-docker.sh -run ^TestRead$' \
     '' \
     'Exit status is the Go test status; cleanup failure is returned when tests succeed.' \
@@ -101,6 +144,54 @@ parse_arguments() {
       -h | --help)
         usage 0
         ;;
+      --performance)
+        PERFORMANCE_ENABLED=1
+        shift
+        ;;
+      --performance=*)
+        die 2 '--performance does not accept a value'
+        ;;
+      --soak)
+        SOAK_ENABLED=1
+        shift
+        ;;
+      --soak=*)
+        die 2 '--soak does not accept a value'
+        ;;
+      --soak-duration=*)
+        SOAK_DURATION="${1#*=}"
+        shift
+        ;;
+      --soak-duration)
+        (($# >= 2)) || die 2 '--soak-duration requires a value'
+        SOAK_DURATION="$2"
+        shift 2
+        ;;
+      --soak-workers=*)
+        SOAK_WORKERS="${1#*=}"
+        shift
+        ;;
+      --soak-workers)
+        (($# >= 2)) || die 2 '--soak-workers requires a value'
+        SOAK_WORKERS="$2"
+        shift 2
+        ;;
+      --soak-sample-interval=*)
+        SOAK_SAMPLE_INTERVAL="${1#*=}"
+        shift
+        ;;
+      --soak-sample-interval)
+        (($# >= 2)) || die 2 '--soak-sample-interval requires a value'
+        SOAK_SAMPLE_INTERVAL="$2"
+        shift 2
+        ;;
+      --native-lifecycle)
+        NATIVE_LIFECYCLE_ENABLED=1
+        shift
+        ;;
+      --native-lifecycle=*)
+        die 2 '--native-lifecycle does not accept a value'
+        ;;
       --)
         shift
         GO_ARGS+=("$@")
@@ -112,7 +203,236 @@ parse_arguments() {
         ;;
     esac
   done
-  FULL_GO_ARGS=(-count=1 -timeout="${REQUESTED_TEST_TIMEOUT}" "${GO_ARGS[@]}")
+}
+
+split_go_arguments() {
+  GO_BUILD_ARGS=()
+  GO_TEST_ARGS=()
+  while (($# > 0)); do
+    case "$1" in
+      -race)
+        GO_BUILD_ARGS+=("$1")
+        ;;
+      *)
+        GO_TEST_ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+}
+
+normalize_decimal() {
+  local value="$1"
+  while [[ "${#value}" -gt 1 && "${value:0:1}" == 0 ]]; do
+    value="${value:1}"
+  done
+  NORMALIZED_DECIMAL="${value}"
+}
+
+parse_duration_seconds() {
+  local option_name="$1"
+  local value="$2"
+  local amount=''
+  local unit=''
+  local maximum=0
+  local factor=0
+
+  if [[ ! "${value}" =~ ^([0-9]+)(s|m|h)$ ]]; then
+    die 2 "${option_name} must be a positive integer duration using s, m, or h (max 24h)"
+  fi
+  amount="${BASH_REMATCH[1]}"
+  unit="${BASH_REMATCH[2]}"
+  normalize_decimal "${amount}"
+  amount="${NORMALIZED_DECIMAL}"
+
+  case "${unit}" in
+    s)
+      maximum="${SOAK_MAX_DURATION_SECONDS}"
+      factor=1
+      ;;
+    m)
+      maximum=$((SOAK_MAX_DURATION_SECONDS / 60))
+      factor=60
+      ;;
+    h)
+      maximum=$((SOAK_MAX_DURATION_SECONDS / 3600))
+      factor=3600
+      ;;
+    *)
+      die 2 "${option_name} must be a positive integer duration using s, m, or h (max 24h)"
+      ;;
+  esac
+  if [[ "${amount}" == 0 || ${#amount} -gt ${#maximum} ]] || ((10#${amount} > maximum)); then
+    die 2 "${option_name} must be a positive integer duration using s, m, or h (max 24h)"
+  fi
+  PARSED_DURATION_SECONDS=$((10#${amount} * factor))
+}
+
+parse_worker_count() {
+  local value="$1"
+
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    die 2 '--soak-workers must be an integer between 1 and 64'
+  fi
+  normalize_decimal "${value}"
+  value="${NORMALIZED_DECIMAL}"
+  if [[ "${value}" == 0 || ${#value} -gt 2 ]] || ((10#${value} > SOAK_MAX_WORKERS)); then
+    die 2 '--soak-workers must be an integer between 1 and 64'
+  fi
+}
+
+parse_go_timeout_seconds() {
+  local value="$1"
+  local remainder="${value}"
+  local amount=''
+  local unit=''
+  local factor=0
+  local total=0
+  local subsecond_nanos=0
+
+  if [[ "${value}" == 0 ]]; then
+    PARSED_DURATION_SECONDS=0
+    PARSED_DURATION_NONZERO=0
+    return 0
+  fi
+  PARSED_DURATION_NONZERO=0
+  while [[ -n "${remainder}" ]]; do
+    if [[ ! "${remainder}" =~ ^([0-9]+)(ns|us|µs|ms|h|m|s)(.*)$ ]]; then
+      return 1
+    fi
+    amount="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    remainder="${BASH_REMATCH[3]}"
+    normalize_decimal "${amount}"
+    amount="${NORMALIZED_DECIMAL}"
+    if [[ "${amount}" != 0 ]]; then
+      PARSED_DURATION_NONZERO=1
+    fi
+    if [[ ${#amount} -gt 12 ]]; then
+      return 1
+    fi
+    case "${unit}" in
+      s) factor=1 ;;
+      m) factor=60 ;;
+      h) factor=3600 ;;
+      ns) subsecond_nanos=$((subsecond_nanos + 10#${amount})) ;;
+      us | µs) subsecond_nanos=$((subsecond_nanos + 10#${amount} * 1000)) ;;
+      ms) subsecond_nanos=$((subsecond_nanos + 10#${amount} * 1000000)) ;;
+      *) return 1 ;;
+    esac
+    if [[ "${unit}" == h || "${unit}" == m || "${unit}" == s ]]; then
+      total=$((total + 10#${amount} * factor))
+    fi
+  done
+  PARSED_DURATION_SECONDS=$((total + subsecond_nanos / 1000000000))
+}
+
+find_requested_timeout() {
+  local index=0
+  local argument=''
+
+  REQUESTED_TIMEOUT_EXPLICIT=0
+  REQUESTED_TIMEOUT_VALUE=''
+  while ((index < ${#GO_TEST_ARGS[@]})); do
+    argument="${GO_TEST_ARGS[index]}"
+    case "${argument}" in
+      -timeout=* | -test.timeout=*)
+        REQUESTED_TIMEOUT_EXPLICIT=1
+        REQUESTED_TIMEOUT_VALUE="${argument#*=}"
+        index=$((index + 1))
+        ;;
+      -timeout | -test.timeout)
+        ((index + 1 < ${#GO_TEST_ARGS[@]})) || die 2 "${argument} requires a duration value"
+        REQUESTED_TIMEOUT_EXPLICIT=1
+        REQUESTED_TIMEOUT_VALUE="${GO_TEST_ARGS[index + 1]}"
+        index=$((index + 2))
+        ;;
+      *)
+        index=$((index + 1))
+        ;;
+    esac
+  done
+}
+
+validate_workload_options() {
+  if ((SOAK_ENABLED == 0)) && [[ -n "${SOAK_DURATION}" || -n "${SOAK_WORKERS}" || -n "${SOAK_SAMPLE_INTERVAL}" ]]; then
+    die 2 '--soak-duration, --soak-workers, and --soak-sample-interval require --soak'
+  fi
+  if ((SOAK_ENABLED == 0)); then
+    return 0
+  fi
+
+  SOAK_DURATION_SECONDS="${SOAK_DEFAULT_RUNTIME_SECONDS}"
+  if [[ -n "${SOAK_DURATION}" ]]; then
+    parse_duration_seconds '--soak-duration' "${SOAK_DURATION}"
+    SOAK_DURATION_SECONDS="${PARSED_DURATION_SECONDS}"
+  fi
+  if [[ -n "${SOAK_SAMPLE_INTERVAL}" ]]; then
+    parse_duration_seconds '--soak-sample-interval' "${SOAK_SAMPLE_INTERVAL}"
+  fi
+  if [[ -n "${SOAK_WORKERS}" ]]; then
+    parse_worker_count "${SOAK_WORKERS}"
+  fi
+}
+
+configure_requested_deadlines() {
+  local minimum_go_timeout_seconds=0
+  local minimum_command_seconds=0
+
+  EFFECTIVE_REQUESTED_TEST_TIMEOUT="${REQUESTED_TEST_TIMEOUT}"
+  REQUESTED_COMMAND_DURATION="${REQUESTED_COMMAND_TIMEOUT}"
+  REQUESTED_GO_TIMEOUT_SECONDS="${REQUESTED_TEST_TIMEOUT_SECONDS}"
+  find_requested_timeout
+
+  if ((SOAK_ENABLED == 1)); then
+    minimum_go_timeout_seconds=$((SOAK_DURATION_SECONDS + SOAK_SETUP_GRACE_SECONDS))
+    minimum_command_seconds=$((minimum_go_timeout_seconds + REQUESTED_COMMAND_GRACE_SECONDS))
+    if ((REQUESTED_TIMEOUT_EXPLICIT == 1)); then
+      EFFECTIVE_REQUESTED_TEST_TIMEOUT="${REQUESTED_TIMEOUT_VALUE}"
+      if parse_go_timeout_seconds "${REQUESTED_TIMEOUT_VALUE}"; then
+        REQUESTED_GO_TIMEOUT_SECONDS="${PARSED_DURATION_SECONDS}"
+        if ((PARSED_DURATION_NONZERO == 1 && REQUESTED_GO_TIMEOUT_SECONDS < SOAK_DURATION_SECONDS)); then
+          die 2 "-timeout must not be shorter than the soak duration (${SOAK_DURATION_SECONDS}s)"
+        fi
+        if ((REQUESTED_GO_TIMEOUT_SECONDS > 0)); then
+          minimum_command_seconds=$((REQUESTED_GO_TIMEOUT_SECONDS + REQUESTED_COMMAND_GRACE_SECONDS))
+        fi
+      else
+        die 2 '-timeout must use an integer-unit Go duration (s, m, or h) for soak runs'
+      fi
+    elif ((minimum_go_timeout_seconds > REQUESTED_TEST_TIMEOUT_SECONDS)); then
+      EFFECTIVE_REQUESTED_TEST_TIMEOUT="${minimum_go_timeout_seconds}s"
+      REQUESTED_GO_TIMEOUT_SECONDS="${minimum_go_timeout_seconds}"
+    fi
+    if ((minimum_command_seconds < SOAK_DURATION_SECONDS + SOAK_SETUP_GRACE_SECONDS + REQUESTED_COMMAND_GRACE_SECONDS)); then
+      minimum_command_seconds=$((SOAK_DURATION_SECONDS + SOAK_SETUP_GRACE_SECONDS + REQUESTED_COMMAND_GRACE_SECONDS))
+    fi
+    REQUESTED_COMMAND_DURATION="${minimum_command_seconds}s"
+  fi
+
+  FULL_GO_ARGS=(-count=1 -timeout="${EFFECTIVE_REQUESTED_TEST_TIMEOUT}" "${GO_TEST_ARGS[@]}")
+}
+
+build_requested_workload_environment() {
+  REQUESTED_WORKLOAD_ENV_ARGS=()
+  if ((PERFORMANCE_ENABLED == 1)); then
+    REQUESTED_WORKLOAD_ENV_ARGS+=(--env 'INTERBASE_PERF=1')
+  fi
+  if ((SOAK_ENABLED == 1)); then
+    REQUESTED_WORKLOAD_ENV_ARGS+=(--env 'INTERBASE_SOAK=1')
+    if [[ -n "${SOAK_DURATION}" ]]; then
+      REQUESTED_WORKLOAD_ENV_ARGS+=(--env "INTERBASE_SOAK_DURATION=${SOAK_DURATION}")
+    fi
+    if [[ -n "${SOAK_WORKERS}" ]]; then
+      REQUESTED_WORKLOAD_ENV_ARGS+=(--env "INTERBASE_SOAK_WORKERS=${SOAK_WORKERS}")
+    fi
+    if [[ -n "${SOAK_SAMPLE_INTERVAL}" ]]; then
+      REQUESTED_WORKLOAD_ENV_ARGS+=(--env "INTERBASE_SOAK_SAMPLE_INTERVAL=${SOAK_SAMPLE_INTERVAL}")
+    fi
+  fi
+  if ((NATIVE_LIFECYCLE_ENABLED == 1)); then
+    REQUESTED_WORKLOAD_ENV_ARGS+=(--env 'INTERBASE_NATIVE_LIFECYCLE_RACE=1')
+  fi
 }
 
 require_command() {
@@ -126,8 +446,10 @@ scrub_operational_environment() {
   while IFS= read -r name; do
     case "${name}" in
       INTERBASE | INTERBASE_* | IB_* | ISC_*)
-        unset "${name}"
-        ;;
+        if [[ "${name}" != INTERBASE_INCLUDE ]]; then
+          unset "${name}"
+        fi
+      ;;
     esac
   done < <(compgen -e || true)
 }
@@ -138,6 +460,18 @@ validate_image() {
   fi
   if [[ ! "${IMAGE}" =~ ^[[:alnum:]][[:alnum:]_.:/@-]*$ ]]; then
     die 2 'IMAGE contains an invalid Docker image reference'
+  fi
+}
+
+validate_interbase_include() {
+  if [[ -z "${INTERBASE_INCLUDE}" ]]; then
+    die 2 'INTERBASE_INCLUDE is required and must contain the matching ibase.h'
+  fi
+  if [[ "${INTERBASE_INCLUDE}" != /* || "${INTERBASE_INCLUDE}" == *:* || "${INTERBASE_INCLUDE}" == *,* || "${INTERBASE_INCLUDE}" == *[[:cntrl:]]* ]]; then
+    die 2 'INTERBASE_INCLUDE must be an absolute local path without colons or commas or control characters'
+  fi
+  if [[ ! -d "${INTERBASE_INCLUDE}" || ! -f "${INTERBASE_INCLUDE}/ibase.h" || -L "${INTERBASE_INCLUDE}/ibase.h" ]]; then
+    die 2 'INTERBASE_INCLUDE must contain a regular ibase.h file'
   fi
 }
 
@@ -186,8 +520,10 @@ create_temp_root() {
   GO_OUTPUT="${TEST_ROOT}/go.output"
   ISQL_FILE="${TEST_ROOT}/isql"
   LIB_FILE="${TEST_ROOT}/libgds.so"
+  INTEGRATION_BIN="${TEST_ROOT}/integration.test"
+  SERVICES_BIN="${TEST_ROOT}/services.test"
   CONTAINER_NAME="interbase-go-test-${TEST_ROOT##*/}"
-  OWNED_FILES=("${CID_FILE}" "${ENV_FILE}" "${DOCKER_OUTPUT}" "${GO_OUTPUT}" "${ISQL_FILE}" "${LIB_FILE}")
+  OWNED_FILES=("${CID_FILE}" "${ENV_FILE}" "${DOCKER_OUTPUT}" "${GO_OUTPUT}" "${ISQL_FILE}" "${LIB_FILE}" "${INTEGRATION_BIN}" "${SERVICES_BIN}")
 }
 
 write_server_environment() {
@@ -283,6 +619,95 @@ copy_client_tools() {
   log_info 'copied matching client tools into the private temporary root'
 }
 
+quote_cgo_flag() {
+  local prefix="$1"
+  local path="$2"
+  if [[ "${path}" != *[[:space:]]* ]]; then
+    printf '%s%s' "${prefix}" "${path}"
+    return 0
+  fi
+  if [[ "${path}" == *"'"* ]]; then
+    [[ "${path}" != *'"'* ]] || return 2
+    printf '"%s%s"' "${prefix}" "${path}"
+  elif [[ "${path}" == *'"'* ]]; then
+    printf "'%s%s'" "${prefix}" "${path}"
+  else
+    printf '"%s%s"' "${prefix}" "${path}"
+  fi
+}
+
+build_test_binary() {
+  local output_file="$1"
+  local package_name="$2"
+  local quoted_include=''
+  local quoted_library=''
+  local quoted_rpath=''
+
+  quoted_include="$(quote_cgo_flag '-I' "${INTERBASE_INCLUDE}")"
+  quoted_library="$(quote_cgo_flag '-L' "${TEST_ROOT}")"
+  quoted_rpath="$(quote_cgo_flag '-Wl,-rpath,' "${TEST_ROOT}")"
+
+  log_info "building ${package_name} integration test binary on the host"
+  : >"${GO_OUTPUT}"
+  if ! (
+    scrub_operational_environment
+    unset GOFLAGS GOTOOLCHAIN CGO_ENABLED LD_LIBRARY_PATH LD_PRELOAD DYLD_INSERT_LIBRARIES
+    export CGO_ENABLED=1
+    export GOTOOLCHAIN=local
+    export CGO_CFLAGS="${quoted_include}${CGO_CFLAGS:+ ${CGO_CFLAGS}}"
+    export CGO_LDFLAGS="${quoted_library} ${quoted_rpath}${CGO_LDFLAGS:+ ${CGO_LDFLAGS}}"
+    exec timeout --signal=TERM --kill-after=5s "${COMMAND_TIMEOUT}" \
+      "${GO_BIN}" test -tags=integration "${GO_BUILD_ARGS[@]}" -c "${package_name}" -o "${output_file}"
+  ) >"${GO_OUTPUT}" 2>&1; then
+    print_sanitized_file "${GO_OUTPUT}" >&2
+    die 1 "could not build ${package_name} integration test binary"
+  fi
+  if [[ ! -f "${output_file}" || -L "${output_file}" || ! -x "${output_file}" ]]; then
+    die 1 "Go did not produce a regular executable for ${package_name}"
+  fi
+}
+
+build_test_binaries() {
+  build_test_binary "${INTEGRATION_BIN}" ./integration
+  build_test_binary "${SERVICES_BIN}" ./services
+}
+
+translate_test_arguments() {
+  TEST_ARGS=()
+  while (($# > 0)); do
+    case "$1" in
+      -test.*)
+        TEST_ARGS+=("$1")
+        ;;
+      -run=* | -count=* | -timeout=* | -bench=* | -benchtime=* | -cpu=* | -list=* | -shuffle=* | -skip=*)
+        TEST_ARGS+=("-test.${1#-}")
+        ;;
+      -blockprofile=* | -coverprofile=* | -memprofile=* | -memprofilerate=* | \
+      -mutexprofile=* | -outputdir=* | -trace=*)
+        TEST_ARGS+=("-test.${1#-}")
+        ;;
+      -benchmem=* | -failfast=* | -paniconexit0=* | -short=* | -v=*)
+        TEST_ARGS+=("-test.${1#-}")
+        ;;
+      -benchmem | -failfast | -paniconexit0 | -short | -v)
+        TEST_ARGS+=("-test.${1#-}")
+        ;;
+      -run | -count | -timeout | -bench | -benchtime | -cpu | -list | -shuffle | -skip | \
+      -blockprofile | -blockprofilerate | -coverprofile | -memprofile | -memprofilerate | \
+      -mutexprofile | -mutexprofilefraction | -outputdir | -trace)
+        local flag="$1"
+        shift
+        (($# > 0)) || return 2
+        TEST_ARGS+=("-test.${flag#-}" "$1")
+        ;;
+      *)
+        TEST_ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+}
+
 print_sanitized_file() {
   local file="$1"
   local line=''
@@ -298,28 +723,53 @@ run_go_test() {
   local output_file="$1"
   local password_kind="$2"
   local duration="$3"
+  local package_name="$4"
+  local include_workload_env="$5"
   local password=''
+  local test_binary=''
   local status=0
-  shift 3
+  shift 5
 
   case "${password_kind}" in
     correct) password="${SERVER_PASSWORD}" ;;
     wrong) password="${INVALID_PASSWORD}" ;;
     *) return 2 ;;
   esac
+  case "${package_name}" in
+    ./integration) test_binary="${INTEGRATION_BIN}" ;;
+    ./services) test_binary="${SERVICES_BIN}" ;;
+    *) die 2 "unsupported test package for the Docker runner: ${package_name}" ;;
+  esac
+  [[ -x "${test_binary}" ]] || die 1 "test binary is unavailable: ${test_binary}"
+  translate_test_arguments "$@" || die 2 'invalid Go test arguments for the Docker test binary'
   : >"${output_file}"
+
+  local -a docker_exec_args=(
+    --env LD_LIBRARY_PATH
+    --env TMPDIR
+    --env INTERBASE_TEST_ISQL
+    --env INTERBASE_TEST_SERVER
+    --env INTERBASE_TEST_USER
+    --env INTERBASE_TEST_PASSWORD
+    --env SERVICES_NATIVE_TRACE
+  )
+  if [[ "${include_workload_env}" == 1 ]]; then
+    docker_exec_args+=("${REQUESTED_WORKLOAD_ENV_ARGS[@]}")
+  elif [[ "${include_workload_env}" != 0 ]]; then
+    return 2
+  fi
 
   (
     scrub_operational_environment
     unset GOFLAGS GOTOOLCHAIN CGO_ENABLED LD_LIBRARY_PATH LD_PRELOAD DYLD_INSERT_LIBRARIES
-    export CGO_ENABLED=1
-    export GOTOOLCHAIN=local
     export LD_LIBRARY_PATH="${TEST_ROOT}:/opt/interbase/lib"
     export TMPDIR="${TEST_ROOT}"
     export INTERBASE_TEST_ISQL="${ISQL_FILE}"
+    export INTERBASE_TEST_SERVER='localhost/3050'
     export INTERBASE_TEST_USER="${SERVER_USER}"
     export INTERBASE_TEST_PASSWORD="${password}"
-    exec timeout --signal=TERM --kill-after=5s "${duration}" "${GO_BIN}" test -tags=integration ./integration "$@"
+    exec timeout --signal=TERM --kill-after=5s "${duration}" "${DOCKER_BIN}" exec \
+      "${docker_exec_args[@]}" "${CONTAINER_ID}" "${test_binary}" "${TEST_ARGS[@]}"
   ) >"${output_file}" 2>&1 &
   ACTIVE_PID=$!
   if wait "${ACTIVE_PID}"; then
@@ -347,7 +797,7 @@ run_readiness_checks() {
   while ((attempt < READINESS_MAX_ATTEMPTS && SECONDS < READINESS_DEADLINE_SECONDS)); do
     attempt=$((attempt + 1))
     log_info "checking fixture SQL readiness (attempt ${attempt}/${READINESS_MAX_ATTEMPTS})"
-    if run_go_test "${GO_OUTPUT}" correct "${READINESS_COMMAND_TIMEOUT}" -run '^TestReadFixtureSmoke$' -count=1 -timeout="${READINESS_TEST_TIMEOUT}"; then
+    if run_go_test "${GO_OUTPUT}" correct "${READINESS_COMMAND_TIMEOUT}" ./integration 0 -run '^TestReadFixtureSmoke$' -count=1 -timeout="${READINESS_TEST_TIMEOUT}"; then
       ready=1
       break
     else
@@ -365,7 +815,7 @@ run_readiness_checks() {
   fi
 
   log_info 'checking that an invalid password is rejected'
-  if run_go_test "${GO_OUTPUT}" wrong "${READINESS_COMMAND_TIMEOUT}" -run '^TestReadFixtureSmoke$' -count=1 -timeout="${READINESS_TEST_TIMEOUT}"; then
+  if run_go_test "${GO_OUTPUT}" wrong "${READINESS_COMMAND_TIMEOUT}" ./integration 0 -run '^TestReadFixtureSmoke$' -count=1 -timeout="${READINESS_TEST_TIMEOUT}"; then
     die 1 'invalid password was accepted by the isolated InterBase server'
   else
     wrong_status=$?
@@ -382,13 +832,24 @@ run_readiness_checks() {
 
 run_requested_tests() {
   local status=0
-  if run_go_test "${GO_OUTPUT}" correct "${REQUESTED_COMMAND_TIMEOUT}" "${FULL_GO_ARGS[@]}"; then
+  if run_go_test "${GO_OUTPUT}" correct "${REQUESTED_COMMAND_DURATION}" ./integration 1 "${FULL_GO_ARGS[@]}"; then
     status=0
   else
     status=$?
   fi
   print_sanitized_file "${GO_OUTPUT}"
   return "${status}"
+}
+
+run_native_service_frame_check() {
+  log_info 'checking native Services output framing'
+  if run_go_test "${GO_OUTPUT}" correct "${COMMAND_TIMEOUT}" ./services 0 \
+    -run '^TestNativeService(OutputUsesLengthDelimitedFrame|JobReturnsCleanOutputAndCanBeReused)$' \
+    -count=1 -timeout="${READINESS_TEST_TIMEOUT}"; then
+    return 0
+  fi
+  print_sanitized_file "${GO_OUTPUT}" >&2
+  die 1 'native Services output framing check failed'
 }
 
 cleanup_container() {
@@ -491,6 +952,10 @@ trap 'handle_signal 143' TERM
 
 main() {
   parse_arguments "$@"
+  split_go_arguments "${GO_ARGS[@]}"
+  validate_workload_options
+  configure_requested_deadlines
+  build_requested_workload_environment
   scrub_operational_environment
 
   require_command docker
@@ -504,6 +969,7 @@ main() {
   GO_BIN="$(command -v go)"
 
   validate_image
+  validate_interbase_include
   validate_temp_parent
   validate_local_image
   create_temp_root
@@ -513,7 +979,9 @@ main() {
   if ! cd -- "${REPO_ROOT}"; then
     die 1 "could not change directory to ${REPO_ROOT}"
   fi
+  build_test_binaries
   run_readiness_checks
+  run_native_service_frame_check
 
   log_info 'running the requested integration contracts'
   run_requested_tests

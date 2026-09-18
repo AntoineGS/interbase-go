@@ -216,6 +216,57 @@ FROM GO_DATA WHERE 1 = 0`)
 	finishReadRows(t, rows)
 }
 
+func TestMetadataRootCHARExpressionsReportDeclaredLength(t *testing.T) {
+	db := newDatabaseWithDialect(t, 3)
+	ctx := readContext(t)
+
+	rows, err := db.QueryContext(ctx, `
+SELECT /* comments are ignored */ CAST(UPPER('x') AS CHAR(3)) AS "R""ESULT",
+       CAST('y' AS CHARACTER(4)) AS SECOND_VALUE
+FROM RDB$DATABASE WHERE 1 = 0`)
+	if err != nil {
+		t.Fatalf("root CHAR metadata query: %v", err)
+	}
+	columns, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatalf("root CHAR ColumnTypes: %v", err)
+	}
+	want := []expectedColumnMetadata{
+		{name: `R"ESULT`, databaseType: "CHAR", scanType: reflect.TypeOf(""),
+			length: 3, hasLength: true},
+		{name: "SECOND_VALUE", databaseType: "CHAR", scanType: reflect.TypeOf(""),
+			length: 4, hasLength: true},
+	}
+	requireColumnMetadata(t, columns, want)
+	finishReadRows(t, rows)
+}
+
+func TestMetadataAmbiguousRootCHARExpressionsDoNotPromiseLength(t *testing.T) {
+	db := newDatabaseWithDialect(t, 3)
+	ctx := readContext(t)
+
+	rows, err := db.QueryContext(ctx, `
+WITH CTE AS (
+       SELECT 'abcdefghijkl' AS LONG_TEXT FROM RDB$DATABASE
+     )
+SELECT CAST('x' AS CHAR(3)) || CTE.LONG_TEXT AS RESULT_TEXT
+FROM CTE WHERE 1 = 0`)
+	if err != nil {
+		t.Fatalf("ambiguous root CHAR metadata query: %v", err)
+	}
+	columns, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatalf("ambiguous root CHAR ColumnTypes: %v", err)
+	}
+	if len(columns) != 1 {
+		t.Fatalf("ambiguous root CHAR column count = %d, want 1", len(columns))
+	}
+	if length, ok := columns[0].Length(); ok {
+		t.Fatalf("ambiguous root CHAR length = (%d, %t), want unknown", length, ok)
+	}
+	finishReadRows(t, rows)
+}
+
 func TestMetadataDoesNotPromiseNotNullForOuterJoinResults(t *testing.T) {
 	db := newDatabase(t)
 	ctx := readContext(t)
@@ -284,7 +335,7 @@ FROM GO_NUMERIC_KINDS WHERE 1 = 0`)
 	finishReadRows(t, rows)
 }
 
-func requireZeroScaleNumericMetadata(t *testing.T, rows *sql.Rows) {
+func requireZeroScaleNumericMetadata(t *testing.T, rows *sql.Rows, declared bool) {
 	t.Helper()
 
 	columns, err := rows.ColumnTypes()
@@ -304,7 +355,13 @@ func requireZeroScaleNumericMetadata(t *testing.T, rows *sql.Rows) {
 			t.Errorf("zero-scale numeric column %d scan type = %v, want int64",
 				index, columns[index].ScanType())
 		}
-		if _, _, ok := columns[index].DecimalSize(); ok {
+		precision, scale, ok := columns[index].DecimalSize()
+		if declared {
+			if precision != 18 || scale != 0 || !ok {
+				t.Errorf("zero-scale numeric column %d decimal size = (%d, %d, %t), want (18, 0, true)",
+					index, precision, scale, ok)
+			}
+		} else if ok {
 			t.Errorf("zero-scale numeric column %d fabricated precision", index)
 		}
 	}
@@ -333,7 +390,7 @@ FROM RDB$DATABASE`
 	if err != nil {
 		t.Fatalf("direct zero-scale numeric expression: %v", err)
 	}
-	requireZeroScaleNumericMetadata(t, rows)
+	requireZeroScaleNumericMetadata(t, rows, false)
 
 	stmt, err := db.PrepareContext(ctx, expression)
 	if err != nil {
@@ -344,7 +401,7 @@ FROM RDB$DATABASE`
 	if err != nil {
 		t.Fatalf("prepared zero-scale numeric expression: %v", err)
 	}
-	requireZeroScaleNumericMetadata(t, rows)
+	requireZeroScaleNumericMetadata(t, rows, false)
 
 	if _, err := db.ExecContext(ctx, `
 CREATE PROCEDURE GO_ZERO_SCALE_NUMERIC
@@ -362,7 +419,7 @@ END`); err != nil {
 	if err != nil {
 		t.Fatalf("direct zero-scale numeric procedure: %v", err)
 	}
-	requireZeroScaleNumericMetadata(t, rows)
+	requireZeroScaleNumericMetadata(t, rows, true)
 
 	procedureStmt, err := db.PrepareContext(ctx, "EXECUTE PROCEDURE GO_ZERO_SCALE_NUMERIC")
 	if err != nil {
@@ -373,5 +430,70 @@ END`); err != nil {
 	if err != nil {
 		t.Fatalf("prepared zero-scale numeric procedure: %v", err)
 	}
-	requireZeroScaleNumericMetadata(t, rows)
+	requireZeroScaleNumericMetadata(t, rows, true)
+}
+
+func TestMetadataProcedureCatalogPreservesDeclaredPrecisionDirectAndPrepared(t *testing.T) {
+	db := newDatabaseWithDialect(t, 3)
+	ctx := readContext(t)
+	if _, err := db.ExecContext(ctx, `
+CREATE PROCEDURE GO_SCALED_NUMERIC
+RETURNS (N4 NUMERIC(4,2), N7 NUMERIC(7,2), D12 DECIMAL(12,3), N18 NUMERIC(18,0))
+AS
+BEGIN
+  N4 = 12.34;
+  N7 = 12345.67;
+  D12 = 123456789.123;
+  N18 = 123456789012345678;
+  SUSPEND;
+END`); err != nil {
+		t.Fatalf("create scaled numeric procedure: %v", err)
+	}
+
+	check := func(t *testing.T, rows *sql.Rows) {
+		t.Helper()
+		columns, err := rows.ColumnTypes()
+		if err != nil {
+			t.Fatalf("scaled numeric procedure ColumnTypes: %v", err)
+		}
+		requireColumnMetadata(t, columns, []expectedColumnMetadata{
+			{
+				name: "N4", databaseType: "NUMERIC", scanType: reflect.TypeOf(""),
+				nullable: true, hasNullable: true, precision: 4, scale: 2, hasPrecision: true,
+			},
+			{
+				name: "N7", databaseType: "NUMERIC", scanType: reflect.TypeOf(""),
+				nullable: true, hasNullable: true, precision: 7, scale: 2, hasPrecision: true,
+			},
+			{
+				name: "D12", databaseType: "DECIMAL", scanType: reflect.TypeOf(""),
+				nullable: true, hasNullable: true, precision: 12, scale: 3, hasPrecision: true,
+			},
+			{
+				name: "N18", databaseType: "NUMERIC", scanType: reflect.TypeOf(int64(0)),
+				nullable: true, hasNullable: true, precision: 18, scale: 0, hasPrecision: true,
+			},
+		})
+		if !rows.Next() {
+			t.Fatalf("scaled numeric procedure returned no row: %v", rows.Err())
+		}
+		finishReadRows(t, rows)
+	}
+
+	rows, err := db.QueryContext(ctx, "EXECUTE PROCEDURE GO_SCALED_NUMERIC")
+	if err != nil {
+		t.Fatalf("direct scaled numeric procedure: %v", err)
+	}
+	check(t, rows)
+
+	stmt, err := db.PrepareContext(ctx, "EXECUTE PROCEDURE GO_SCALED_NUMERIC")
+	if err != nil {
+		t.Fatalf("prepare scaled numeric procedure: %v", err)
+	}
+	t.Cleanup(func() { _ = stmt.Close() })
+	rows, err = stmt.QueryContext(ctx)
+	if err != nil {
+		t.Fatalf("prepared scaled numeric procedure: %v", err)
+	}
+	check(t, rows)
 }

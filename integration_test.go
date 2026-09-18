@@ -55,6 +55,8 @@ func TestLiveDialectOneScalars(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The source-less CAST is still a declared CHAR(3); its padding is recovered
+	// from the complete, validated output expression.
 	if text != "dialect one" || padded != "x  " || number != -42 || nullable.Valid {
 		t.Fatal("unexpected Dialect 1 scalar, padding, or NULL conversion")
 	}
@@ -128,7 +130,6 @@ func TestLiveRecoveryAfterErrors(t *testing.T) {
 	}{
 		{"SELECT FROM", nil},
 		{"SELECT CAST(? AS INTEGER) FROM RDB$DATABASE", nil},
-		{"SELECT RDB$DESCRIPTION FROM RDB$DATABASE", nil}, // BLOBs intentionally unsupported.
 	} {
 		rows, err := db.Query(test.query, test.args...)
 		if err == nil {
@@ -139,8 +140,25 @@ func TestLiveRecoveryAfterErrors(t *testing.T) {
 			t.Fatalf("connection unusable after query error: %v", err)
 		}
 	}
+	rows, err := db.Query("SELECT RDB$DESCRIPTION FROM RDB$DATABASE")
+	if err != nil {
+		t.Fatalf("BLOB query failed: %v", err)
+	}
+	if !rows.Next() {
+		err := rows.Err()
+		_ = rows.Close()
+		t.Fatalf("BLOB query returned no row: %v", err)
+	}
+	var description any
+	if err := rows.Scan(&description); err != nil {
+		_ = rows.Close()
+		t.Fatalf("BLOB scan failed: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("BLOB rows close failed: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	rows, err := db.QueryContext(ctx, "SELECT RDB$RELATION_NAME FROM RDB$RELATIONS")
+	rows, err = db.QueryContext(ctx, "SELECT RDB$RELATION_NAME FROM RDB$RELATIONS")
 	if err != nil {
 		cancel()
 		t.Fatal(err)

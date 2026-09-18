@@ -25,17 +25,23 @@ make build
 make test
 ```
 
-`make build` creates `bin/ibprobe`. `make test` runs Go tests and five native
+`make build` creates `bin/ibprobe`. `make test` runs Go tests and ten native
 AddressSanitizer harnesses, including leak detection. Without the environment
 variables below, live Go tests explicitly skip. Native harnesses use synthetic
 descriptors/status vectors and injected lifecycle failures, and do not attach
 to a database.
 
+For a non-default SDK layout, override the paths used by both Makefile targets:
+
+```sh
+make test INTERBASE_INCLUDE=/path/to/include INTERBASE_LIB=/path/to/lib
+```
+
 The disposable write/transaction/type contracts are separate from the read-only
 probe. Run them with an existing local server image:
 
 ```sh
-IMAGE=your-local-interbase-image make test-integration-docker
+IMAGE=your-local-interbase-image INTERBASE_INCLUDE=/path/to/include make test-integration-docker
 ```
 
 See [integration/README.md](integration/README.md) for prerequisites, isolation,
@@ -103,21 +109,238 @@ Set `Dialect: 1` to opt into Dialect 1. The example spells out the Dialect 3
 default; it requires no dependency beyond Go's standard `database/sql` package
 and this connector.
 
+Set `Config.Host` together with `Config.Database` to construct a native
+`[host[/port]]:database` attachment. `Config.TLS` adds the InterBase native
+TLS attachment parameters, while `Config.Role`, `Config.EncryptedPassword`,
+and `Config.SystemEncryptionPassword` populate the corresponding attachment
+parameters. These values are validated before the native client is called and
+are redacted from returned errors.
+
+> **TLS security warning:** with vendor client `LI-V15.1.0.42`, a trusted CA
+> does **not** establish server identity. The client accepted an intentionally
+> wrong DNS hostname in the isolated strict-TLS matrix, including through the
+> vendor `isql`. Do not use `TLS.Enabled` or CA trust alone as proof of hostname
+> verification. This project deliberately has no Go-side TLS preflight
+> workaround: a second connection would not authenticate the actual native
+> InterBase attachment.
+
+`Config.TransactionOptions` supplies connector-wide native defaults for
+`NoWait`, `NoRecordVersion`, and table reservations. Per-transaction
+`database/sql.TxOptions` selects read-only access and the standard
+read-committed, repeatable-read/snapshot, or serializable isolation level.
+
+### Explicit direct API
+
+Use `Open` when the application needs an explicitly owned attachment and the
+bounded cursor/transaction operations that are not expressible through
+`database/sql`:
+
+```go
+attachment, err := interbase.Open(ctx, interbase.Config{
+    Database: os.Getenv("INTERBASE_DATABASE"),
+    User:     os.Getenv("INTERBASE_USER"),
+    Password: os.Getenv("INTERBASE_PASSWORD"),
+    Dialect:  3,
+})
+if err != nil {
+    return err
+}
+defer attachment.Close()
+
+tx, err := attachment.BeginTx(ctx, interbase.TransactionOptions{
+    Isolation: sql.LevelReadCommitted,
+})
+if err != nil {
+    return err
+}
+
+cursor, err := tx.Query(ctx,
+    "SELECT ID, COUNTRY FROM GO_COUNTRY WHERE ID = ? FOR UPDATE", int64(1),
+)
+if err != nil {
+    _ = tx.Rollback()
+    return err
+}
+defer cursor.Close()
+
+if err := cursor.SetName("country_cursor"); err != nil {
+    _ = tx.Rollback()
+    return err
+}
+for {
+    hasRow, err := cursor.Next(ctx)
+    if err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    if !hasRow {
+        break
+    }
+    cells, err := cursor.Row()
+    if err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    _ = cells // Cell.Value and Cell.Indicator are Go-owned snapshots.
+}
+return tx.Commit()
+```
+
+### Distributed direct transactions
+
+Use `BeginDistributed` when one atomic native transaction must cover multiple
+explicit attachments. The engine receives all participants in one
+`isc_start_multiple` call; prepare and completion must be performed through the
+coordinator, not through an individual participant transaction:
+
+```go
+coordinator, err := interbase.BeginDistributed(ctx, []interbase.Participant{
+    {Attachment: firstAttachment, Options: interbase.TxOptions{Isolation: sql.LevelReadCommitted}},
+    {Attachment: secondAttachment, Options: interbase.TxOptions{Isolation: sql.LevelReadCommitted}},
+})
+if err != nil {
+    return err
+}
+left, err := coordinator.Participant(0)
+if err != nil {
+    _ = coordinator.Rollback(context.Background())
+    return err
+}
+right, err := coordinator.Participant(1)
+if err != nil {
+    _ = coordinator.Rollback(context.Background())
+    return err
+}
+if _, err := left.Exec(ctx, "UPDATE FIRST_TABLE SET VALUE = ?", int64(1)); err != nil {
+    _ = coordinator.Rollback(context.Background())
+    return err
+}
+if _, err := right.Exec(ctx, "UPDATE SECOND_TABLE SET VALUE = ?", int64(1)); err != nil {
+    _ = coordinator.Rollback(context.Background())
+    return err
+}
+if err := coordinator.Prepare(ctx, []byte("application-recovery-key")); err != nil {
+    _ = coordinator.Rollback(context.Background())
+    return err
+}
+return coordinator.Commit(ctx)
+```
+
+`Prepare` calls the native prepare API with the optional recovery message.
+After prepare or an ambiguous completion error, resolve the coordinator
+explicitly; `Attachment.Close` refuses to detach an unresolved distributed
+participant. `RecoveryInfo` returns copied database and transaction identifiers
+for every participant and remains available while the outcome is uncertain. If
+the native client consumed the coordinator while reporting that error,
+`Commit` and `Rollback` return `ErrDistributedNativeUnavailable`; resolve the
+copied identifiers through Services before releasing local ownership.
+
+### Creating and dropping an owned database
+
+Use `CreateDatabase` only with a path owned by the current operation. It calls
+the native InterBase create API, never overwrites an existing database, and
+returns an attachment that can be explicitly dropped:
+
+```go
+// Imports used below: context, errors, and filepath.
+attachment, createErr := interbase.CreateDatabase(ctx, interbase.Config{
+    Database: filepath.Join(tempDir, "database.ib"),
+    User:     "SYSDBA",
+    Password: password,
+    Dialect:  3,
+}, interbase.CreateOptions{PageSize: 4096})
+if createErr != nil {
+    // A successful native create followed by setup or context failure can
+    // return both an attachment and an error. Clean it up before returning;
+    // use a non-canceled context so cleanup is still attempted.
+    if attachment == nil {
+        return createErr
+    }
+    if dropErr := attachment.DropDatabase(context.Background()); dropErr != nil {
+        return errors.Join(createErr, dropErr, attachment.Close())
+    }
+    return createErr
+}
+
+// Finish every transaction and close every cursor before dropping.
+if err := attachment.DropDatabase(ctx); err != nil {
+    // ErrAttachmentBusy and non-consuming native drop errors preserve the
+    // attachment for retry. A consumed-handle diagnostic such as status
+    // 335544667 closes the attachment despite returning an error; do not retry.
+    return err
+}
+return attachment.Close() // idempotent after a successful drop
+```
+
+`Close` detaches and never drops a database. A failed or canceled create may
+return a non-nil attachment with an error; retain it and either finish the
+operation or call `DropDatabase` explicitly. Do not call `DropDatabase` on a
+`database/sql` pool or an application database. Every dedicated `Attachment`
+is eligible because `DropDatabase` is an explicit destructive caller
+authorization; only fixture paths owned by the current operation should be
+passed to it.
+
+`Attachment.Diagnostics` combines the linked client version, server version,
+ODS version, page size, SQL dialect, and read-only state. `DatabaseInfo` returns
+copied `InfoItem` payloads; use `Uint64`, `Int64`, `Bool`, or UTF-8 `Text` for
+bounded decoding. `Transaction.Plan` only prepares a statement: a valid DML
+statement may return an empty plan, which never means that the DML executed.
+
+`Attachment` may own multiple independent direct transactions; each transaction
+has its own native handle and may own multiple cursors. Normal commit/rollback
+closes those cursors, while
+`CommitRetaining`/`RollbackRetaining` keep the transaction and active cursors
+usable. `Cursor.SetName` is one-shot and requires a writable transaction, making
+`UPDATE ... WHERE CURRENT OF country_cursor` possible. `Transaction.Plan`,
+`Attachment.DatabaseInfo`, and `Transaction.Info` return bounded copied data in
+`Plan`/`InfoItem` values. `Cell.Value` follows the existing scalar conversion
+rules, copies byte slices, and reports `SQLIND_NULL` as bit 15 while preserving
+positive change-indicator flags. Direct ChangeView reads use a serializable
+transaction: execute `SET SUBSCRIPTION ... ACTIVE` on that transaction before
+querying it. The `database/sql` path rejects subscription activation because
+pooled session state cannot safely represent it. Close the attachment when
+finished; it rolls back any still-active direct transaction.
+
+Direct array parameters and results use `Array`, whose inclusive bounds are
+kept separately from its flat `Elements` slice. Elements use rightmost
+dimension-fastest ordering. Bounds and element types are validated against the
+server descriptor before an array is sent. Array values are intentionally
+available only through this direct API; `database/sql` rejects array
+parameters and results instead of silently materializing them.
+
+Direct BLOB results are returned as an opaque, transaction-generation-bound
+`BlobRef`. Pass that reference to `Transaction.OpenBlob` for an
+`io.ReadCloser`, or use `Transaction.CreateBlob` to stream an `io.Reader` into
+a new BLOB. A reference can also be used as a direct BLOB parameter in the
+same transaction. References and open streams are owned by the active
+transaction and become unusable when it completes; cursor, transaction, and
+attachment cleanup closes any remaining native BLOB handles. The standard
+`database/sql` path continues to materialize text and binary BLOBs.
+
 ## Supported Boundary
 
 - Client SQL Dialect 3 by default, or Dialect 1 when selected with
-  `Config.Dialect`. `Config.Charset` defaults to UTF8; WIN1250 is also
-  supported. Go strings and SQL text remain UTF8 at the public boundary.
+  `Config.Dialect`. `Config.Charset` defaults to UTF8; UTF8, WIN1250, WIN1252,
+  ISO8859_1, and ASCII are supported. Go strings and SQL text remain UTF8 at
+  the public boundary.
+- Structured native attachments with host/port, roles, alternate encrypted and
+  system-encryption credentials, and TLS parameters.
 - Direct `QueryContext`/`QueryRowContext` and `PingContext`.
+- Explicit `Open` attachments with owned transactions/cursors, retaining
+  completion, positioned cursor names, plans, raw info items, SQLDA
+  change-indicator access, and serializable ChangeView reads.
 - `ExecContext` for DML/DDL, with DML affected-row counts and implicit commit.
   `LastInsertId` is unsupported.
 - Reusable server-side prepared statements via `PrepareContext`.
-- Explicit read-committed transactions, read-only transactions and SQL
-  savepoints. Use the Go transaction methods for commit/rollback; full SQL
-  transaction-control statements are rejected.
+- Explicit transactions with standard read-committed, repeatable-read/snapshot,
+  and serializable isolation, read-only transactions, connector-level wait and
+  record-version policies, table reservations, and SQL savepoints. Use the Go
+  transaction methods for commit/rollback; full SQL transaction-control
+  statements are rejected.
 - Positional parameters: `string`, `[]byte`, `int64`, `float64`, `bool`,
   `time.Time`, and `nil`, plus standard `database/sql` numeric and Valuer
-  conversions.
+  conversions. Direct `Query`/`Exec` additionally accept validated `Array`
+  values.
 - CHAR/VARCHAR, OCTETS CHAR/VARCHAR, SMALLINT/INTEGER/INT64, FLOAT/DOUBLE,
   BOOLEAN, DATE/TIME/TIMESTAMP, and NULL results.
 - OCTETS CHAR/VARCHAR as raw `[]byte`; fixed CHAR values retain space padding,
@@ -130,7 +353,20 @@ and this connector.
   Scaled integer results remain exact decimal strings; wide Dialect-1 numerics
   remain approximate floating-point values.
 - Materialized text and binary BLOBs, including empty versus NULL values,
-  segmented transfer, and text-column charset conversion.
+  segmented transfer, and text-column charset conversion. The direct API also
+  exposes bounded streaming reads and writes through `BlobRef`, `OpenBlob`,
+  and `CreateBlob`.
+- Explicitly owned asynchronous database event subscriptions through the
+  [`events`](events) package. Counts accumulate across native callbacks,
+  cancellation only cancels the current wait, and close waits for callbacks
+  before detaching. Server/native-client timing and grouping remain observable
+  behavior; the isolated integration fixture verifies commit/rollback timing,
+  while exactly-once delivery and row-level identity are not promised.
+- A bounded typed Services Manager package for server information, logs,
+  statistics, logical backup/restore/dump, archive/tablespace operations,
+  database maintenance and properties, users, aliases, and limbo resolution.
+  See [services/README.md](services/README.md). It uses the official native
+  client and does not accept arbitrary Services parameter blocks.
 - DATE/TIME/TIMESTAMP values as `time.Time`, preserving wall-clock fields and
   attaching UTC as a convention, not claiming stored timezone data. DATE uses
   midnight; TIME uses a `1900-01-01` anchor and accepts Go's year-zero values
@@ -144,8 +380,19 @@ and this connector.
   rejects output-producing procedures. An implicit procedure query commits its
   write transaction after EOF or early close, and rolls back on execution,
   cancellation, or completion failure; explicit transactions remain caller-owned.
-- One active cursor per native connection; `database/sql` may pool separate
+ - Multiple direct cursors may remain active on one native connection, and
+  `ExecContext` may run while those rows are open. A prepared statement still
+  permits only one active execution at a time; `database/sql` may pool separate
   connections. Always close rows or consume them to EOF.
+  - Explicit direct attachments may own multiple independent direct transactions.
+    `BeginDistributed` provides one native two-phase transaction across multiple
+    attachments. Persist `DistributedTransaction.RecoveryInfo` before ambiguous
+    completion; its copied database IDs and transaction IDs are in participant
+    input order for external Services `ListLimbo`/commit/rollback recovery.
+    `ReleaseAfterRecovery` and `Abandon` only relinquish local ownership and do
+    not resolve limbo. The live client-death test syncs and closes its private
+    recovery and post-`ListLimbo` decision files, but does not test server
+    restart or power loss and makes no power-loss durability claim.
 
 Each ordinary SELECT cursor borrows an explicit connection transaction or owns
 a read-committed, read-only implicit transaction that is rolled back on
@@ -156,7 +403,9 @@ transaction-start/cleanup failures invalidate it. A Go `driver.Validator`
 prevents broken attachments from returning to the pool. Result descriptors
 always request NULL indicators, including expressions described as non-nullable.
 
-The server-reported statement type must be plain SELECT before ordinary query execution.
+The server-reported statement type must be an allowed result-producing SELECT
+(plain SELECT, SELECT FOR UPDATE inside an explicit writable transaction, or an
+output-producing procedure) before ordinary query execution.
 Prepared statements retain the server-side statement handle and reset their
 input/output SQLDA storage for each execution. Prepared writes use the explicit
 connection transaction when present; otherwise each successful write commits
@@ -166,11 +415,15 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 
 ## Known Limits
 
-- No arrays or standalone QUADs. BLOBs are materialized rather than streamed,
-  with a 64 MiB read limit; alternate subtype behavior remains limited.
+- `database/sql` does not expose arrays or standalone QUADs. The direct API
+  supports bounded arrays and `io.Reader`/`io.ReadCloser` BLOB streaming, but
+  does not yet provide Python-style BLOB seeking, `readline`, or alternate
+  subtype behavior. `database/sql` BLOB results remain materialized with a
+  64 MiB read limit.
   Unsupported descriptors fail explicitly.
-- No named parameters, services, events, change views, roles, or distributed
-  transactions.
+- No named parameters. Raw/custom TPBs and lock timeouts are not exposed;
+  distributed transaction failure-injection and live limbo recovery require a
+  server fixture with an available Services Manager.
 - Mixed-character-set casts may require an explicit source-charset cast on
   the parameter. For a UTF8 attachment, declare `CAST(? AS VARCHAR(40)
   CHARACTER SET UTF8)` before converting to WIN1250 and back. The original
@@ -181,10 +434,14 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 - **Context cancellation cannot interrupt an in-flight native call.** It is
   checked before/after native operations and between rows. A stalled native
   call can outlive its context deadline; use a process timeout for experiments.
-- No advanced TPB API, TLS configuration API, or validated cross-version/platform
-  matrix yet.
-  The probe must only be used on a trusted network unless native transport
-  security is independently configured and verified.
+- TLS is passed to the native client as an attachment option. The repository
+  has an isolated certificate fixture, but the strict matrix is intentionally
+  nonzero with vendor client `LI-V15.1.0.42`: it accepts a wrong hostname.
+  Correct trust, unrelated-CA rejection, and required-TLS/no-plaintext-fallback
+  checks pass, but CA trust is not server identity verification. There is no
+  validated cross-version/platform matrix and no unsafe Go-side preflight
+  workaround. Use the probe only on a trusted network unless transport security
+  is independently configured and verified for the deployed native client.
 - Error reporting uses bounded SQLCODE messages plus a numeric native status.
   It deliberately avoids the legacy unbounded `isc_interprete` function and
   omits detailed server-provided strings.
@@ -193,38 +450,33 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 
 ## Verification Record
 
-On 2026-09-14, the full isolated Docker suite passed **80 top-level groups,
-zero failures and zero skips**, covering both Dialect 1 and Dialect 3 against
-server `LI-V15.1.0.49` and matching client `LI-V15.1.0.42`. Offline Go tests,
-all five native ASan/leak harnesses, race tests, integration-tagged vet, build,
-all 15 Bats runner tests, and ShellCheck also passed. Review findings were fixed
-and independently re-reviewed; owned Docker resources were removed.
+Production-hardening commands and execution semantics are documented in
+[docs/production-hardening.md](docs/production-hardening.md). Deferred feature
+requests are tracked in [docs/TODO.md](docs/TODO.md).
 
-Historical evidence: on 2026-09-13, the then-expanded integration suite had
-**54 passing top-level groups, zero failures and zero skips** against an
-isolated InterBase 15.1 Docker server and matching client. That count predates
-the completed parity, procedure/metadata, and Dialect 3 work; it is not a
-current-suite result.
+On 2026-09-16, a fresh controller run completed `make test` with the official
+SDK: all six Go packages and all ten native ASan/leak harnesses passed.
+`make test-runner BATS=/tmp/opencode/parity-bats/bin/bats` reported **21/21**
+passing tests, `go vet -tags=integration ./...` passed, and the ordinary full
+Docker integration runner passed, including its Services framing precheck.
+The ordinary runner deliberately excludes the strict TLS matrix because its
+known hostname-verification defect makes that security suite return nonzero.
 
-The following is an earlier read-only baseline, not a current full-suite result:
+Fresh race, checkptr, build, ShellCheck, and all root `TestLive*` checks also
+passed. The strict isolated TLS rerun returned 12 passing checks and four
+wrong-hostname failures, with its disposable container and keys cleaned up.
+The race command requires a runtime library path when cgo is linked to an
+explicit SDK directory. For the temporary SDK used in this verification:
 
-On 2026-09-11, using the installed InterBase 2020 Linux client/SDK:
+```sh
+LD_LIBRARY_PATH=/tmp/opencode \
+  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+  go test -race ./... -count=1 -timeout=120s
+```
 
-- The executable probe connected directly to the reference database and read
-  **282 UDF argument catalog rows**, without invoking any UDFs.
-- All current Go tests, including the live integration tests, passed.
-- Native status, descriptor/value, and lifecycle-failure harnesses passed
-  AddressSanitizer with leak detection enabled. The lifecycle harness also
-  checks read-only transaction flags and plain-SELECT gating without executing
-  statements on a server.
-
-After the successful live run, review added pool validation and more defensive
-cleanup-failure handling. The final offline build, tests, race detector, native
-harnesses, and `go vet` passed. The final live repeat timed out inside attachment;
-a separate TCP check showed connections to the database endpoint stuck in
-SYN-SENT. Those last lifecycle changes therefore still need a live repeat when
-the endpoint is reachable. The successful earlier live run is not being used
-as evidence of a successful final rerun.
+Prior migration evidence is historical context only, not verification of the
+current source tree.
 
 This proves the basic native-client approach is viable. It does not add support
 to sqls; catalog caching, InterBase parsing, UDF completion/hover/signatures,

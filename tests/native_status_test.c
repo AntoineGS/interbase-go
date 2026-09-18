@@ -123,12 +123,18 @@ static void test_dialect_is_encoded_in_dpb(void)
 	char *error = NULL;
 	size_t offset;
 	int dialect_seen;
+	int role_seen;
+	int encrypted_seen;
+	int system_encryption_seen;
+	int timeout_seen;
 
 	memset(captured_dpb, 0, sizeof(captured_dpb));
 	captured_dpb_length = 0;
 	connection = ib_connection_open("database", strlen("database"),
 		"SYSDBA", strlen("SYSDBA"), "masterkey", strlen("masterkey"),
-		"UTF8", strlen("UTF8"), SQL_DIALECT_V6, &error);
+		"APP_ROLE", strlen("APP_ROLE"), "encrypted", strlen("encrypted"),
+		"system-encryption", strlen("system-encryption"), "UTF8", strlen("UTF8"),
+		SQL_DIALECT_V6, 0U, &error);
 	require_condition(connection != NULL && error == NULL,
 		"Dialect 3 connection open failed");
 	if (connection == NULL) {
@@ -138,6 +144,10 @@ static void test_dialect_is_encoded_in_dpb(void)
 	require_condition(connection->dialect == SQL_DIALECT_V6,
 		"Dialect 3 was not retained in native connection state");
 	dialect_seen = 0;
+	role_seen = 0;
+	encrypted_seen = 0;
+	system_encryption_seen = 0;
+	timeout_seen = 0;
 	require_condition(captured_dpb_length > 0U &&
 		captured_dpb[0] == isc_dpb_version1,
 		"captured DPB has the wrong version marker");
@@ -163,11 +173,90 @@ static void test_dialect_is_encoded_in_dpb(void)
 			require_condition(captured_dpb[offset] == SQL_DIALECT_V6,
 				"captured DPB selected the wrong SQL dialect");
 		}
+		if (tag == isc_dpb_sql_role_name) {
+			role_seen++;
+			require_condition(length == strlen("APP_ROLE") &&
+				memcmp(captured_dpb + offset, "APP_ROLE", length) == 0,
+				"captured DPB selected the wrong SQL role");
+		}
+		if (tag == isc_dpb_password_enc) {
+			encrypted_seen++;
+			require_condition(length == strlen("encrypted") &&
+				memcmp(captured_dpb + offset, "encrypted", length) == 0,
+				"captured DPB selected the wrong encrypted password");
+		}
+		if (tag == isc_dpb_sys_encrypt_password) {
+			system_encryption_seen++;
+			require_condition(length == strlen("system-encryption") &&
+				memcmp(captured_dpb + offset, "system-encryption", length) == 0,
+				"captured DPB selected the wrong system encryption password");
+		}
+		if (tag == isc_dpb_connect_timeout) {
+			timeout_seen++;
+		}
 		offset += length;
 	}
 	require_condition(dialect_seen == 1, "captured DPB has no unique SQL dialect item");
+	require_condition(role_seen == 1, "captured DPB has no unique SQL role item");
+	require_condition(encrypted_seen == 1,
+		"captured DPB has no unique encrypted password item");
+	require_condition(system_encryption_seen == 1,
+		"captured DPB has no unique system encryption password item");
+	require_condition(timeout_seen == 0,
+		"zero connect timeout unexpectedly changed the native default");
 	connection->database = NULL;
 	free(connection);
+}
+
+static void test_connect_timeout_is_encoded_as_little_endian_integer(void)
+{
+	const unsigned char expected[] = {0x04, 0x03, 0x02, 0x01};
+	ib_connection *connection;
+	char *error = NULL;
+	size_t offset;
+	int timeout_seen = 0;
+
+	memset(captured_dpb, 0, sizeof(captured_dpb));
+	captured_dpb_length = 0;
+	connection = ib_connection_open("database", strlen("database"),
+		"SYSDBA", strlen("SYSDBA"), "masterkey", strlen("masterkey"),
+		NULL, 0U, NULL, 0U, NULL, 0U, "UTF8", strlen("UTF8"),
+		SQL_DIALECT_V6, 0x01020304U, &error);
+	require_condition(connection != NULL && error == NULL,
+		"connection with connect timeout failed");
+	if (connection == NULL) {
+		ib_error_free(error);
+		return;
+	}
+	offset = 1U;
+	while (offset < (size_t) captured_dpb_length) {
+		unsigned char tag;
+		unsigned char length;
+
+		require_condition((size_t) captured_dpb_length - offset >= 2U,
+			"timeout DPB item header is truncated");
+		if ((size_t) captured_dpb_length - offset < 2U) {
+			break;
+		}
+		tag = captured_dpb[offset++];
+		length = captured_dpb[offset++];
+		require_condition((size_t) captured_dpb_length - offset >= length,
+			"timeout DPB item is truncated");
+		if ((size_t) captured_dpb_length - offset < length) {
+			break;
+		}
+		if (tag == isc_dpb_connect_timeout) {
+			timeout_seen++;
+			require_condition(length == sizeof(expected) &&
+				memcmp(captured_dpb + offset, expected, sizeof(expected)) == 0,
+				"connect timeout DPB value is not little endian");
+		}
+		offset += length;
+	}
+	require_condition(timeout_seen == 1, "connect timeout DPB item is missing");
+	connection->database = NULL;
+	free(connection);
+	ib_error_free(error);
 }
 
 static void test_unset_connection_defaults_to_dialect_three(void)
@@ -186,6 +275,7 @@ int main(void)
 	test_sqlcode_status_keeps_numeric_context();
 	test_unset_connection_defaults_to_dialect_three();
 	test_dialect_is_encoded_in_dpb();
+	test_connect_timeout_is_encoded_as_little_endian_integer();
 	(void) puts("native status tests passed");
 	return EXIT_SUCCESS;
 }

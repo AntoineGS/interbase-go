@@ -447,12 +447,32 @@ func TestConfigRejectsControlCharacters(t *testing.T) {
 		{name: "user nul", cfg: Config{ISQL: "/tmp/isql", User: "SYS\x00DBA", Password: "masterkey"}},
 		{name: "password carriage return", cfg: Config{ISQL: "/tmp/isql", User: "SYSDBA", Password: "bad\rsecret"}},
 		{name: "password tab", cfg: Config{ISQL: "/tmp/isql", User: "SYSDBA", Password: "bad\tsecret"}},
+		{name: "server newline", cfg: Config{ISQL: "/tmp/isql", User: "SYSDBA", Password: "masterkey", Server: "localhost/3050\n"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := validateConfig(test.cfg); err == nil {
 				t.Fatal("validateConfig accepted a control character")
 			}
 		})
+	}
+}
+
+func TestServerPrefixIsPropagatedToFixtureScriptsAndConnectionString(t *testing.T) {
+	cfg := Config{ISQL: "/tmp/isql", User: "SYSDBA", Password: "masterkey", Server: "localhost/3050"}
+	path := "/tmp/example.ib"
+
+	create := createScript(path, cfg, "CREATE TABLE T (ID INTEGER);")
+	if !strings.Contains(create, "CREATE DATABASE 'localhost/3050:/tmp/example.ib'") {
+		t.Fatalf("create script does not use server-prefixed attachment:\n%s", create)
+	}
+	drop := dropScript(path, cfg)
+	if !strings.Contains(drop, "CONNECT 'localhost/3050:/tmp/example.ib'") {
+		t.Fatalf("drop script does not use server-prefixed attachment:\n%s", drop)
+	}
+
+	db := &Database{Path: path, config: cfg}
+	if got := db.ConnectionString(); got != "localhost/3050:/tmp/example.ib" {
+		t.Fatalf("ConnectionString() = %q, want server-prefixed path", got)
 	}
 }
 

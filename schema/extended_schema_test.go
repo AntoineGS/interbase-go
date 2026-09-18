@@ -1,0 +1,736 @@
+package schema
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestCatalogReadsExtendedSchemaFamilies(t *testing.T) {
+	db := openFixtureDB(t)
+	defer db.Close()
+	catalog := New(db)
+	ctx := context.Background()
+
+	domains, err := catalog.Domains(ctx, "")
+	if err != nil {
+		t.Fatalf("Domains returned error: %v", err)
+	}
+	if names := domainNames(domains); !reflect.DeepEqual(names, []string{"IN_NAME", "IN_COUNT", "OUT_TOTAL"}) {
+		t.Fatalf("domain names = %#v, want user domains in catalog order", names)
+	}
+	if domains[0].Name != "IN_NAME" || !domains[0].FieldType.Valid {
+		t.Fatalf("domain metadata = %#v, want typed field metadata", domains[0])
+	}
+
+	sequences, err := catalog.Sequences(ctx, "GO_SEQUENCE")
+	if err != nil {
+		t.Fatalf("Sequences returned error: %v", err)
+	}
+	if len(sequences) != 1 || sequences[0].Name != "GO_SEQUENCE" {
+		t.Fatalf("sequence result = %#v, want exact sequence", sequences)
+	}
+
+	indexes, err := catalog.Indexes(ctx, "GO_CHILD_UQ")
+	if err != nil {
+		t.Fatalf("Indexes returned error: %v", err)
+	}
+	if len(indexes) != 1 || indexes[0].RelationName != "GO_CHILD" {
+		t.Fatalf("index result = %#v, want exact index and relation", indexes)
+	}
+	if names := indexSegmentNames(indexes[0].Segments); !reflect.DeepEqual(names, []string{"PARENT_ID"}) {
+		t.Fatalf("index segments = %#v, want ordered segment names", names)
+	}
+
+	constraints, err := catalog.Constraints(ctx, "GO_CHILD_FK")
+	if err != nil {
+		t.Fatalf("Constraints returned error: %v", err)
+	}
+	if len(constraints) != 1 || constraints[0].ConstraintType != "FOREIGN KEY" {
+		t.Fatalf("constraint result = %#v, want foreign-key metadata", constraints)
+	}
+	if constraints[0].ReferencedRelationName != "GO_PARENT" ||
+		!reflect.DeepEqual(constraints[0].ReferencedColumns, []string{"ID"}) {
+		t.Fatalf("foreign-key target = %#v, want scoped referenced relation and columns", constraints[0])
+	}
+
+	triggers, err := catalog.Triggers(ctx, "GO_CHILD_BI")
+	if err != nil {
+		t.Fatalf("Triggers returned error: %v", err)
+	}
+	if len(triggers) != 1 || triggers[0].RelationName.String != "GO_CHILD" || !triggers[0].Source.Valid {
+		t.Fatalf("trigger result = %#v, want relation and exact source", triggers)
+	}
+
+	roles, err := catalog.Roles(ctx, "GO_SCHEMA_ROLE")
+	if err != nil {
+		t.Fatalf("Roles returned error: %v", err)
+	}
+	if len(roles) != 1 || roles[0].Name != "GO_SCHEMA_ROLE" {
+		t.Fatalf("role result = %#v, want exact role", roles)
+	}
+
+	dependencies, err := catalog.Dependencies(ctx, "GO_CHILD")
+	if err != nil {
+		t.Fatalf("Dependencies returned error: %v", err)
+	}
+	if len(dependencies) == 0 || dependencies[0].DependentName != "GO_CHILD" {
+		t.Fatalf("dependency result = %#v, want dependent-name filter", dependencies)
+	}
+
+	functions, err := catalog.Functions(ctx, "GO_EXTERNAL")
+	if err != nil {
+		t.Fatalf("Functions returned error: %v", err)
+	}
+	if len(functions) != 1 || functions[0].Name != "GO_EXTERNAL" {
+		t.Fatalf("function result = %#v, want external-function metadata", functions)
+	}
+	if len(functions[0].Arguments) != 1 || functions[0].Arguments[0].Position.Int64 != 0 {
+		t.Fatalf("function arguments = %#v, want argument metadata without invocation", functions[0].Arguments)
+	}
+
+	files, err := catalog.DatabaseFiles(ctx)
+	if err != nil {
+		t.Fatalf("DatabaseFiles returned error: %v", err)
+	}
+	if len(files) != 1 || !files[0].FileName.Valid {
+		t.Fatalf("database files = %#v, want current database file metadata", files)
+	}
+
+	shadows, err := catalog.Shadows(ctx)
+	if err != nil {
+		t.Fatalf("Shadows returned error: %v", err)
+	}
+	if len(shadows) != 0 {
+		t.Fatalf("shadows = %#v, want empty fixture result", shadows)
+	}
+
+	privileges, err := catalog.Privileges(ctx, "GO_SCHEMA_ROLE")
+	if err != nil {
+		t.Fatalf("Privileges returned error: %v", err)
+	}
+	if len(privileges) != 1 || privileges[0].Grantee != "GO_SCHEMA_ROLE" || privileges[0].PrivilegeCode != "S" {
+		t.Fatalf("privilege result = %#v, want exact grantee and code", privileges)
+	}
+}
+
+func TestCatalogTableLoadsDDLMetadata(t *testing.T) {
+	db := openFixtureDB(t)
+	defer db.Close()
+
+	table, err := New(db).Table(context.Background(), "ORDERS")
+	if err != nil {
+		t.Fatalf("Table returned error: %v", err)
+	}
+	if table == nil {
+		t.Fatal("Table returned nil")
+	}
+	if !table.ConstraintsLoaded || !table.IndexesLoaded || !table.TriggersLoaded {
+		t.Fatalf("table metadata loaded flags = (constraints=%t, indexes=%t, triggers=%t), want all true",
+			table.ConstraintsLoaded, table.IndexesLoaded, table.TriggersLoaded)
+	}
+
+	indexes, err := New(db).IndexesForRelation(context.Background(), "GO_CHILD")
+	if err != nil {
+		t.Fatalf("IndexesForRelation returned error: %v", err)
+	}
+	if len(indexes) != 2 {
+		t.Fatalf("IndexesForRelation returned %d indexes, want the two GO_CHILD indexes", len(indexes))
+	}
+	constraints, err := New(db).ConstraintsForRelation(context.Background(), "GO_CHILD")
+	if err != nil {
+		t.Fatalf("ConstraintsForRelation returned error: %v", err)
+	}
+	if len(constraints) != 2 {
+		t.Fatalf("ConstraintsForRelation returned %d constraints, want one CHECK and one FOREIGN KEY", len(constraints))
+	}
+	triggers, err := New(db).TriggersForRelation(context.Background(), "GO_CHILD")
+	if err != nil {
+		t.Fatalf("TriggersForRelation returned error: %v", err)
+	}
+	if len(triggers) != 1 || triggers[0].Name != "GO_CHILD_BI" {
+		t.Fatalf("TriggersForRelation returned %#v, want GO_CHILD_BI", triggers)
+	}
+}
+
+func TestCatalogDeduplicatesCheckConstraints(t *testing.T) {
+	db := openFixtureDB(t)
+	defer db.Close()
+
+	constraints, err := New(db).Constraints(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Constraints returned error: %v", err)
+	}
+	var checks []Constraint
+	for _, constraint := range constraints {
+		if constraint.Name == "GO_CHILD_CHECK" {
+			checks = append(checks, constraint)
+		}
+	}
+	if len(checks) != 1 {
+		t.Fatalf("check constraints = %#v, want one logical constraint", checks)
+	}
+	if !reflect.DeepEqual(checks[0].TriggerNames, []string{"GO_CHILD_CHECK_TRG"}) {
+		t.Fatalf("check constraint trigger names = %#v, want one trigger", checks[0].TriggerNames)
+	}
+}
+
+func TestCatalogReadsNotNullColumnNameFromConstraintTriggerName(t *testing.T) {
+	db := openFixtureDB(t)
+	defer db.Close()
+
+	constraints, err := New(db).ConstraintsForRelation(context.Background(), "ORDERS")
+	if err != nil {
+		t.Fatalf("ConstraintsForRelation returned error: %v", err)
+	}
+	var notNull *Constraint
+	for index := range constraints {
+		if constraints[index].ConstraintType == string(ConstraintNotNull) {
+			notNull = &constraints[index]
+			break
+		}
+	}
+	if notNull == nil {
+		t.Fatalf("constraints = %#v, want a NOT NULL constraint", constraints)
+	}
+	if !notNull.ColumnName.Valid || notNull.ColumnName.String != "TOTAL" {
+		t.Fatalf("NOT NULL column name = %#v, want TOTAL", notNull.ColumnName)
+	}
+	if notNull.TriggerName.Valid {
+		t.Fatalf("NOT NULL trigger name = %#v, want invalid", notNull.TriggerName)
+	}
+	if !reflect.DeepEqual(notNull.TriggerNames, []string(nil)) {
+		t.Fatalf("NOT NULL trigger names = %#v, want none", notNull.TriggerNames)
+	}
+	if notNull.CheckSource.Valid {
+		t.Fatalf("NOT NULL check source = %#v, want invalid", notNull.CheckSource)
+	}
+}
+
+func TestCatalogExtendedFiltersAreBoundAndUseOfficialCatalogs(t *testing.T) {
+	db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+	defer db.Close()
+	const maliciousName = `GO_CHILD' OR 1=1 --`
+
+	if _, err := New(db).Indexes(context.Background(), maliciousName); err != nil {
+		t.Fatalf("malicious index filter returned error: %v", err)
+	}
+	calls := state.callsSnapshot()
+	if len(calls) != 1 {
+		t.Fatalf("query count = %d, want one filtered index query", len(calls))
+	}
+	if strings.Contains(calls[0].query, maliciousName) {
+		t.Fatalf("index filter was interpolated into query: %q", calls[0].query)
+	}
+	if len(calls[0].args) != 1 || calls[0].args[0].Value != maliciousName {
+		t.Fatalf("index filter args = %#v, want one bound argument", calls[0].args)
+	}
+
+	db, state = openFixtureDBWithOptions(t, fixtureOptions{})
+	defer db.Close()
+	if _, err := New(db).Constraints(context.Background(), "GO_CHILD"); err != nil {
+		t.Fatalf("constraint filter returned error: %v", err)
+	}
+	constraintQuery := fixtureCallQuery(t, state.callsSnapshot(), "constraints")
+	upper := strings.ToUpper(constraintQuery)
+	for _, clause := range []string{
+		"FROM RDB$RELATION_CONSTRAINTS",
+		"LEFT JOIN RDB$REF_CONSTRAINTS",
+		"LEFT JOIN RDB$CHECK_CONSTRAINTS",
+		"RC.RDB$CONSTRAINT_TYPE = 'CHECK'",
+		"ORDER BY",
+	} {
+		if !strings.Contains(upper, clause) {
+			t.Fatalf("constraint query = %q, want official catalog clause %q", constraintQuery, clause)
+		}
+	}
+}
+
+func TestDDLGenerationQuotesIdentifiersAndPreservesSupportedClauses(t *testing.T) {
+	domain := Domain{
+		Name:             `Weird"Domain`,
+		FieldType:        sql.NullInt64{Int64: 37, Valid: true},
+		CharacterLength:  sql.NullInt64{Int64: 20, Valid: true},
+		CharacterSetName: sql.NullString{String: "UTF8", Valid: true},
+		CollationID:      sql.NullInt64{Int64: 1, Valid: true},
+		CollationName:    sql.NullString{String: `WEIRD"COLLATION`, Valid: true},
+		DefaultSource:    sql.NullString{String: "DEFAULT  42  ", Valid: true},
+		ValidationSource: sql.NullString{String: "CHECK (VALUE > 0)  ", Valid: true},
+	}
+	got, err := domain.GenerateDDL()
+	if err != nil {
+		t.Fatalf("domain GenerateDDL returned error: %v", err)
+	}
+	want := `CREATE DOMAIN "Weird""Domain" AS VARCHAR(20) CHARACTER SET "UTF8" DEFAULT  42   CHECK (VALUE > 0)   COLLATE "WEIRD""COLLATION"`
+	if got != want {
+		t.Fatalf("domain DDL = %q, want %q", got, want)
+	}
+
+	table := Relation{
+		Name:              `Order"Table`,
+		Kind:              RelationTable,
+		ConstraintsLoaded: true,
+		IndexesLoaded:     true,
+		TriggersLoaded:    true,
+		Columns: []Column{{
+			Name:     `Order"ID`,
+			Domain:   &Domain{FieldType: sql.NullInt64{Int64: 8, Valid: true}},
+			Nullable: sql.NullBool{Bool: false, Valid: true},
+		}},
+		Constraints: []Constraint{{
+			Name:           `Order"PK`,
+			RelationName:   `Order"Table`,
+			ConstraintType: "PRIMARY KEY",
+			Columns:        []string{`Order"ID`},
+		}},
+	}
+	got, err = table.GenerateDDL()
+	if err != nil {
+		t.Fatalf("table GenerateDDL returned error: %v", err)
+	}
+	if !strings.Contains(got, `CREATE TABLE "Order""Table"`) ||
+		!strings.Contains(got, `CONSTRAINT "Order""PK" PRIMARY KEY ("Order""ID")`) {
+		t.Fatalf("table DDL = %q, want quoted table and primary key", got)
+	}
+
+	view := Relation{
+		Name:       "Order View",
+		Kind:       RelationView,
+		ViewSource: sql.NullString{String: "SELECT 1  ", Valid: true},
+		Columns:    []Column{{Name: "Value"}},
+	}
+	got, err = view.GenerateDDL()
+	if err != nil {
+		t.Fatalf("view GenerateDDL returned error: %v", err)
+	}
+	if want := `CREATE VIEW "Order View" ("Value") AS SELECT 1  `; got != want {
+		t.Fatalf("view DDL = %q, want %q", got, want)
+	}
+
+	procedure := Procedure{
+		Name:        "Do Work",
+		Source:      sql.NullString{String: "BEGIN\n  SUSPEND;\nEND", Valid: true},
+		InputCount:  sql.NullInt64{Int64: 1, Valid: true},
+		OutputCount: sql.NullInt64{Int64: 1, Valid: true},
+		InputParameters: []ProcedureParameter{{
+			Name:          "Amount",
+			Number:        sql.NullInt64{Int64: 0, Valid: true},
+			ParameterType: sql.NullInt64{Int64: 0, Valid: true},
+			FieldSource:   sql.NullString{String: "RDB$AMOUNT", Valid: true},
+			Domain:        &Domain{FieldType: sql.NullInt64{Int64: 8, Valid: true}},
+			Direction:     ParameterInput,
+			Nullable:      sql.NullBool{Bool: true, Valid: true},
+		}},
+		OutputParameters: []ProcedureParameter{{
+			Name:          "Result",
+			Number:        sql.NullInt64{Int64: 0, Valid: true},
+			ParameterType: sql.NullInt64{Int64: 1, Valid: true},
+			FieldSource:   sql.NullString{String: "RDB$RESULT", Valid: true},
+			Domain:        &Domain{FieldType: sql.NullInt64{Int64: 8, Valid: true}},
+			Direction:     ParameterOutput,
+			Nullable:      sql.NullBool{Bool: true, Valid: true},
+		}},
+	}
+	got, err = procedure.GenerateDDL()
+	if err != nil {
+		t.Fatalf("procedure GenerateDDL returned error: %v", err)
+	}
+	if !strings.Contains(got, `CREATE PROCEDURE "Do Work"`) ||
+		!strings.Contains(got, `"Amount" INTEGER`) ||
+		!strings.Contains(got, `RETURNS ("Result" INTEGER)`) ||
+		!strings.HasSuffix(got, procedure.Source.String) {
+		t.Fatalf("procedure DDL = %q, want quoted parameters and exact source", got)
+	}
+
+	trigger := Trigger{
+		Name:         "Order Trigger",
+		RelationName: sql.NullString{String: `Order"Table`, Valid: true},
+		TriggerType:  sql.NullInt64{Int64: 1, Valid: true},
+		Sequence:     sql.NullInt64{Int64: 3, Valid: true},
+		Source:       sql.NullString{String: "AS\nBEGIN\n  POST_EVENT 'x';\nEND", Valid: true},
+	}
+	got, err = trigger.GenerateDDL()
+	if err != nil {
+		t.Fatalf("trigger GenerateDDL returned error: %v", err)
+	}
+	if !strings.Contains(got, `CREATE TRIGGER "Order Trigger" FOR "Order""Table" ACTIVE BEFORE INSERT POSITION 3`) ||
+		!strings.HasSuffix(got, trigger.Source.String) {
+		t.Fatalf("trigger DDL = %q, want decoded event and exact source", got)
+	}
+
+	sequence := Sequence{Name: `Seq"Name`}
+	got, err = sequence.GenerateDDL()
+	if err != nil || got != `CREATE GENERATOR "Seq""Name"` {
+		t.Fatalf("sequence DDL = (%q, %v), want quoted create", got, err)
+	}
+
+	role := Role{Name: `Role"Name`}
+	got, err = role.GenerateDDL()
+	if err != nil || got != `CREATE ROLE "Role""Name"` {
+		t.Fatalf("role DDL = (%q, %v), want quoted create", got, err)
+	}
+
+	privilege := Privilege{
+		Grantee:       `User"Name`,
+		Grantor:       "SYSDBA",
+		PrivilegeCode: "S",
+		SubjectName:   `Order"Table`,
+		FieldName:     sql.NullString{String: "Order ID", Valid: true},
+		GranteeType:   sql.NullInt64{Int64: 8, Valid: true},
+		SubjectType:   sql.NullInt64{Int64: 0, Valid: true},
+		GrantOption:   sql.NullInt64{Int64: 1, Valid: true},
+	}
+	got, err = privilege.GenerateDDL()
+	if err != nil || got != `GRANT SELECT ("Order ID") ON "Order""Table" TO "User""Name" WITH GRANT OPTION` {
+		t.Fatalf("privilege DDL = (%q, %v), want quoted grant", got, err)
+	}
+}
+
+func TestDDLReportsUnsupportedMetadataInsteadOfSilentlyDroppingIt(t *testing.T) {
+	function := Function{Name: "GO_EXTERNAL"}
+	if _, err := function.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("function GenerateDDL error = %v, want ErrUnsupportedDDL", err)
+	}
+
+	table := Relation{Name: "INCOMPLETE", Kind: RelationTable}
+	if _, err := table.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("incomplete table GenerateDDL error = %v, want ErrUnsupportedDDL", err)
+	}
+
+	domain := Domain{Name: "ARRAY_DOMAIN", FieldType: sql.NullInt64{Int64: 8, Valid: true}, Dimensions: sql.NullInt64{Int64: 1, Valid: true}}
+	if _, err := domain.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("array domain GenerateDDL error = %v, want ErrUnsupportedDDL", err)
+	}
+}
+
+func TestDDLUsesTokenBoundariesAndCanonicalClauseOrder(t *testing.T) {
+	domain := Domain{
+		Name:             "ORDERED_DOMAIN",
+		FieldType:        sql.NullInt64{Int64: fieldTypeVarchar, Valid: true},
+		CharacterLength:  sql.NullInt64{Int64: 20, Valid: true},
+		CharacterSetID:   sql.NullInt64{Int64: 4, Valid: true},
+		CharacterSetName: sql.NullString{String: "UTF8", Valid: true},
+		CollationID:      sql.NullInt64{Int64: 1, Valid: true},
+		CollationName:    sql.NullString{String: "UTF8", Valid: true},
+		DefaultSource:    sql.NullString{String: "DEFAULT\t'unknown'", Valid: true},
+		NullFlag:         sql.NullInt64{Int64: 1, Valid: true},
+		ValidationSource: sql.NullString{String: "CHECK(\nVALUE <> ''\n)", Valid: true},
+	}
+	ddl, err := domain.GenerateDDL()
+	if err != nil {
+		t.Fatalf("domain GenerateDDL returned error: %v", err)
+	}
+	upper := strings.ToUpper(ddl)
+	if strings.Count(upper, "DEFAULT") != 1 || strings.Count(upper, "CHECK") != 1 {
+		t.Fatalf("domain DDL = %q, want token-aware DEFAULT/CHECK clauses without duplication", ddl)
+	}
+	for _, pair := range [][2]string{{"DEFAULT", "NOT NULL"}, {"NOT NULL", "CHECK"}, {"CHECK", "COLLATE"}} {
+		if strings.Index(upper, pair[0]) >= strings.Index(upper, pair[1]) {
+			t.Fatalf("domain DDL = %q, want %s before %s", ddl, pair[0], pair[1])
+		}
+	}
+
+	table := Relation{
+		Name:              "ORDERED_TABLE",
+		Kind:              RelationTable,
+		ConstraintsLoaded: true,
+		Columns: []Column{{
+			Name:          "TEXT_VALUE",
+			RelationName:  "ORDERED_TABLE",
+			FieldSource:   sql.NullString{String: "RDB$TEXT", Valid: true},
+			Domain:        &Domain{Name: "RDB$TEXT", SystemFlag: sql.NullInt64{Int64: 1, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeVarchar, Valid: true}, CharacterLength: sql.NullInt64{Int64: 20, Valid: true}, CharacterSetID: sql.NullInt64{Int64: 4, Valid: true}, CharacterSetName: sql.NullString{String: "UTF8", Valid: true}},
+			DefaultSource: sql.NullString{String: "DEFAULT\n'v'", Valid: true},
+			Nullable:      sql.NullBool{Bool: false, Valid: true},
+			CollationID:   sql.NullInt64{Int64: 1, Valid: true},
+			CollationName: sql.NullString{String: "UTF8", Valid: true},
+		}},
+	}
+	tableDDL, err := table.GenerateDDL()
+	if err != nil {
+		t.Fatalf("table GenerateDDL returned error: %v", err)
+	}
+	columnUpper := strings.ToUpper(tableDDL)
+	for _, pair := range [][2]string{{"DEFAULT", "NOT NULL"}, {"NOT NULL", "COLLATE"}} {
+		if strings.Index(columnUpper, pair[0]) >= strings.Index(columnUpper, pair[1]) {
+			t.Fatalf("table DDL = %q, want %s before %s", tableDDL, pair[0], pair[1])
+		}
+	}
+}
+
+func TestTableDDLPreservesNamedNotNullConstraintInline(t *testing.T) {
+	table := Relation{
+		Name:              "NAMED_NOT_NULL",
+		Kind:              RelationTable,
+		ConstraintsLoaded: true,
+		Columns: []Column{{
+			Name:         "VALUE",
+			RelationName: "NAMED_NOT_NULL",
+			Domain:       &Domain{Name: "RDB$VALUE", SystemFlag: sql.NullInt64{Int64: 1, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}},
+		}},
+		Constraints: []Constraint{{
+			Name:           "NAMED_NOT_NULL_VALUE",
+			ConstraintType: string(ConstraintNotNull),
+			RelationName:   "NAMED_NOT_NULL",
+			ColumnName:     sql.NullString{String: "VALUE", Valid: true},
+		}},
+	}
+
+	ddl, err := table.GenerateDDL()
+	if err != nil {
+		t.Fatalf("table GenerateDDL returned error: %v", err)
+	}
+	if !strings.Contains(ddl, `"VALUE" INTEGER CONSTRAINT "NAMED_NOT_NULL_VALUE" NOT NULL`) {
+		t.Fatalf("table DDL = %q, want named NOT NULL inline on VALUE", ddl)
+	}
+}
+
+func TestDDLUsesExactCatalogEnumValuesAndPreservesSourceCase(t *testing.T) {
+	table := Relation{
+		Name:              "GTT_TABLE",
+		Kind:              RelationTable,
+		RelationType:      sql.NullString{String: "GLOBAL_TEMPORARY_PRESERVE_ROWS", Valid: true},
+		ConstraintsLoaded: true,
+		Columns: []Column{{
+			Name:   "VALUE",
+			Domain: &Domain{FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}},
+		}},
+	}
+	ddl, err := table.GenerateDDL()
+	if err != nil {
+		t.Fatalf("GTT GenerateDDL returned error: %v", err)
+	}
+	if !strings.HasPrefix(ddl, `CREATE GLOBAL TEMPORARY TABLE "GTT_TABLE"`) || !strings.HasSuffix(ddl, "ON COMMIT PRESERVE ROWS") {
+		t.Fatalf("GTT DDL = %q, want exact valid relation type rendering", ddl)
+	}
+
+	invalid := table
+	invalid.RelationType = sql.NullString{String: "GLOBAL_TEMPORARY_UNKNOWN", Valid: true}
+	if _, err := invalid.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("invalid relation type error = %v, want ErrUnsupportedDDL", err)
+	}
+
+	if _, err := constraintDefinition(Constraint{
+		Name:           "LOWERCASE_CHECK",
+		ConstraintType: "check",
+		CheckSource:    sql.NullString{String: "CHECK (VALUE > 0)", Valid: true},
+	}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("lowercase constraint type error = %v, want exact enum rejection", err)
+	}
+
+	domain := Domain{
+		Name:          "CASE_SOURCE",
+		FieldType:     sql.NullInt64{Int64: fieldTypeInteger, Valid: true},
+		DefaultSource: sql.NullString{String: "default  7", Valid: true},
+	}
+	if ddl, err := domain.GenerateDDL(); err != nil || !strings.Contains(ddl, " default  7") {
+		t.Fatalf("source case DDL = (%q, %v), want original source case preserved", ddl, err)
+	}
+}
+
+func TestDDLRejectsAmbiguousAndLossyTypeMetadata(t *testing.T) {
+	tests := []struct {
+		name   string
+		domain Domain
+	}{
+		{
+			name: "scaled double without numeric metadata",
+			domain: Domain{
+				Name:       "SCALED_DOUBLE",
+				FieldType:  sql.NullInt64{Int64: fieldTypeDouble, Valid: true},
+				FieldScale: sql.NullInt64{Int64: -2, Valid: true},
+			},
+		},
+		{
+			name: "multibyte character length missing",
+			domain: Domain{
+				Name:             "UTF8_BYTES_ONLY",
+				FieldType:        sql.NullInt64{Int64: fieldTypeVarchar, Valid: true},
+				FieldLength:      sql.NullInt64{Int64: 40, Valid: true},
+				CharacterSetID:   sql.NullInt64{Int64: 4, Valid: true},
+				CharacterSetName: sql.NullString{String: "UTF8", Valid: true},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := test.domain.SQLType(); !errors.Is(err, ErrUnsupportedDDL) {
+				t.Fatalf("SQLType error = %v, want ErrUnsupportedDDL", err)
+			}
+		})
+	}
+
+	validScaled := Domain{
+		Name:           "SCALED_DOUBLE",
+		FieldType:      sql.NullInt64{Int64: fieldTypeDouble, Valid: true},
+		FieldSubType:   sql.NullInt64{Int64: 1, Valid: true},
+		FieldPrecision: sql.NullInt64{Int64: 15, Valid: true},
+		FieldScale:     sql.NullInt64{Int64: -2, Valid: true},
+	}
+	if got, err := validScaled.SQLType(); err != nil || got != "NUMERIC(15, 2)" {
+		t.Fatalf("scaled DOUBLE SQLType = (%q, %v), want NUMERIC(15, 2)", got, err)
+	}
+
+	computed := Relation{
+		Name:              "COMPUTED_TABLE",
+		Kind:              RelationTable,
+		ConstraintsLoaded: true,
+		Columns: []Column{{
+			Name:           "COMPUTED_VALUE",
+			RelationName:   "COMPUTED_TABLE",
+			FieldSource:    sql.NullString{String: "RDB$COMPUTED", Valid: true},
+			ComputedSource: sql.NullString{String: "COMPUTED\tBY VALUE + 1", Valid: true},
+			Domain:         &Domain{Name: "RDB$COMPUTED", SystemFlag: sql.NullInt64{Int64: 1, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}},
+		}},
+	}
+	if _, err := computed.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("computed column DDL error = %v, want ErrUnsupportedDDL", err)
+	}
+}
+
+func TestProcedureDDLRequiresExactCountsAndCompleteParameters(t *testing.T) {
+	base := Procedure{
+		Name:        "COUNTED_PROCEDURE",
+		Source:      sql.NullString{String: "BEGIN END", Valid: true},
+		InputCount:  sql.NullInt64{Int64: 1, Valid: true},
+		OutputCount: sql.NullInt64{Int64: 0, Valid: true},
+		InputParameters: []ProcedureParameter{{
+			Name:          "INPUT_VALUE",
+			ProcedureName: "COUNTED_PROCEDURE",
+			Number:        sql.NullInt64{Int64: 0, Valid: true},
+			Direction:     ParameterInput,
+			ParameterType: sql.NullInt64{Int64: 0, Valid: true},
+			FieldSource:   sql.NullString{String: "RDB$INPUT", Valid: true},
+			Domain:        &Domain{Name: "RDB$INPUT", SystemFlag: sql.NullInt64{Int64: 1, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}},
+			Nullable:      sql.NullBool{Bool: true, Valid: true},
+		}},
+	}
+	if _, err := base.GenerateDDL(); err != nil {
+		t.Fatalf("complete procedure GenerateDDL returned error: %v", err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*Procedure)
+	}{
+		{name: "input count mismatch", mutate: func(procedure *Procedure) { procedure.InputCount.Int64 = 2 }},
+		{name: "input count unknown", mutate: func(procedure *Procedure) { procedure.InputCount.Valid = false }},
+		{name: "parameter position unknown", mutate: func(procedure *Procedure) { procedure.InputParameters[0].Number.Valid = false }},
+		{name: "parameter domain unknown", mutate: func(procedure *Procedure) { procedure.InputParameters[0].Domain = nil }},
+		{name: "parameter nullability unknown", mutate: func(procedure *Procedure) { procedure.InputParameters[0].Nullable = sql.NullBool{} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := base
+			candidate.InputParameters = append([]ProcedureParameter(nil), base.InputParameters...)
+			test.mutate(&candidate)
+			if _, err := candidate.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+				t.Fatalf("GenerateDDL error = %v, want ErrUnsupportedDDL", err)
+			}
+		})
+	}
+}
+
+func TestPrivilegeDDLHonorsGranteeAndSubjectTypes(t *testing.T) {
+	tests := []struct {
+		name      string
+		privilege Privilege
+		want      string
+	}{
+		{
+			name:      "trigger grantee",
+			privilege: Privilege{Grantee: "TRIGGER_GRANTEE", GranteeType: sql.NullInt64{Int64: 2, Valid: true}, PrivilegeCode: "S", SubjectName: "TABLE_NAME", SubjectType: sql.NullInt64{Int64: 0, Valid: true}},
+			want:      `GRANT SELECT ON "TABLE_NAME" TO TRIGGER "TRIGGER_GRANTEE"`,
+		},
+		{
+			name:      "view subject and procedure grantee",
+			privilege: Privilege{Grantee: "PROC_GRANTEE", GranteeType: sql.NullInt64{Int64: 5, Valid: true}, PrivilegeCode: "S", SubjectName: "VIEW_NAME", SubjectType: sql.NullInt64{Int64: 1, Valid: true}},
+			want:      `GRANT SELECT ON VIEW "VIEW_NAME" TO PROCEDURE "PROC_GRANTEE"`,
+		},
+		{
+			name:      "role membership",
+			privilege: Privilege{Grantee: "USER_NAME", GranteeType: sql.NullInt64{Int64: 8, Valid: true}, PrivilegeCode: "M", SubjectName: "ROLE_NAME", SubjectType: sql.NullInt64{Int64: 13, Valid: true}},
+			want:      `GRANT "ROLE_NAME" TO "USER_NAME"`,
+		},
+		{
+			name:      "role grantee",
+			privilege: Privilege{Grantee: "ROLE_NAME", GranteeType: sql.NullInt64{Int64: 13, Valid: true}, PrivilegeCode: "S", SubjectName: "TABLE_NAME", SubjectType: sql.NullInt64{Int64: 0, Valid: true}},
+			want:      `GRANT SELECT ON "TABLE_NAME" TO "ROLE_NAME"`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.privilege.GenerateDDL()
+			if err != nil || got != test.want {
+				t.Fatalf("GenerateDDL = (%q, %v), want (%q, nil)", got, err, test.want)
+			}
+		})
+	}
+
+	unknown := Privilege{Grantee: "UNKNOWN", GranteeType: sql.NullInt64{Int64: 99, Valid: true}, PrivilegeCode: "S", SubjectName: "TABLE", SubjectType: sql.NullInt64{Int64: 0, Valid: true}}
+	if _, err := unknown.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("unknown grantee type error = %v, want ErrUnsupportedDDL", err)
+	}
+}
+
+func TestTriggerEventDecodesAllDMLOperationsWithoutOverwriting(t *testing.T) {
+	got, err := triggerEvent(17) // BEFORE INSERT OR UPDATE
+	if err != nil {
+		t.Fatalf("triggerEvent returned error: %v", err)
+	}
+	if got != "BEFORE INSERT OR UPDATE" {
+		t.Fatalf("triggerEvent(17) = %q, want BEFORE INSERT OR UPDATE", got)
+	}
+
+	if _, err := triggerEvent(1 << 7); err == nil {
+		t.Fatal("triggerEvent accepted a code with unsupported reserved bits")
+	}
+
+	trigger := Trigger{
+		Name:         "MULTI_EVENT_TRIGGER",
+		RelationName: sql.NullString{String: "TABLE_NAME", Valid: true},
+		TriggerType:  sql.NullInt64{Int64: 17, Valid: true},
+		Sequence:     sql.NullInt64{Int64: 0, Valid: true},
+		Source:       sql.NullString{String: "AS BEGIN END", Valid: true},
+	}
+	if _, err := trigger.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("multi-event trigger GenerateDDL error = %v, want ErrUnsupportedDDL", err)
+	}
+}
+
+func TestInactiveIndexExposesExecutableStatements(t *testing.T) {
+	index := Index{
+		Name:         "INACTIVE_INDEX",
+		RelationName: "TABLE_NAME",
+		UniqueFlag:   sql.NullInt64{Int64: 1, Valid: true},
+		Inactive:     sql.NullInt64{Int64: 1, Valid: true},
+		IndexType:    sql.NullInt64{Int64: 1, Valid: true},
+		Segments:     []IndexSegment{{FieldName: "VALUE"}},
+	}
+	want := []string{
+		`CREATE UNIQUE DESCENDING INDEX "INACTIVE_INDEX" ON "TABLE_NAME" ("VALUE")`,
+		`ALTER INDEX "INACTIVE_INDEX" INACTIVE`,
+	}
+	got, err := index.Statements()
+	if err != nil {
+		t.Fatalf("Statements() returned error: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Statements() = %#v, want %#v", got, want)
+	}
+
+	invalid := index
+	invalid.IndexType = sql.NullInt64{Int64: 2, Valid: true}
+	if _, err := invalid.Statements(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("invalid Statements() error = %v, want ErrUnsupportedDDL", err)
+	}
+}
+
+func domainNames(domains []Domain) []string {
+	names := make([]string, 0, len(domains))
+	for _, domain := range domains {
+		names = append(names, domain.Name)
+	}
+	return names
+}

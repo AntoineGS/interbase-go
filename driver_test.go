@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
 	"math"
 	"reflect"
 	"strconv"
@@ -59,6 +60,9 @@ func TestConfigCharsetNormalizesSupportedValues(t *testing.T) {
 		{name: "empty defaults to UTF8", input: "", want: "UTF8"},
 		{name: "UTF8", input: "utf8", want: "UTF8"},
 		{name: "WIN1250", input: "win1250", want: "WIN1250"},
+		{name: "WIN1252", input: "win1252", want: "WIN1252"},
+		{name: "ISO8859_1", input: "iso8859_1", want: "ISO8859_1"},
+		{name: "ASCII", input: "ascii", want: "ASCII"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -133,6 +137,29 @@ func TestNewConnectorRejectsUnsupportedCharset(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "super-secret") {
 		t.Fatalf("error leaked password: %q", err)
+	}
+}
+
+func TestDatabaseSQLRejectsSubscriptionSessionControl(t *testing.T) {
+	queries := []string{
+		"SET SUBSCRIPTION SUB_CUSTOMER_CHANGE ACTIVE",
+		"set   subscription SUB_CUSTOMER_CHANGE inactive",
+		"-- configure the change view\n SET /* keep the session isolated */ SUBSCRIPTION SUB_CUSTOMER_CHANGE ACTIVE",
+	}
+	for _, query := range queries {
+		_, err := convertQuery(query, nil)
+		if err == nil {
+			t.Fatalf("convertQuery(%q) accepted subscription session control", query)
+		}
+		if !strings.Contains(err.Error(), "explicit direct API") {
+			t.Fatalf("convertQuery(%q) error = %v, want explicit direct API guidance", query, err)
+		}
+	}
+}
+
+func TestDirectQueryValidationAllowsSubscriptionSessionControl(t *testing.T) {
+	if err := validateQueryText("SET SUBSCRIPTION SUB_CUSTOMER_CHANGE ACTIVE"); err != nil {
+		t.Fatalf("validateQueryText rejected direct subscription control: %v", err)
 	}
 }
 
@@ -500,6 +527,52 @@ func TestStmtCloseIsIdempotent(t *testing.T) {
 	}
 	if !s.closed || s.native != nil {
 		t.Fatalf("statement close did not clear native ownership: closed=%t native=%v", s.closed, s.native)
+	}
+}
+
+func TestStmtCloseDoesNotCloseDirectSiblingRowsAfterRepeatedClose(t *testing.T) {
+	c := &conn{
+		rows:       make(map[*rows]struct{}),
+		statements: make(map[*stmt]struct{}),
+	}
+	s := &stmt{conn: c, native: &nativeStatement{}}
+	direct := &rows{
+		conn:   c,
+		native: &nativeCursor{},
+	}
+	c.statements[s] = struct{}{}
+	c.rows[direct] = struct{}{}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("first statement close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second statement close: %v", err)
+	}
+	if direct.closed {
+		t.Fatal("repeated statement close closed an unrelated direct row")
+	}
+	if _, ok := c.rows[direct]; !ok {
+		t.Fatal("repeated statement close unregistered an unrelated direct row")
+	}
+}
+
+func TestInvalidatedSiblingRowsDoNotReportCleanEOF(t *testing.T) {
+	c := &conn{rows: make(map[*rows]struct{})}
+	r := &rows{
+		conn:   c,
+		native: &nativeCursor{},
+	}
+	c.rows[r] = struct{}{}
+
+	cause := errors.New("query failed while invalidating connection")
+	c.invalidateLocked(cause)
+	err := r.Next(nil)
+	if err == nil || errors.Is(err, io.EOF) || !errors.Is(err, cause) {
+		t.Fatalf("invalidated row Next error = %v, want terminal error", err)
+	}
+	if r.native != nil {
+		t.Fatal("invalidated row retained a native cursor pointer")
 	}
 }
 
