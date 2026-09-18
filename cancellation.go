@@ -61,6 +61,31 @@ type UncertainOutcomeError struct {
 	Cleanup   error
 }
 
+// cancellationCleanupError preserves a non-mutating cancellation's cleanup
+// diagnostics without rendering the cleanup error. It is intentionally not an
+// UncertainOutcomeError: cleanup failure makes a canceled write uncertain, but
+// does not establish an uncertain write outcome for a read-only operation.
+type cancellationCleanupError struct {
+	Operation string
+	Cause     error
+	Cleanup   error
+}
+
+func (e *cancellationCleanupError) Error() string {
+	if e == nil {
+		return "interbase: canceled operation cleanup failed"
+	}
+	return fmt.Sprintf("interbase: %s canceled; cleanup failed",
+		safeOperationName(e.Operation, "operation"))
+}
+
+func (e *cancellationCleanupError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	return joinErrorValues(e.Cause, e.Cleanup)
+}
+
 // nativeCancelOperation owns one cancellation slot generation and its single
 // context watcher. The executing native call owns the slot while it is active;
 // finish joins the watcher before close can destroy the slot.
@@ -188,23 +213,20 @@ func (o *nativeCancelOperation) finish() {
 	if o == nil || !o.started.Load() {
 		return
 	}
-	if o.finished.CompareAndSwap(false, true) {
-		close(o.done)
-	}
-	<-o.watcherDone
 	o.close()
 }
 
-// close is idempotent and retains the ownership boundary in one place. If a
-// caller closes an operation directly, finish first joins its watcher.
+// close is idempotent and retains the ownership boundary in one place. Every
+// destruction path waits for watcherDone, including a close concurrent with a
+// finish that has already published the finished signal.
 func (o *nativeCancelOperation) close() {
 	if o == nil || !o.started.Load() {
 		return
 	}
-	if !o.finished.Load() {
-		o.finish()
-		return
+	if o.finished.CompareAndSwap(false, true) {
+		close(o.done)
 	}
+	<-o.watcherDone
 	if o.closed.CompareAndSwap(false, true) {
 		o.slot.close()
 	}
@@ -323,7 +345,11 @@ func classifyNativeOutcome(operation string, mutating bool, contextErr error,
 		}
 	}
 	if cleanupErr != nil {
-		return errors.Join(canceled, cleanupErr)
+		return &cancellationCleanupError{
+			Operation: operation,
+			Cause:     canceled,
+			Cleanup:   cleanupErr,
+		}
 	}
 	return canceled
 }

@@ -5,6 +5,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +22,7 @@ type fakeCancelSlot struct {
 	cancelGenerations []uint64
 	cancelStarted     chan struct{}
 	cancelStartedOnce sync.Once
+	publication       <-chan struct{}
 	cancelRelease     <-chan struct{}
 	cancelErr         error
 	nativeCode        int64
@@ -47,6 +50,9 @@ func (s *fakeCancelSlot) cancel(generation uint64) (nativeCancelResult, error) {
 	s.mu.Unlock()
 	if started != nil {
 		s.cancelStartedOnce.Do(func() { close(started) })
+	}
+	if s.publication != nil {
+		<-s.publication
 	}
 	if release != nil {
 		<-release
@@ -83,6 +89,17 @@ func waitForTestSignal(t *testing.T, signal <-chan struct{}, message string) {
 	}
 }
 
+func waitForTestCondition(t *testing.T, condition func() bool, message string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for !condition() && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if !condition() {
+		t.Fatal(message)
+	}
+}
+
 func TestNativeCancelOperationRejectsPreCanceledContextBeforeBegin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -99,7 +116,54 @@ func TestNativeCancelOperationRejectsPreCanceledContextBeforeBegin(t *testing.T)
 	}
 }
 
-func TestNativeCancelOperationWaitsForCancellationRequestBeforeClosingSlot(t *testing.T) {
+func TestNativeCancelOperationWaitsForPublicationAndCancellationBeforeClosingSlot(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	publication := make(chan struct{})
+	cancelRelease := make(chan struct{})
+	slot := &fakeCancelSlot{
+		cancelStarted: make(chan struct{}),
+		publication:   publication,
+		cancelRelease: cancelRelease,
+	}
+	op := &nativeCancelOperation{slot: slot}
+	if err := op.begin(ctx); err != nil {
+		t.Fatalf("begin() error = %v", err)
+	}
+	slot.mu.Lock()
+	slot.watcherDone = op.watcherDone
+	slot.mu.Unlock()
+
+	cancel()
+	waitForTestSignal(t, slot.cancelStarted, "watcher did not wait for publication")
+	finished := make(chan struct{})
+	go func() {
+		op.finish()
+		close(finished)
+	}()
+	select {
+	case <-finished:
+		t.Fatal("finish returned before cancellation request completed")
+	default:
+	}
+
+	close(publication)
+	select {
+	case <-finished:
+		t.Fatal("finish returned before the published cancellation request completed")
+	default:
+	}
+	close(cancelRelease)
+	waitForTestSignal(t, finished, "finish did not join the cancellation watcher")
+	_, cancelCalls, closeCalls, _, beforeWatch := slot.snapshot()
+	if cancelCalls != 1 || closeCalls != 1 {
+		t.Fatalf("slot lifecycle = cancel %d, close %d; want one each", cancelCalls, closeCalls)
+	}
+	if beforeWatch {
+		t.Fatal("slot closed before watcher joined")
+	}
+}
+
+func TestNativeCancelOperationOverlappingFinishAndCloseWaitsForWatcher(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelRelease := make(chan struct{})
 	slot := &fakeCancelSlot{
@@ -115,26 +179,38 @@ func TestNativeCancelOperationWaitsForCancellationRequestBeforeClosingSlot(t *te
 	slot.mu.Unlock()
 
 	cancel()
-	waitForTestSignal(t, slot.cancelStarted, "watcher did not request native cancellation")
-	finished := make(chan struct{})
+	waitForTestSignal(t, slot.cancelStarted, "watcher did not enter cancellation request")
+	finishDone := make(chan struct{})
 	go func() {
 		op.finish()
-		close(finished)
+		close(finishDone)
 	}()
+	waitForTestCondition(t, op.finished.Load,
+		"finish did not publish completion before close overlap")
+
+	closeAttempted := make(chan struct{})
+	closeDone := make(chan struct{})
+	go func() {
+		close(closeAttempted)
+		op.close()
+		close(closeDone)
+	}()
+	waitForTestSignal(t, closeAttempted, "close did not overlap finish")
 	select {
-	case <-finished:
-		t.Fatal("finish returned before cancellation request completed")
+	case <-closeDone:
+		t.Fatal("close destroyed the slot before watcher completion")
 	default:
 	}
 
 	close(cancelRelease)
-	waitForTestSignal(t, finished, "finish did not join the cancellation watcher")
-	_, cancelCalls, closeCalls, _, beforeWatch := slot.snapshot()
-	if cancelCalls != 1 || closeCalls != 1 {
-		t.Fatalf("slot lifecycle = cancel %d, close %d; want one each", cancelCalls, closeCalls)
+	waitForTestSignal(t, finishDone, "finish did not complete after cancellation request")
+	waitForTestSignal(t, closeDone, "close did not complete after watcher join")
+	_, _, closeCalls, _, beforeWatch := slot.snapshot()
+	if closeCalls != 1 || beforeWatch {
+		t.Fatalf("slot close lifecycle = calls %d beforeWatch=%v", closeCalls, beforeWatch)
 	}
-	if beforeWatch {
-		t.Fatal("slot closed before watcher joined")
+	if err := classifyNativeOutcome("execute statement", true, ctx.Err(), nil, nil); err != nil {
+		t.Fatalf("successful completion was replaced by cancellation: %v", err)
 	}
 }
 
@@ -206,7 +282,11 @@ func TestNativeCancelOperationReportsCancellationRequestFailureWithoutChangingRe
 	}
 }
 
-func TestNativeCancelOperationPassesOneGenerationAndJoinsDelayedWatcher(t *testing.T) {
+// Task 1's native harness proves that a stale generation cannot cancel the
+// next operation. This Go test only proves that the first watcher is joined
+// before a backend can be reused; its fake backend forwards generations and
+// cannot prove the native slot's rejection rule.
+func TestNativeCancelOperationJoinsWatcherBeforeSlotReuse(t *testing.T) {
 	firstContext, cancelFirst := context.WithCancel(context.Background())
 	slot := &fakeCancelSlot{cancelStarted: make(chan struct{})}
 	first := &nativeCancelOperation{slot: slot}
@@ -223,7 +303,7 @@ func TestNativeCancelOperationPassesOneGenerationAndJoinsDelayedWatcher(t *testi
 	cancelFirst()
 	select {
 	case <-slot.cancelStarted:
-		t.Fatal("delayed first watcher targeted the second generation")
+		t.Fatal("delayed first watcher survived slot reuse")
 	default:
 	}
 	cancelSecond()
@@ -237,6 +317,49 @@ func TestNativeCancelOperationPassesOneGenerationAndJoinsDelayedWatcher(t *testi
 	}
 	if len(generations) != 1 || generations[0] != 2 {
 		t.Fatalf("cancellation generations = %v, want [2]", generations)
+	}
+}
+
+type cleanupDiagnostic struct {
+	message string
+}
+
+func (e *cleanupDiagnostic) Error() string { return e.message }
+
+func TestClassifyReadOnlyCancellationRedactsCleanupMessageAndPreservesIdentity(t *testing.T) {
+	const secret = "UPDATE accounts SET password='secret' attachment=/private/db.ib"
+	native := &NativeError{
+		Operation:  "fetch rows",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	cleanup := &cleanupDiagnostic{message: secret}
+
+	err := classifyNativeOutcome("fetch rows", false, context.DeadlineExceeded, native, cleanup)
+	if err == nil {
+		t.Fatal("read-only cancellation with cleanup returned nil")
+	}
+	var cancellationErr *CancellationError
+	if !errors.As(err, &cancellationErr) {
+		t.Fatal("read-only cleanup lost CancellationError identity")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("read-only cleanup lost context identity")
+	}
+	var nativeErr *NativeError
+	if !errors.As(err, &nativeErr) || !errors.Is(err, native) {
+		t.Fatal("read-only cleanup lost native cancellation identity")
+	}
+	var cleanupErr *cleanupDiagnostic
+	if !errors.As(err, &cleanupErr) || !errors.Is(err, cleanup) {
+		t.Fatal("read-only cleanup lost cleanup identity")
+	}
+	var uncertainErr *UncertainOutcomeError
+	if errors.As(err, &uncertainErr) {
+		t.Fatal("read-only cleanup was classified as uncertain write")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("read-only cancellation rendered cleanup secret: %v", err)
 	}
 }
 
