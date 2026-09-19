@@ -332,6 +332,12 @@ attachment cleanup closes any remaining native BLOB handles. The standard
 - `ExecContext` for DML/DDL, with DML affected-row counts and implicit commit.
   `LastInsertId` is unsupported.
 - Reusable server-side prepared statements via `PrepareContext`.
+- Best-effort context cancellation for DSQL prepare, execute, and fetch calls:
+  `database/sql` `PrepareContext`, direct and prepared `ExecContext`,
+  `QueryContext`/`QueryRowContext` and `Rows.Next`, plus direct
+  `Transaction.Query`, `Transaction.Exec`, `Transaction.Plan`, and
+  `Cursor.Next`. The executing native result remains authoritative; the
+  cancellation request never replaces a result that already completed.
 - Explicit transactions with standard read-committed, repeatable-read/snapshot,
   and serializable isolation, read-only transactions, connector-level wait and
   record-version policies, table reservations, and SQL savepoints. Use the Go
@@ -431,9 +437,63 @@ do not run untrusted SQL. The supplied probe/tests never call them.
   tested InterBase 15.1 stack too. See the native comparison in
   [integration/README.md](integration/README.md#mixed-character-set-parameters).
   The driver does not silently rewrite SQL or open secondary attachments.
-- **Context cancellation cannot interrupt an in-flight native call.** It is
-  checked before/after native operations and between rows. A stalled native
-  call can outlive its context deadline; use a process timeout for experiments.
+- **DSQL context cancellation is best effort, not a hard deadline.** The DSQL
+  prepare/execute/fetch operations listed under [Supported Boundary](#supported-boundary)
+  start a native cancellation request when their context is canceled
+  after native entry. The executing result is authoritative: a successful
+  prepare, execute, or fetch remains successful even if the context expires
+  concurrently, while an executing `isc_cancelled` result is reported through
+  a typed cancellation error. A successful cancellation request by itself does
+  not establish the operation outcome. Each fetch watcher is joined before the
+  rows, cursor, or statement can be closed or reused.
+- Cancellation latency depends on the native client and operation. On the
+  tested Linux/amd64 InterBase 15.1 `LI-V15.1.0.42` stack, a roughly
+  3.2-second aggregate fetch returned `isc_cancelled` about 101 ms after the
+  request, while a statement waiting for a row lock returned only after roughly
+  9.2–10 seconds. These are observations, not guarantees; a stalled DSQL call
+  can outlive its context deadline, so use process supervision for a hard bound.
+- Canceled DSQL errors match the originating context through `errors.Is` and
+  retain native diagnostics through `errors.As`. A canceled mutating operation
+  returns `CancellationError` when rollback or the caller-owned transaction
+  state is confirmed. If the final write outcome cannot be established,
+  `UncertainOutcomeError` is returned instead. Canceled writes must not be
+  blindly retried: reconcile an uncertain outcome using an operation ID or
+  database state before deciding whether a retry is safe. Cancellation alone
+  never becomes `driver.ErrBadConn`, so `database/sql` does not replay it.
+  Cancellation never commits or rolls back a caller-owned explicit transaction;
+  the caller remains responsible for completing it.
+
+  ```go
+  ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+  defer cancel()
+
+  _, err := db.ExecContext(ctx, query, args...)
+  if err == nil {
+      return nil
+  }
+
+  var uncertain *interbase.UncertainOutcomeError
+  if errors.As(err, &uncertain) {
+      // Reconcile the operation ID or database state before any retry.
+      return err
+  }
+
+  var canceled *interbase.CancellationError
+  if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+      if errors.As(err, &canceled) {
+          var native *interbase.NativeError
+          _ = errors.As(err, &native) // isc_cancelled diagnostics, when present.
+          return err
+      }
+  }
+  return err
+  ```
+- Context cancellation does not interrupt non-DSQL native calls once they have
+  entered the client. Attachment open/create/drop, transaction begin/commit/
+  rollback/retaining and distributed completion, BLOB segment/array I/O,
+  Services, and Events keep their existing admission and cleanup semantics.
+  Event wait cancellation remains a separate subscription behavior and is not
+  a DSQL cancellation guarantee.
 - TLS is passed to the native client as an attachment option. The repository
   has an isolated certificate fixture, but the strict matrix is intentionally
   nonzero with vendor client `LI-V15.1.0.42`: it accepts a wrong hostname.
@@ -446,13 +506,37 @@ do not run untrusted SQL. The supplied probe/tests never call them.
   It deliberately avoids the legacy unbounded `isc_interprete` function and
   omits detailed server-provided strings.
 - Race/ASan checks do not establish complete leak-freedom inside the proprietary
-  client library, safe asynchronous cancellation, or production readiness.
+  client library, a universal DSQL cancellation latency/thread-safety guarantee,
+  or production readiness.
 
 ## Verification Record
 
 Production-hardening commands and execution semantics are documented in
 [docs/production-hardening.md](docs/production-hardening.md). Deferred feature
 requests are tracked in [docs/TODO.md](docs/TODO.md).
+
+On 2026-09-18, the complete serial DSQL-cancellation verification passed with
+the Linux/amd64 InterBase 15.1 client: `make test` (eight Go packages and ten
+native ASan/leak harnesses) took 19.99 seconds, race took 28.90 seconds,
+checkptr 3.38 seconds, tagged integration vet 1.34 seconds, and the runner
+reported **42/42** in 11.09 seconds. The cancellation target passed ten
+iterations in 12.88 seconds (16.68 seconds including Docker setup/cleanup),
+the fault matrix took 16.72 seconds, and the native lifecycle target took 6.80
+seconds. The final four-worker, 120-second soak ran for 2m0.003813076s and
+validated 122,283 operations: 61,143 committed writes, 61,140 rolled-back
+writes, 61,143 persisted values, 30,573 physical opens/closes, and 30,572
+identity replacements. Throughput was 1,018.99 operations/s; average and
+maximum latencies were 3.925199 ms and 27.478933 ms. After close, both pools
+were empty, with six file descriptors and two goroutines. `make build` took
+0.37 seconds. The raw soak log is
+`/tmp/opencode/dsql-context-task-7-20260918/09-test-soak-120s.log`.
+
+The initial unqualified `make test`, race, and vet invocations failed before
+testing because the temporary SDK include/runtime paths were not supplied;
+reruns with the explicit paths in
+[production-hardening.md](docs/production-hardening.md) passed. These results
+measure a two-minute soak only and do not add a cross-version latency or
+thread-safety guarantee.
 
 On 2026-09-16, a fresh controller run completed `make test` with the official
 SDK: all six Go packages and all ten native ASan/leak harnesses passed.

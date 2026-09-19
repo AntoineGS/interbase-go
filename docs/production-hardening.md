@@ -7,17 +7,73 @@ keeps the client default; positive durations round upward to whole seconds.
 Negative durations and values exceeding the native unsigned 32-bit seconds
 field are rejected. This is an attachment timeout, not a query deadline.
 
-Context cancellation prevents execution when observed before native entry.
-It cannot interrupt an in-flight native call. A successfully completed
-`database/sql` execution returns its affected-row result even if cancellation
-arrives during that call; returning a result together with an error would make
-`database/sql` discard the result. A native error is preserved rather than
-converted to `driver.ErrBadConn` after a potentially executed operation.
+Context cancellation prevents execution when observed before native entry. For
+DSQL prepare, execute, and fetch operations, cancellation after native entry is
+best effort: the driver requests native DSQL cancellation, then waits for the
+executing call and its cleanup to finish. The executing result is authoritative.
+A successful `database/sql` execution therefore returns its affected-row result
+even if cancellation arrives during that call; returning an error would make
+`database/sql` discard the result and could invite an unsafe retry. A successful
+cancellation request is not itself an operation result. An executing
+`isc_cancelled` result after context cancellation is reported as a typed
+cancellation error, while another native error remains the native operation
+error. DSQL cancellation is never converted to `driver.ErrBadConn`.
 
-An error after a lost response does not prove a write failed. Applications must
-reconcile uncertain results using their own operation identifiers or database
-state before retrying. Explicit transaction execution success does not imply
-that its later commit succeeded.
+The supported DSQL entry points are `database/sql` `PrepareContext`, direct and
+prepared `ExecContext`, `QueryContext`/`QueryRowContext` and each `Rows.Next`,
+as well as direct `Transaction.Query`, `Transaction.Exec`, `Transaction.Plan`,
+and `Cursor.Next`. Procedures and context-bearing catalog work are covered when
+they use these DSQL paths. The watcher is joined before a rows, cursor, or
+statement handle is closed or reused.
+
+An error after a lost response does not prove a write failed. A canceled write
+with confirmed rollback (implicit transaction) or confirmed usable explicit
+transaction returns `CancellationError`; if rollback or final state cannot be
+confirmed, the driver returns `UncertainOutcomeError`. Applications must
+inspect these errors with `errors.Is`/`errors.As`, reconcile an uncertain result
+using their own operation identifier or database state, and never blindly retry
+the write. Explicit transaction execution success does not imply that its later
+commit succeeded. Cancellation never commits or rolls back a caller-owned
+explicit transaction; the caller remains responsible for completing it.
+
+For example:
+
+```go
+_, err := db.ExecContext(ctx, query, args...)
+if err == nil {
+    return nil
+}
+
+var uncertain *interbase.UncertainOutcomeError
+if errors.As(err, &uncertain) {
+    // Reconcile the operation ID or database state before deciding on a retry.
+    return err
+}
+
+var canceled *interbase.CancellationError
+if (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) &&
+    errors.As(err, &canceled) {
+    var native *interbase.NativeError
+    if errors.As(err, &native) {
+        log.Printf("DSQL cancellation status=%d", native.NativeCode)
+    }
+    return err
+}
+return err
+```
+
+DSQL cancellation has no hard latency limit. On the tested Linux/amd64
+InterBase 15.1 `LI-V15.1.0.42` client, a roughly 3.2-second aggregate fetch
+returned `isc_cancelled` about 101 ms after cancellation was requested. A
+statement waiting for a database row lock returned only after roughly 9.2–10
+seconds. These measurements are evidence for that client/server stack, not a
+portable bound; process supervision remains the hard bound for a stuck call.
+
+Non-DSQL native calls remain non-interruptible after entry. This includes
+attachment open/create/drop, transaction begin/commit/rollback/retaining and
+distributed completion, BLOB segment/array I/O, Services, and Events. Their
+existing context admission and cleanup behavior is unchanged; Event wait
+cancellation is a separate subscription contract, not DSQL cancellation.
 
 `TransactionOptions.NoWait` avoids waiting for conflicting database locks.
 It is not a general statement or network timeout. Process supervision remains
@@ -53,6 +109,32 @@ make test-native-lifecycle IMAGE=private-interbase:local INTERBASE_INCLUDE=/path
 make test-fuzz INTERBASE_INCLUDE=/path/to/sdk/include INTERBASE_LIB=/path/to/client/lib FUZZ_TIME=10s
 make bench INTERBASE_INCLUDE=/path/to/sdk/include INTERBASE_LIB=/path/to/client/lib
 make bench-live IMAGE=private-interbase:local INTERBASE_INCLUDE=/path/to/sdk/include BENCH_TIME=1s
+```
+
+For the complete DSQL-cancellation acceptance run used by this repository,
+execute the commands serially with the matching SDK and client library:
+
+```sh
+LD_LIBRARY_PATH=/tmp/opencode make test INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include INTERBASE_LIB=/tmp/opencode
+LD_LIBRARY_PATH=/tmp/opencode \
+  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+  go test -race ./... -count=1 -timeout=300s
+LD_LIBRARY_PATH=/tmp/opencode \
+  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+  go test -gcflags=all=-d=checkptr=2 ./... -count=1 -timeout=180s
+LD_LIBRARY_PATH=/tmp/opencode \
+  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+  go vet -tags=integration ./...
+make test-runner BATS=/tmp/opencode/parity-bats/bin/bats
+make test-cancellation IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include
+make test-faults IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include
+make test-native-lifecycle IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include
+make test-soak IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include SOAK_DURATION=120s
+make build INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include INTERBASE_LIB=/tmp/opencode
+git diff --check
 ```
 
 The soak runner accepts positive integer durations in seconds, minutes or hours,
@@ -108,39 +190,54 @@ supervision and the documented uncertain-result/reconciliation rules in place.
 
 ### Final verification — September 18, 2026
 
-Cancellation-aware admission now returns before entering native code when its
-context expires while waiting. Mandatory cleanup remains uninterruptible.
-Events callbacks participate in the same gate through the C/Go bridge; stop
-unregisters and drains callback/queue work before exclusive native cancellation.
-Canceled Events `Next` calls preserve the subscription and context error identity.
-Independent review approved the corrected admission and callback sequencing.
+The complete Task 7 sequence ran serially with the Linux/amd64 InterBase 15.1
+client, SDK `/tmp/opencode/interbase-parity-include`, runtime `/tmp/opencode`,
+image `interbase-go-parity-test:local`, and Bats
+`/tmp/opencode/parity-bats/bin/bats`:
 
-Fresh controller checks passed:
+- `make test` passed in 19.99 seconds with eight Go packages and ten native
+  ASan/leak harnesses. The temporary runtime path was supplied through
+  `LD_LIBRARY_PATH`.
+- Go race passed in 28.90 seconds; checkptr passed in 3.38 seconds; tagged
+  integration vet passed in 1.34 seconds. These Go commands used explicit
+  temporary SDK `CGO_CFLAGS`/`CGO_LDFLAGS` and `LD_LIBRARY_PATH`.
+- The Bats runner passed **42/42** in 11.09 seconds.
+- The DSQL cancellation target passed ten cancellation-race iterations in
+  12.88 seconds (16.68 seconds including Docker setup/cleanup). It exercised
+  direct and prepared execution, query/fetch cancellation, implicit and
+  explicit writes, completion-winning and cancellation-winning races, and
+  statement/pool recovery. The test's 30-second result limit is an external
+  bound, not a cancellation-latency guarantee.
+- The owned fault matrix passed in 16.72 seconds.
+- The native lifecycle target passed in 6.80 seconds, including a 3.08-second
+  `TestNativeLifecycleRace`.
+- The four-worker, 120-second soak passed in 124.22 seconds wall-clock. The
+  workload ran for 2m0.003813076s and completed 122,283 validated operations:
+  61,143 committed writes, 61,140 rolled-back writes, and 61,143 persisted
+  values. It performed 30,573 physical opens and closes with 30,572 identity
+  replacements; throughput was 1,018.99 operations/s, average latency was
+  3.925199 ms, and maximum latency was 27.478933 ms. After close, both pools
+  had zero open/in-use/idle connections; the process had six file descriptors
+  and two goroutines. RSS was 32,370,688 bytes after close, recorded as a
+  measurement rather than a claim of native leak-freedom. The raw log is
+  `/tmp/opencode/dsql-context-task-7-20260918/09-test-soak-120s.log`.
+- `make build` passed in 0.37 seconds. The final `git diff --check` is run
+  after the documentation commit preparation.
 
-- All eight Go packages and ten native ASan/leak harnesses.
-- Full Go race checks, checkptr, and tagged integration vet.
-- Full ordinary Docker integration suite and the owned fault matrix.
-- Lifecycle churn and both row-lock commit/rollback progress regressions,
-  repeated three times with the race detector.
-- All 36 runner tests. One initial parallel lifecycle runner failed to start
-  its container; the subsequent serial run completed all requested tests.
-
-The final four-worker, 120-second soak completed 95,389 validated operations:
-47,696 committed writes, 47,693 rolled-back writes, and exactly 47,696 persisted
-counter increments. It performed 23,850 physical opens and closes, with 23,849
-observed replacement identities. Throughput was 794.87 workload iterations/s;
-average iteration latency was 5.032 ms. Both pools were empty after close;
-file descriptors fell from 7 before the workload to 6 afterward, and goroutines
-from 4 to 2. Process RSS grew from about 16.5 MB to 26.9 MB, which is recorded
-as a measurement rather than a claim of native leak-freedom. The raw final soak
-log is `/tmp/opencode/hardening-final-soak.log` in the verification environment.
+The first unqualified `make test`, race, and vet attempts failed before the
+tests because the temporary client library/include paths were not present in
+the process environment. They are retained as failures in the Task 7 report;
+the reruns above used the explicit paths documented in the command block and
+passed. No claim is made here for a multi-hour soak or for a universal native
+client latency/thread-safety guarantee.
 
 Ten bounded fuzz targets and local/live benchmarks were also executed during
 this hardening work. Multi-hour soak support is implemented, but the final
-measured soak was two minutes. In-flight native calls remain non-interruptible;
-lifecycle admission can wait for a long-running call, and sustained ordinary
-traffic can delay lifecycle work. No server power-loss durability or additional
-platform/client-version guarantee is implied.
+measured soak was two minutes. Non-DSQL native calls remain non-interruptible;
+DSQL cancellation is best effort, lifecycle admission can wait for a
+long-running call, and sustained ordinary traffic can delay lifecycle work. No
+server power-loss durability or additional platform/client-version guarantee
+is implied.
 
 Deferred feature requests are tracked in [TODO.md](TODO.md). The vendor TLS
 hostname-verification defect is outside this hardening scope.

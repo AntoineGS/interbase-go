@@ -158,8 +158,9 @@ is not required.
 
 Subprocess runtime, pipe wait, and captured output are bounded. Error output
 redacts raw and SQL-escaped credentials; excessive output is omitted entirely.
-Owned subprocess groups are terminated on execution failure. Native driver
-calls remain non-interruptible in flight, so the Go process timeout is still
+Owned subprocess groups are terminated on execution failure. Non-DSQL native
+driver calls remain non-interruptible in flight, and DSQL cancellation is best
+effort rather than a deadline guarantee, so the Go process timeout is still
 necessary. No filesystem permissions or server security settings are changed.
 
 The tested InterBase isql returns exit status 1 even after successful SQL.
@@ -213,10 +214,11 @@ The plaintext control exists only inside the disconnected disposable container.
 The fixture maps `wrong.parity.invalid` to `::1`, checks that both names reach the
 same endpoint, validates the certificate chain offline, and proves the leaf
 certificate does not identify the wrong name. Authentication readiness requires
-both a successful login and rejection of a wrong password. Native calls cannot
-always be canceled by context, so both the binary and Docker execution have
-timeouts. Container ownership is checked before cleanup; cleanup failures return
-failure and identify any retained private artifacts.
+both a successful login and rejection of a wrong password. Non-DSQL native
+calls cannot be canceled after entry, and DSQL cancellation is best effort, so
+both the binary and Docker execution have timeouts. Container ownership is
+checked before cleanup; cleanup failures return failure and identify any
+retained private artifacts.
 
 **Known security failure (2026-09-16):** vendor client `LI-V15.1.0.42` accepts
 the wrong hostname, reproduced with vendor `isql` and with all four Go APIs
@@ -385,12 +387,13 @@ retain their source mapping. Go-specific lifecycle checks (contexts, pool reuse,
 | `TestTransactionCommitVisibilityAndOwnWrites`, `TestTransactionRollbackVisibilityAndOwnWrites` | `TestTransaction.test_cursor`, `.test_context_manager`; `DatabaseAPI20Test.test_cursor_isolation` | Own-write visibility and commit/rollback checked through a separate pinned attachment |
 | `TestTransactionSavepointPartialRollback`, `TestTransactionReadOnlyOption` | `TestTransaction.test_savepoint`, `.test_tpb` | SQL savepoint and Go read-only transaction option; no binary TPB API |
 | `TestTransactionSnapshotAndReadCommittedVisibility` | `DatabaseAPI20Test.test_cursor_isolation` | Two pinned attachments verify the distinct post-commit visibility of read-committed and snapshot transactions |
-| `TestTransactionNoWaitAndReservationEnforcement` | `TestTransaction.test_tpb` | Native NOWAIT row conflict and exclusive table reservation enforcement, with a bounded child process because native calls cannot be interrupted in flight |
+| `TestTransactionNoWaitAndReservationEnforcement` | `TestTransaction.test_tpb` | Native NOWAIT row conflict and exclusive table reservation enforcement, with a bounded child process because lock-wait latency has no hard context-cancellation bound and non-DSQL calls remain non-interruptible |
 | `TestConnectorTPBPreservesQuotedIdentifierCase` | Go parity regression | Actual connector-to-native transaction start with a quoted mixed-case table reservation; the reserved table is queried using its case-sensitive identifier |
 | `TestEffectiveRoleAuthorization` | Go parity regression based on `TestConnection`/security setup | Owned role/user creation, role grant, no-role denial, and role-selected authorization through separate attachments |
 | `TestConstraintViolationReturnsTypedNativeError` | Go parity regression | Duplicate-key failure must retain `*interbase.Error` SQLCODE and native status metadata through `database/sql` |
 | `TestTransactionPrepareContextCommit`, `TestTransactionStmtContextRollback`, `TestTransactionErrTxDoneAfterCommitAndRollback` | `TestPreparedStatement.test_execution`; `TestTransaction.test_cursor`; `DatabaseAPI20Test.test_commit`, `.test_rollback` | Additional Go statement/transaction binding and completion requirements |
 | `TestTypesIntegerBounds`, `TestTypesCharVarcharUTF8RoundTrip`, `TestTypesUTF8OverlengthRecovery` | `TestInsertData.test_insert_integers`, `.test_insert_char_varchar`; `TestCharsetConversion.testCharVarchar` | Insert/readback, padding, UTF8 character capacity and recovery without truncation |
+| `integration/cancellation_test.go`: `TestLiveCancellationRaces`, `TestCanceledImplicitDMLRollsBackAndDoesNotReplay`, `TestCanceledExplicitWritePreservesTransactionOwnership`, `TestCanceledDistributedParticipantRemainsUsable` | Go-specific DSQL cancellation contract | Best-effort prepare/execute/fetch cancellation, authoritative completion-winning races, `isc_cancelled` diagnostics, implicit rollback, explicit-transaction ownership, no `database/sql` replay, pool/statement/cursor reuse, and cancellation cleanup |
 | `TestTypesFloatTolerance`, `TestTypesNumericDecimalBindings` | `TestInsertData.test_insert_float_double`, `.test_insert_numeric_decimal` | NaN-safe tolerances, decimal strings/float inputs; no Python Decimal library |
 | `TestTypesTimestampPrecisionAndMidnight`, `TestTypesBooleanRoundTrip` | `TestInsertData.test_insert_datetime`, `.test_insert_boolean`; `TestBugs.test_pyib_44` | `time.Time` fractional/midnight values and boolean readback; no distinct Python date object |
 | `TestTypesTextAndBinaryBlobRoundTrips`, `TestTypesEmptyBytesDistinguishNull` | `TestInsertData.test_insert_blob`; `TestCharsetConversion.testBlob`; `TestBugs.test_pyib_30`; `DatabaseAPI20Test.test_Binary`, `.test_None` | Text/binary BLOB content, UTF8, embedded NUL, 90,000-byte segments and empty versus NULL; no stream reader or alternate subtype coverage |
@@ -431,6 +434,29 @@ those capabilities. There are no feature skips or expected-failure wrappers;
 any failing contract makes the live test command fail.
 
 ### Current verification
+
+On 2026-09-18, the serial DSQL-cancellation verification passed with the
+temporary Linux/amd64 InterBase client and the requested local image. The Go
+and native checks passed as eight Go packages plus ten native ASan/leak
+harnesses (`make test`, 19.99s), race (28.90s), checkptr (3.38s), and tagged
+integration vet (1.34s). The Bats runner passed **42/42** (11.09s). The live
+DSQL cancellation target passed ten race iterations (12.88s test time; 16.68s
+including setup/cleanup), the owned fault matrix passed in 16.72s, and native
+lifecycle passed in 6.80s. The final four-worker soak ran for
+2m0.003813076s and validated 122,283 operations, with 61,143 committed writes,
+61,140 rolled-back writes, 61,143 persisted values, 30,573 physical opens and
+closes, and 30,572 identity replacements. Its throughput was 1,018.99
+operations/s, with 3.925199 ms average and 27.478933 ms maximum latency; both
+pools were empty after close, with six file descriptors and two goroutines.
+`make build` passed in 0.37s. The exact serial command block, including the
+temporary SDK runtime flags, is in
+[`docs/production-hardening.md`](../docs/production-hardening.md).
+
+The first unqualified `make test`, race, and vet attempts failed before
+testing because the temporary SDK include/runtime paths were not supplied;
+reruns with the explicit paths documented above passed. This verification
+measures a two-minute soak only and does not add a cross-version cancellation
+latency or native-client thread-safety guarantee.
 
 On 2026-09-16, the fresh controller run passed `make test` with the official
 SDK (all six Go packages and all ten native ASan/leak harnesses),
