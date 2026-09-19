@@ -98,10 +98,11 @@ type nativeCancellationEvidence struct {
 	executingCanceled bool
 }
 
-// nativeExecutionError keeps an execution failure separate from cleanup
-// diagnostics returned by the native wrapper.  The public classifier needs to
-// distinguish a failed implicit rollback from the authoritative DSQL result,
-// while the error tree must retain both diagnostics for callers.
+// nativeExecutionError keeps the execution, cleanup, and cancellation-request
+// diagnostics returned by the native wrapper in distinct roles. The public
+// classifier needs to distinguish a failed implicit rollback from the
+// authoritative DSQL result, while the error tree must retain every
+// diagnostic for callers.
 type nativeExecutionError struct {
 	primary       error
 	cleanup       error
@@ -125,16 +126,28 @@ func (e *nativeExecutionError) Unwrap() []error {
 	return joinErrorValues(e.primary, e.cleanup, e.request)
 }
 
-func splitNativeExecutionError(err error) (primary, cleanup error) {
+// nativeExecutionParts is the classifier-facing view of nativeExecutionError;
+// request is diagnostic only and must never be passed as cleanup.
+type nativeExecutionParts struct {
+	primary error
+	cleanup error
+	request error
+}
+
+func splitNativeExecutionError(err error) nativeExecutionParts {
 	if err == nil {
-		return nil, nil
+		return nativeExecutionParts{}
 	}
 	var executionErr *nativeExecutionError
 	if !errors.As(err, &executionErr) || executionErr == nil {
-		return splitNativeCleanupDiagnostic(err)
+		primary, cleanup := splitNativeCleanupDiagnostic(err)
+		return nativeExecutionParts{primary: primary, cleanup: cleanup}
 	}
-	return executionErr.primary,
-		joinPrimaryCleanup(executionErr.cleanup, executionErr.request)
+	return nativeExecutionParts{
+		primary: executionErr.primary,
+		cleanup: executionErr.cleanup,
+		request: executionErr.request,
+	}
 }
 
 func nativeCancellationEvidenceOf(err error) nativeCancellationEvidence {
@@ -216,11 +229,13 @@ func (o *nativeCancelOperation) wrapQueryExecutionError(primary, cleanup error,
 
 func (o *nativeCancelOperation) wrapExecutionErrorMutating(primary, cleanup error,
 	mutatingKnown, mutating bool) error {
+	request := o.requestError()
 	var nested *nativeExecutionError
 	if errors.As(primary, &nested) && nested != nil {
-		var nestedCleanup error
-		primary, nestedCleanup = splitNativeExecutionError(primary)
-		cleanup = joinPrimaryCleanup(nestedCleanup, cleanup)
+		parts := splitNativeExecutionError(primary)
+		primary = parts.primary
+		cleanup = joinPrimaryCleanup(parts.cleanup, cleanup)
+		request = joinNativeRequestDiagnostic(parts.request, request)
 		if !mutatingKnown && nested.mutatingKnown {
 			mutatingKnown = true
 			mutating = nested.mutating
@@ -228,10 +243,10 @@ func (o *nativeCancelOperation) wrapExecutionErrorMutating(primary, cleanup erro
 	}
 	if mutatingKnown {
 		return wrapNativeExecutionErrorWithMetadata(primary, cleanup,
-			o.requestError(), o.cancellationEvidence(), mutating)
+			request, o.cancellationEvidence(), mutating)
 	}
 	return wrapNativeExecutionErrorWithMetadata(primary, cleanup,
-		o.requestError(), o.cancellationEvidence())
+		request, o.cancellationEvidence())
 }
 
 func wrapNativeQueryMutability(err error, mutating bool) error {
@@ -635,4 +650,16 @@ func joinPrimaryCleanup(primary, cleanup error) error {
 		return primary
 	}
 	return errors.Join(primary, cleanup)
+}
+
+// joinNativeRequestDiagnostic retains a cancellation-request diagnostic in the
+// error tree without presenting it to the write-outcome classifier as cleanup.
+func joinNativeRequestDiagnostic(operation, request error) error {
+	if operation == nil {
+		return request
+	}
+	if request == nil {
+		return operation
+	}
+	return &nativeExecutionError{primary: operation, request: request}
 }

@@ -793,12 +793,14 @@ func (t *Transaction) Query(ctx context.Context, query string, args ...any) (*Cu
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := a.conn.sanitizeError("direct query", primaryErr)
-		cleanupErr = a.conn.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := a.conn.sanitizeError("direct query", parts.primary)
+		cleanupErr := a.conn.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeWriteOutcome("direct query",
 			nativeQueryMutatingOf(err), contextCancellation(ctx), operationErr,
 			cleanupErr, t.native.writeOutcomeState(), evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			a.conn.sanitizeError("", parts.request))
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
@@ -857,11 +859,13 @@ func (t *Transaction) Exec(ctx context.Context, query string, args ...any) (int6
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := a.conn.sanitizeError("direct exec", primaryErr)
-		cleanupErr = a.conn.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := a.conn.sanitizeError("direct exec", parts.primary)
+		cleanupErr := a.conn.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeWriteOutcome("direct exec", true,
 			contextCancellation(ctx), operationErr, cleanupErr, t.native.writeOutcomeState(), evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			a.conn.sanitizeError("", parts.request))
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
@@ -1041,11 +1045,13 @@ func (t *Transaction) Plan(ctx context.Context, query string) (string, error) {
 	}
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := a.conn.sanitizeError("prepare direct plan", primaryErr)
-		cleanupErr = a.conn.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := a.conn.sanitizeError("prepare direct plan", parts.primary)
+		cleanupErr := a.conn.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeOutcome("prepare direct plan", false,
 			contextCancellation(ctx), operationErr, cleanupErr, evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			a.conn.sanitizeError("", parts.request))
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
@@ -1763,11 +1769,13 @@ func (c *Cursor) Next(ctx context.Context) (bool, error) {
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := c.tx.attachment.conn.sanitizeError("direct fetch", primaryErr)
-		cleanupErr = c.tx.attachment.conn.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := c.tx.attachment.conn.sanitizeError("direct fetch", parts.primary)
+		cleanupErr := c.tx.attachment.conn.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeOutcome("direct fetch", false,
 			contextCancellation(ctx), operationErr, cleanupErr, evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			c.tx.attachment.conn.sanitizeError("", parts.request))
 		closeErr := c.closeLocked(true, operationErr)
 		return false, errors.Join(operationErr, closeErr)
 	}

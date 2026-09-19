@@ -841,11 +841,13 @@ func (s *stmt) ExecContext(ctx context.Context, values []driver.NamedValue) (dri
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := conn.sanitizeError("exec prepared statement", primaryErr)
-		cleanupErr = conn.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := conn.sanitizeError("exec prepared statement", parts.primary)
+		cleanupErr := conn.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeWriteOutcome("execute prepared statement", true,
 			contextCancellation(ctx), operationErr, cleanupErr, native.writeOutcomeState(), evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			conn.sanitizeError("", parts.request))
 		if conn.native == nil || conn.native.broken() {
 			conn.invalidateLocked(operationErr)
 		}
@@ -897,12 +899,14 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := conn.sanitizeError("query prepared statement", primaryErr)
-		cleanupErr = conn.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := conn.sanitizeError("query prepared statement", parts.primary)
+		cleanupErr := conn.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeWriteOutcome("execute prepared query",
 			nativeQueryMutatingOf(err), contextCancellation(ctx), operationErr,
 			cleanupErr, native.writeOutcomeState(), evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			conn.sanitizeError("", parts.request))
 		if conn.native == nil || conn.native.broken() {
 			conn.invalidateLocked(operationErr)
 		}
@@ -1090,11 +1094,13 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	}
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := c.sanitizeError("prepare", primaryErr)
-		cleanupErr = c.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := c.sanitizeError("prepare", parts.primary)
+		cleanupErr := c.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeOutcome("prepare", false,
 			contextCancellation(ctx), operationErr, cleanupErr, evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			c.sanitizeError("", parts.request))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1216,11 +1222,13 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := c.sanitizeError("exec", primaryErr)
-		cleanupErr = c.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := c.sanitizeError("exec", parts.primary)
+		cleanupErr := c.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeWriteOutcome("execute", true,
 			contextCancellation(ctx), operationErr, cleanupErr, c.native.writeOutcomeState(), evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			c.sanitizeError("", parts.request))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1271,12 +1279,14 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := c.sanitizeError("query", primaryErr)
-		cleanupErr = c.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := c.sanitizeError("query", parts.primary)
+		cleanupErr := c.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeWriteOutcome("query", nativeQueryMutatingOf(err),
 			contextCancellation(ctx), operationErr, cleanupErr,
 			c.native.writeOutcomeState(), evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			c.sanitizeError("", parts.request))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1452,11 +1462,13 @@ func (r *rows) Next(dest []driver.Value) error {
 	if err != nil {
 		releaseNative()
 		evidence := nativeCancellationEvidenceOf(err)
-		primaryErr, cleanupErr := splitNativeExecutionError(err)
-		operationErr := r.conn.sanitizeError("fetch", primaryErr)
-		cleanupErr = r.conn.sanitizeError("", cleanupErr)
+		parts := splitNativeExecutionError(err)
+		operationErr := r.conn.sanitizeError("fetch", parts.primary)
+		cleanupErr := r.conn.sanitizeError("", parts.cleanup)
 		operationErr = classifyNativeOutcome("fetch row", false,
 			contextCancellation(r.ctx), operationErr, cleanupErr, evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			r.conn.sanitizeError("", parts.request))
 		return errors.Join(operationErr, r.abortLocked(operationErr))
 	}
 	if !hasRow {

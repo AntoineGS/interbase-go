@@ -542,15 +542,20 @@ func TestNativeWriteOutcomeStateParsingIsConservative(t *testing.T) {
 func TestNativeExecutionErrorPreservesPrimaryAndCleanupDiagnostics(t *testing.T) {
 	primary := &NativeError{Operation: "execute statement", NativeCode: nativeCancelledCode}
 	cleanup := &NativeError{Operation: "rollback transaction", NativeCode: 335545000}
-	original := &nativeExecutionError{primary: primary, cleanup: cleanup}
+	request := &NativeError{Operation: "cancel statement", NativeCode: 335545001}
+	original := &nativeExecutionError{primary: primary, cleanup: cleanup, request: request}
 
-	gotPrimary, gotCleanup := splitNativeExecutionError(original)
-	if !errors.Is(gotPrimary, primary) || !errors.Is(gotCleanup, cleanup) {
-		t.Fatalf("splitNativeExecutionError() = (%v, %v), want primary and cleanup diagnostics",
-			gotPrimary, gotCleanup)
+	parts := splitNativeExecutionError(original)
+	if !errors.Is(parts.primary, primary) || !errors.Is(parts.cleanup, cleanup) ||
+		!errors.Is(parts.request, request) {
+		t.Fatalf("splitNativeExecutionError() = (%+v), want separate execution, cleanup, and request diagnostics",
+			parts)
 	}
 	if !errors.Is(original, primary) || !errors.Is(original, cleanup) {
 		t.Fatal("native execution error did not retain both diagnostics in its error tree")
+	}
+	if !errors.Is(original, request) {
+		t.Fatal("native execution error did not retain request diagnostic in its error tree")
 	}
 }
 
@@ -1024,6 +1029,80 @@ func TestExecContextOverlappingLostResponsePreservesFaultTreeAndRedacts(t *testi
 		if strings.Contains(err.Error(), secretValue) {
 			t.Fatalf("ExecContext() rendered unsanitized secret %q: %v", secretValue, err)
 		}
+	}
+}
+
+func TestExecContextCancellationRequestDiagnosticDoesNotMakeConfirmedWriteUncertain(t *testing.T) {
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	request := &NativeError{
+		Operation:  "cancel statement",
+		NativeCode: 335545001,
+		Message:    "cancel request diagnostic",
+	}
+
+	for _, test := range []struct {
+		name  string
+		state nativeWriteOutcomeState
+	}{
+		{name: "rollback confirmed", state: nativeWriteOutcomeRollbackConfirmed},
+		{name: "explicit transaction usable", state: nativeWriteOutcomeExplicitUsable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			slot := &fakeCancelSlot{
+				cancelStarted:    make(chan struct{}),
+				cancelErr:        request,
+				cancelAttempted:  true,
+				cancelOverlapped: true,
+			}
+			native := &nativeConnection{
+				brokenOverride:     func() bool { return false },
+				cancelSlotOverride: slot,
+				writeOutcomeStateOverride: func() nativeWriteOutcomeState {
+					return test.state
+				},
+				execContextOverride: func(_ string, _ []argument, _ bool,
+					_ *nativeCancelOperation) (int64, error) {
+					close(entered)
+					<-release
+					return 0, primary
+				},
+			}
+			connection := &conn{native: native}
+			result := make(chan error, 1)
+			go func() {
+				_, err := connection.ExecContext(ctx, "UPDATE example SET value = value + 1", nil)
+				result <- err
+			}()
+			waitForTestSignal(t, entered, "execution did not enter native override")
+			cancel()
+			waitForTestSignal(t, slot.cancelStarted, "cancellation request did not run")
+			close(release)
+
+			err := <-result
+			if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) ||
+				!errors.Is(err, request) {
+				t.Fatalf("ExecContext() error = %v, lost context/primary/request diagnostics", err)
+			}
+			var cancellation *CancellationError
+			if !errors.As(err, &cancellation) || !cancellation.Mutating {
+				t.Fatalf("ExecContext() error = %v, want mutating CancellationError", err)
+			}
+			var uncertain *UncertainOutcomeError
+			if errors.As(err, &uncertain) {
+				t.Fatalf("ExecContext() error = %v, request diagnostic made confirmed outcome uncertain", err)
+			}
+			if errors.Is(err, driver.ErrBadConn) {
+				t.Fatalf("ExecContext() error = %v, must not match driver.ErrBadConn", err)
+			}
+		})
 	}
 }
 
