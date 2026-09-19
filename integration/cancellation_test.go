@@ -62,6 +62,7 @@ CREATE TABLE GO_CANCEL_LOG (
 INSERT INTO GO_CANCEL_TARGET (ID, WRITE_VALUE, LABEL)
 VALUES (1, 10, 'initial');
 CREATE GENERATOR GO_CANCEL_GENERATOR;
+CREATE GENERATOR GO_CANCEL_RACE_GENERATOR;
 
 SET TERM ^ ;
 CREATE PROCEDURE GO_CANCEL_DELAY AS
@@ -83,6 +84,19 @@ CREATE PROCEDURE GO_CANCEL_MAYBE_DELAY (DELAY_ENABLED INTEGER) AS
 BEGIN
     IF (DELAY_ENABLED = 1) THEN
         EXECUTE PROCEDURE GO_CANCEL_DELAY;
+END^
+
+CREATE PROCEDURE GO_CANCEL_RACE_DELAY AS
+DECLARE VARIABLE RACE_TOKEN INTEGER;
+BEGIN
+    RACE_TOKEN = GEN_ID(GO_CANCEL_RACE_GENERATOR, 1);
+    EXECUTE PROCEDURE GO_CANCEL_DELAY;
+END^
+
+CREATE PROCEDURE GO_CANCEL_RACE_COMPLETE AS
+DECLARE VARIABLE RACE_TOKEN INTEGER;
+BEGIN
+    RACE_TOKEN = GEN_ID(GO_CANCEL_RACE_GENERATOR, 1);
 END^
 
 CREATE TRIGGER GO_CANCEL_TARGET_BI FOR GO_CANCEL_TARGET
@@ -166,31 +180,24 @@ func TestLiveCancellationRaces(t *testing.T) {
 	const cpuQuery = "EXECUTE PROCEDURE GO_CANCEL_DELAY"
 	for iteration := 0; iteration < iterations; iteration++ {
 		t.Run("iteration", func(t *testing.T) {
-			// Direct CPU query cancellation and a cancel/complete race.
+			// Direct CPU query cancellation.
 			runCanceledRead(t, func(ctx context.Context) error {
 				_, err := db.ExecContext(ctx, cpuQuery)
 				return err
 			})
-			raceCtx, raceCancel := context.WithCancel(context.Background())
-			var raceCount int64
-			raceDone := make(chan error, 1)
-			go func() {
-				raceDone <- db.QueryRowContext(raceCtx, "SELECT COUNT(*) FROM GO_CANCEL_SEED").Scan(&raceCount)
-			}()
-			raceCancel()
-			select {
-			case err := <-raceDone:
-				if err != nil && !errors.Is(err, context.Canceled) {
-					t.Fatalf("completion race error = %v, want success or cancellation", err)
-				}
-			case <-time.After(cancellationResultLimit):
-				t.Fatal("completion race did not return before its live bound")
-			}
+			runCompletionWinningRace(t, db, verifier)
+			runCancellationWinningRace(t, db, verifier)
 
 			prepared, err := db.PrepareContext(context.Background(), "EXECUTE PROCEDURE GO_CANCEL_MAYBE_DELAY(?)")
 			if err != nil {
 				t.Fatalf("prepare repeated CPU query: %v", err)
 			}
+			preparedClosed := false
+			t.Cleanup(func() {
+				if !preparedClosed {
+					_ = prepared.Close()
+				}
+			})
 			runCanceledRead(t, func(ctx context.Context) error {
 				_, err := prepared.ExecContext(ctx, 1)
 				return err
@@ -201,6 +208,7 @@ func TestLiveCancellationRaces(t *testing.T) {
 			if err := prepared.Close(); err != nil {
 				t.Fatalf("close canceled prepared query: %v", err)
 			}
+			preparedClosed = true
 
 			runCanceledRead(t, func(ctx context.Context) error {
 				rows, err := db.QueryContext(ctx, "SELECT A.ID FROM GO_CANCEL_DELAY_ROWS A, GO_CANCEL_DELAY_ROWS B")
@@ -230,6 +238,12 @@ func TestLiveCancellationRaces(t *testing.T) {
 			if err != nil {
 				t.Fatalf("begin repeated explicit transaction: %v", err)
 			}
+			transactionFinished := false
+			t.Cleanup(func() {
+				if !transactionFinished {
+					_ = tx.Rollback()
+				}
+			})
 			runCanceledWrite(t, func(ctx context.Context) error {
 				_, err := tx.ExecContext(ctx, "INSERT INTO GO_CANCEL_TARGET (ID, WRITE_VALUE, LABEL) VALUES (?, ?, ?)", id+10000, id, "repeated explicit cancellation")
 				return err
@@ -238,6 +252,7 @@ func TestLiveCancellationRaces(t *testing.T) {
 			if err := tx.Rollback(); err != nil {
 				t.Fatalf("rollback repeated explicit transaction: %v", err)
 			}
+			transactionFinished = true
 			insertCancellationControl(t, verifyCtx, db, id, "pool recovery")
 		})
 	}
@@ -260,6 +275,88 @@ func TestLiveCancellationRaces(t *testing.T) {
 	if fdsAvailable {
 		if got, available := openFileDescriptorCount(); available && got > beforeFDs {
 			t.Fatalf("file descriptors after repeated cancellation = %d, baseline = %d", got, beforeFDs)
+		}
+	}
+}
+
+func runCompletionWinningRace(t *testing.T, db, verifier *sql.DB) {
+	t.Helper()
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
+	defer verifyCancel()
+	before := queryCancellationCount(t, verifyCtx, verifier,
+		"SELECT GEN_ID(GO_CANCEL_RACE_GENERATOR, 0) FROM RDB$DATABASE")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, "EXECUTE PROCEDURE GO_CANCEL_RACE_COMPLETE")
+		result <- err
+	}()
+	// The non-transactional generator confirms that this DSQL operation entered
+	// native execution before the competing context cancellation is requested.
+	waitForCancellationRaceMarker(t, verifyCtx, verifier, before+1)
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("completion-winning race error = %v, want successful native result", err)
+		}
+	case <-time.After(cancellationResultLimit):
+		t.Fatal("completion-winning race did not return before its live bound")
+	}
+	if got := queryCancellationCount(t, verifyCtx, verifier,
+		"SELECT GEN_ID(GO_CANCEL_RACE_GENERATOR, 0) FROM RDB$DATABASE"); got != before+1 {
+		t.Fatalf("completion-winning non-idempotent marker = %d, want %d", got, before+1)
+	}
+	var count int64
+	if err := db.QueryRowContext(verifyCtx, "SELECT COUNT(*) FROM GO_CANCEL_SEED").Scan(&count); err != nil || count != 16 {
+		t.Fatalf("connection reuse after completion-winning race = (%d, %v), want (16, nil)", count, err)
+	}
+}
+
+func runCancellationWinningRace(t *testing.T, db, verifier *sql.DB) {
+	t.Helper()
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
+	defer verifyCancel()
+	before := queryCancellationCount(t, verifyCtx, verifier,
+		"SELECT GEN_ID(GO_CANCEL_RACE_GENERATOR, 0) FROM RDB$DATABASE")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, "EXECUTE PROCEDURE GO_CANCEL_RACE_DELAY")
+		result <- err
+	}()
+	waitForCancellationRaceMarker(t, verifyCtx, verifier, before+1)
+	cancel()
+	select {
+	case err := <-result:
+		runCanceledReadError(t, err)
+	case <-time.After(cancellationResultLimit):
+		t.Fatal("native-overlap cancellation race did not return before its live bound")
+	}
+	var count int64
+	if err := db.QueryRowContext(verifyCtx, "SELECT COUNT(*) FROM GO_CANCEL_SEED").Scan(&count); err != nil || count != 16 {
+		t.Fatalf("connection reuse after cancellation-winning race = (%d, %v), want (16, nil)", count, err)
+	}
+}
+
+func waitForCancellationRaceMarker(t *testing.T, ctx context.Context, db *sql.DB, want int64) {
+	t.Helper()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		got := queryCancellationCount(t, ctx, db, "SELECT GEN_ID(GO_CANCEL_RACE_GENERATOR, 0) FROM RDB$DATABASE")
+		if got == want {
+			return
+		}
+		if got > want {
+			t.Fatalf("cancellation race marker = %d, want %d", got, want)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for cancellation race marker: %v", ctx.Err())
+		case <-ticker.C:
 		}
 	}
 }
@@ -324,11 +421,16 @@ func runCanceledRead(t *testing.T, execute func(context.Context) error) {
 	}
 	select {
 	case err := <-result:
-		if err == nil || !errors.Is(err, context.Canceled) || errors.Is(err, driver.ErrBadConn) {
-			t.Fatalf("canceled read returned %v, want non-bad-connection context cancellation", err)
-		}
+		runCanceledReadError(t, err)
 	case <-time.After(cancellationResultLimit):
 		t.Fatal("canceled read did not return before its live bound")
+	}
+}
+
+func runCanceledReadError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil || !errors.Is(err, context.Canceled) || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("canceled read returned %v, want non-bad-connection context cancellation", err)
 	}
 }
 

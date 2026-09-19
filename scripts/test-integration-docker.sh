@@ -38,6 +38,8 @@ readonly SOAK_MAX_WORKERS=64
 readonly CANCELLATION_DEFAULT_ITERATIONS=10
 readonly CANCELLATION_MAX_ITERATIONS=10000
 readonly CANCELLATION_ITERATION_TIMEOUT_SECONDS=30
+readonly CANCELLATION_OPERATIONS_PER_ITERATION=5
+readonly CANCELLATION_VERIFICATION_SECONDS=30
 readonly AUTH_FAILURE_REGEX='(335544472|SQLSTATE[[:space:]]*[:=][[:space:]]*28000|[Yy]our[[:space:]]+[Uu]ser[[:space:]]+name[[:space:]]+and[[:space:]]+[Pp]assword[[:space:]]+are[[:space:]]+not[[:space:]]+defined)'
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -79,6 +81,7 @@ SOAK_SAMPLE_INTERVAL=''
 NATIVE_LIFECYCLE_ENABLED=0
 CANCELLATION_ENABLED=0
 CANCELLATION_ITERATIONS=''
+CANCELLATION_ITERATIONS_SET=0
 EFFECTIVE_REQUESTED_TEST_TIMEOUT="${REQUESTED_TEST_TIMEOUT}"
 REQUESTED_COMMAND_DURATION="${REQUESTED_COMMAND_TIMEOUT}"
 SOAK_DURATION_SECONDS=0
@@ -209,11 +212,13 @@ parse_arguments() {
         ;;
       --cancellation-iterations=*)
         CANCELLATION_ITERATIONS="${1#*=}"
+        CANCELLATION_ITERATIONS_SET=1
         shift
         ;;
       --cancellation-iterations)
         (($# >= 2)) || die 2 '--cancellation-iterations requires a value'
         CANCELLATION_ITERATIONS="$2"
+        CANCELLATION_ITERATIONS_SET=1
         shift 2
         ;;
       --)
@@ -393,15 +398,18 @@ find_requested_timeout() {
 }
 
 validate_workload_options() {
-  if ((CANCELLATION_ENABLED == 0)) && [[ -n "${CANCELLATION_ITERATIONS}" ]]; then
+  if ((CANCELLATION_ITERATIONS_SET == 1)); then
+    parse_cancellation_iterations "${CANCELLATION_ITERATIONS}"
+  fi
+  if ((CANCELLATION_ENABLED == 0 && CANCELLATION_ITERATIONS_SET == 1)); then
     die 2 '--cancellation-iterations require --cancellation'
   fi
   if ((CANCELLATION_ENABLED == 1)); then
-    if [[ -z "${CANCELLATION_ITERATIONS}" ]]; then
+    if ((CANCELLATION_ITERATIONS_SET == 0)); then
       CANCELLATION_ITERATIONS="${CANCELLATION_DEFAULT_ITERATIONS}"
+      parse_cancellation_iterations "${CANCELLATION_ITERATIONS}"
     fi
-    parse_cancellation_iterations "${CANCELLATION_ITERATIONS}"
-    CANCELLATION_DURATION_SECONDS=$((10#${CANCELLATION_ITERATIONS} * CANCELLATION_ITERATION_TIMEOUT_SECONDS))
+    CANCELLATION_DURATION_SECONDS=$((10#${CANCELLATION_ITERATIONS} * (CANCELLATION_OPERATIONS_PER_ITERATION * CANCELLATION_ITERATION_TIMEOUT_SECONDS + CANCELLATION_VERIFICATION_SECONDS)))
   fi
   if ((SOAK_ENABLED == 0)) && [[ -n "${SOAK_DURATION}" || -n "${SOAK_WORKERS}" || -n "${SOAK_SAMPLE_INTERVAL}" ]]; then
     die 2 '--soak-duration, --soak-workers, and --soak-sample-interval require --soak'
@@ -433,21 +441,13 @@ configure_requested_deadlines() {
   find_requested_timeout
 
   if ((SOAK_ENABLED == 1 || CANCELLATION_ENABLED == 1)); then
-    minimum_go_timeout_seconds="${CANCELLATION_DURATION_SECONDS}"
-    if ((SOAK_ENABLED == 1 && SOAK_DURATION_SECONDS > minimum_go_timeout_seconds)); then
-      minimum_go_timeout_seconds="${SOAK_DURATION_SECONDS}"
-    fi
-    minimum_go_timeout_seconds=$((minimum_go_timeout_seconds + SOAK_SETUP_GRACE_SECONDS))
-    minimum_command_seconds=$((minimum_go_timeout_seconds + REQUESTED_COMMAND_GRACE_SECONDS))
+    minimum_go_timeout_seconds=$((CANCELLATION_DURATION_SECONDS + SOAK_DURATION_SECONDS + SOAK_SETUP_GRACE_SECONDS))
     if ((REQUESTED_TIMEOUT_EXPLICIT == 1)); then
       EFFECTIVE_REQUESTED_TEST_TIMEOUT="${REQUESTED_TIMEOUT_VALUE}"
       if parse_go_timeout_seconds "${REQUESTED_TIMEOUT_VALUE}"; then
         REQUESTED_GO_TIMEOUT_SECONDS="${PARSED_DURATION_SECONDS}"
         if ((PARSED_DURATION_NONZERO == 1 && REQUESTED_GO_TIMEOUT_SECONDS < minimum_go_timeout_seconds)); then
           die 2 "-timeout must not be shorter than the soak duration or cancellation workload (${minimum_go_timeout_seconds}s)"
-        fi
-        if ((REQUESTED_GO_TIMEOUT_SECONDS > 0)); then
-          minimum_command_seconds=$((REQUESTED_GO_TIMEOUT_SECONDS + REQUESTED_COMMAND_GRACE_SECONDS))
         fi
       else
         die 2 '-timeout must use an integer-unit Go duration (s, m, or h) for soak runs'
@@ -456,9 +456,7 @@ configure_requested_deadlines() {
       EFFECTIVE_REQUESTED_TEST_TIMEOUT="${minimum_go_timeout_seconds}s"
       REQUESTED_GO_TIMEOUT_SECONDS="${minimum_go_timeout_seconds}"
     fi
-    if ((minimum_command_seconds < minimum_go_timeout_seconds + REQUESTED_COMMAND_GRACE_SECONDS)); then
-      minimum_command_seconds=$((minimum_go_timeout_seconds + REQUESTED_COMMAND_GRACE_SECONDS))
-    fi
+    minimum_command_seconds=$((REQUESTED_GO_TIMEOUT_SECONDS + REQUESTED_COMMAND_GRACE_SECONDS))
     REQUESTED_COMMAND_DURATION="${minimum_command_seconds}s"
   fi
 

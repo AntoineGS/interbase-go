@@ -76,6 +76,45 @@ teardown() {
   [ "$status" -eq 2 ]
   [[ "$output" == *"between 1 and 10000"* ]]
   [ ! -s "$FAKE_DOCKER_LOG" ]
+
+  run "$RUNNER" --cancellation-iterations=
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"between 1 and 10000"* ]]
+  [ ! -s "$FAKE_DOCKER_LOG" ]
+
+  run "$RUNNER" --cancellation --cancellation-iterations ''
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"between 1 and 10000"* ]]
+  [ ! -s "$FAKE_DOCKER_LOG" ]
+}
+
+@test "derives cancellation external deadlines from the final Go deadline" {
+  run "$RUNNER" --cancellation -run '^TestLiveCancellationRaces$'
+
+  [ "$status" -eq 0 ]
+  go_log="$(<"$FAKE_GO_LOG")"
+  [[ "$go_log" == *"go -test.count=1 -test.timeout=1860s"* ]]
+  timeout_log="$(<"$FAKE_TIMEOUT_LOG")"
+  [[ "$timeout_log" == *" 1920s "*"/integration.test "* ]]
+
+  run "$RUNNER" --cancellation --cancellation-iterations=4 -timeout=1000s -run '^TestLiveCancellationRaces$'
+
+  [ "$status" -eq 0 ]
+  go_log="$(<"$FAKE_GO_LOG")"
+  [[ "$go_log" == *"go -test.count=1 -test.timeout=1000s"* ]]
+  timeout_log="$(<"$FAKE_TIMEOUT_LOG")"
+  [[ "$timeout_log" == *" 1060s "*"/integration.test "* ]]
+}
+
+@test "adds cancellation and soak budgets before applying the external grace" {
+  run "$RUNNER" --soak --soak-duration=120s --cancellation --cancellation-iterations=1 \
+    -run '^TestSoakConcurrentWorkload$'
+
+  [ "$status" -eq 0 ]
+  go_log="$(<"$FAKE_GO_LOG")"
+  [[ "$go_log" == *"go -test.count=1 -test.timeout=10m"* ]]
+  timeout_log="$(<"$FAKE_TIMEOUT_LOG")"
+  [[ "$timeout_log" == *" 660s "*"/integration.test "* ]]
 }
 
 @test "passes performance opt-in only to the requested test command" {
