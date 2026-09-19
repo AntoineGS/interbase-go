@@ -364,16 +364,33 @@ same fixture path rather than taking two `*sql.Conn` from one pool.
      if `Plan` had started its own implicit transaction, the uncommitted
      metadata would be invisible and prepare would fail with an unknown-table
      error.
-  4. Still inside the writable transaction, `Plan`
-     `UPDATE GO_INTROSPECTION_TXPROBE SET TEXT_VALUE = 'changed' WHERE ID = 1`
-     and `DELETE FROM GO_INTROSPECTION_TXPROBE WHERE ID = 1`, then read
-     `TEXT_VALUE` back on the same `*sql.Conn` and assert it is still
-     `'sentinel'` and that exactly one row remains. **This is the safety proof:**
-     the transaction the DML would have run in is writable and the read sees its
-     own uncommitted work, so an execute would be both permitted and visible.
-  5. `tx.Rollback()`, then assert from the second pool that
-     `GO_INTROSPECTION_TXPROBE` does not exist — the rollback proves `Plan`
-     neither committed nor rolled back the caller's transaction at any point.
+  4. Still inside the writable transaction, `Plan` each mutating statement form
+     in turn, reading state back on the same `*sql.Conn` after each one:
+     `UPDATE GO_INTROSPECTION_TXPROBE SET TEXT_VALUE = 'changed' WHERE ID = 1`,
+     `DELETE FROM GO_INTROSPECTION_TXPROBE WHERE ID = 1`, and
+     `INSERT INTO GO_INTROSPECTION_TXPROBE VALUES (2, 'inserted')`. After all
+     three, assert `TEXT_VALUE` for `ID = 1` is still `'sentinel'` and that
+     exactly one row remains. **This is the safety proof:** the transaction the
+     DML would have run in is writable and the read sees its own uncommitted
+     work, so an execute would be both permitted and visible.
+
+     Then cover the procedure form, which is the statement type most likely to
+     behave differently: inside the same transaction, create
+     `GO_INTROSPECTION_TXPROC` as a procedure whose body inserts
+     `(3, 'procedure')` into the probe table, `Plan`
+     `EXECUTE PROCEDURE GO_INTROSPECTION_TXPROC`, and assert the row count is
+     still exactly one. This case is called out separately because the
+     execution path does treat procedures specially — `ib_connection_query`
+     re-prepares an implicit procedure under a write transaction
+     (`native.c:7486`) — while `ib_statement_prepare_mode` has no such branch.
+     The spec claims prepare-only for every statement type, so the procedure
+     form must be demonstrated rather than assumed.
+  5. `tx.Rollback()` must return nil rather than `sql.ErrTxDone`; a
+     `sql.ErrTxDone` here would mean `Plan` had already completed the caller's
+     transaction and the later assertions would pass vacuously. Then assert from
+     the second pool that `GO_INTROSPECTION_TXPROBE` does not exist — together
+     these prove `Plan` neither committed nor rolled back the caller's
+     transaction at any point.
 
   An earlier draft of this test used `SELECT ... FOR UPDATE` as the
   transaction-selection signal, on the assumption that it only prepares inside a
