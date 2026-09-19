@@ -49,8 +49,8 @@ here. They simplify the design rather than complicate it.
    Go side only calls `c.native.prepare(ctx, query)`.
 2. **The implicit prepare transaction is committed, not rolled back.** On the
    success path `ib_statement_prepare_mode` calls `isc_commit_transaction` on
-   its owned transaction before returning the statement (`native.c:7923`);
-   rollback happens only on the failure path (`native.c:7948`). Because the
+   its owned transaction before returning the statement (`native.c:7925`);
+   rollback happens only on the failure path (`native.c:7950`). Because the
    transaction is read-only and nothing was executed in it, commit and rollback
    are equivalent in effect. The owned transaction's entire lifetime is inside
    the native prepare call, so `Plan` never leaves a transaction open on the
@@ -85,7 +85,9 @@ array-capable connection-level prepare entry point is out of scope.
 - Refactoring the diagnostics decoding out of `Attachment.Diagnostics` so both
   entry points share one implementation.
 - A `planOverride` test seam on `nativeStatement`, matching its existing
-  `execOverride`/`closeOverride`/`numInputOverride` fields.
+  `execOverride`/`closeOverride`/`numInputOverride` fields, and a
+  connection-minting variant of `databaseSQLTestConnector` so pool eviction is
+  observable.
 - Unit tests, live integration tests, and README documentation.
 
 ### Excluded
@@ -124,9 +126,14 @@ func Plan(ctx context.Context, conn *sql.Conn, query string) (string, error)
 Each helper calls `conn.Raw`, asserts the callback value to `Introspector`,
 invokes the method, copies the result into a variable owned by the helper, and
 returns the driver error unchanged from the callback. A nil `*sql.Conn` returns
-`ErrNotInterBaseConn` rather than panicking. The interface is exported so that
-callers who already hold a `Raw` callback for other reasons are not forced
-through the helpers; the helpers remain the documented API.
+`ErrNotInterBaseConn` rather than panicking.
+
+Exporting `Introspector` is a documentation choice, not a necessity: Go
+interfaces are structural, so a third party can already declare and assert an
+identical interface inside their own `Raw` callback whether or not this package
+names it. Exporting states which methods are the supported contract and pins its
+shape, at the cost of making the two method signatures part of the public API.
+The helpers remain the documented entry points.
 
 ### `(*conn).Diagnostics`
 
@@ -147,11 +154,14 @@ entry point:
    validator, so `SET SUBSCRIPTION` is redirected to the direct API exactly as
    `PrepareContext` does, rather than the direct-only `validateQueryText`.
 2. `c.lockDirect()` and `defer c.mu.Unlock()`.
-3. Return `ErrDistributedParticipantManaged` when `c.distributed != nil`. Today
-   only explicit attachments can be distributed participants, so this is
-   unreachable from the pool; it is kept because the method lives on the shared
-   `*conn` and `BeginTx` already sets this precedent for implicit transaction
-   selection on a coordinator-managed connection.
+3. Return `ErrDistributedParticipantManaged` when `c.distributed != nil`.
+   **This branch is unreachable from the pool by design and is expected to stay
+   that way:** `c.distributed` is only ever assigned through `BeginDistributed`,
+   which accepts explicit `Attachment` participants (`distributed.go:216`). The
+   guard exists because the method lives on the shared `*conn` and `BeginTx`
+   already refuses implicit transaction selection on a coordinator-managed
+   connection. A future reader should not treat it as a live path, and a test
+   for it belongs to the direct API, not to this sub-project.
 4. Return `driver.ErrBadConn` when `c.closed`, `c.native == nil`, or
    `c.native.broken()`.
 5. `enterNativeContext(ctx)`, released on every path.
@@ -159,29 +169,48 @@ entry point:
    explicit transaction when `BeginTx` started one and has not completed it, and
    otherwise starts, uses, and completes its own read-only transaction inside the
    call. Go makes no transaction decision.
-7. On prepare failure, classify exactly as `PrepareContext` does:
-   `nativeCancellationEvidenceOf`, `splitNativeExecutionError`, `sanitizeError`
-   for primary and cleanup parts, `classifyNativeOutcome("prepare plan", false, …)`
-   with the non-mutating flag, `joinNativeRequestDiagnostic`, then
+7. On prepare failure, classify exactly as `PrepareContext` does
+   (`interbase.go:1100`): `nativeCancellationEvidenceOf`,
+   `splitNativeExecutionError`, the `c.sanitizeError` *method*
+   (`interbase.go:733`, which applies `c.redactionSecrets`) for the primary and
+   cleanup parts, then
+
+   ```go
+   operationErr = classifyNativeOutcome("prepare plan", false,
+       contextCancellation(ctx), operationErr, cleanupErr, evidence)
+   ```
+
+   — note the third argument is `contextCancellation(ctx)` (`cancellation.go:573`),
+   not `contextError(ctx)` — followed by `joinNativeRequestDiagnostic` and
    `invalidateLocked` when `c.native.broken()`. Native prepare already closed its
    own statement and rolled back its own transaction before returning the error.
 8. On success, re-check `contextError(ctx)` and return `errors.Join(err,
    statement.close())` if it fires.
 9. Otherwise read `statement.plan()`, then `statement.close()` unconditionally,
-   join the two errors, `sanitizeError` them, and `invalidateLocked` if the
-   connection broke.
+   join the two errors, pass them through `c.sanitizeError`, and
+   `invalidateLocked` if the connection broke.
 
 The prepared statement is never registered in `c.statements` and never returned
 to the caller. It exists only between steps 6 and 9.
 
 ### Why this is prepare-only
 
-`isc_dsql_prepare` is the only DSQL call `Plan` makes. No `isc_dsql_execute`,
-`execute2`, or `fetch` is reachable from this path, for any statement type. A
-`DELETE` or `UPDATE` passed to `Plan` is compiled and described, and its
-statement handle is closed. The existing documented caveat carries over: a valid
-DML statement may return an empty plan string, and an empty plan never implies
-that the DML ran.
+The load-bearing claim is negative: **no `isc_dsql_execute`, `isc_dsql_execute2`,
+or `isc_dsql_fetch` is reachable from this path, for any statement type.** The
+path is not a single native call. `ib_statement_prepare_mode` issues
+`isc_dsql_allocate_statement`, `isc_dsql_prepare`, `isc_dsql_describe_bind`
+(`native.c:1620`), and `isc_dsql_sql_info` for `isc_info_sql_stmt_type`
+(`native.c:1698`), plus `isc_dsql_describe` (`native.c:1665`) when the statement
+type is `select`, `select_for_upd`, or `exec_procedure`. `statement.plan()` then
+issues a second `isc_dsql_sql_info` for `isc_info_sql_get_plan`
+(`native.c:8288`), and `statement.close()` issues `isc_dsql_free_statement`.
+Every one of these compiles, describes, or releases; none of them runs the
+statement.
+
+A `DELETE` or `UPDATE` passed to `Plan` is therefore compiled and described, and
+its statement handle is closed. The existing documented caveat carries over: a
+valid DML statement may return an empty plan string, and an empty plan never
+implies that the DML ran.
 
 ## Result and Error Semantics
 
@@ -263,15 +292,27 @@ with a `*sql.Conn` from that pool.
   returns the same error without panicking.
 - Broken during introspection: `prepareOverride` (and separately
   `databaseInfoOverride`) returns a native error while `brokenOverride` reports
-  true. The test asserts the error propagates, that `(*conn).IsValid()` is false
-  afterwards, and that closing the `*sql.Conn` and reopening from the same
-  `*sql.DB` does not hand back the same `*conn` pointer.
+  true. The test asserts the error propagates and that `(*conn).IsValid()` is
+  false afterwards.
+
+  Proving the pool actually discards it needs a new seam. The existing
+  `databaseSQLTestConnector.Connect` returns one fixed `driver.Conn` on every
+  call (`connect_timeout_test.go:17`), so the pool drops the dead `*conn` and
+  immediately reconnects to the same dead `*conn`; a pointer-identity assertion
+  against that connector is meaningless. Add a sibling connector whose `Connect`
+  calls a `func() driver.Conn` factory and records each minted connection. With
+  it, the test closes the `*sql.Conn`, acquires a new one, runs a successful
+  `Diagnostics`, and asserts the factory was called a second time and that the
+  first `*conn` never served it. That assertion is what proves `IsValid` removed
+  the broken connection from the pool rather than merely reporting false.
 - Context cancellation during prepare: a `prepareContextOverride` blocks until
   the test cancels, following the pattern of
-  `TestDatabaseSQLPreparedExecContextCancelsActiveNativeCall`. The returned error
-  matches the originating context through `errors.Is`, and the connection mutex
-  is shown to be released afterwards by a successful subsequent `Diagnostics`
-  call on a fresh connection.
+  `TestDatabaseSQLPreparedExecContextCancelsActiveNativeCall`
+  (`direct_lifecycle_test.go:864`). The returned error matches the originating
+  context through `errors.Is`. A subsequent `Diagnostics` call that completes
+  then shows `c.mu` was released; with the fixed-connection connector that call
+  reaches the same `*conn`, which is the stronger demonstration and is what the
+  test should assert.
 
 ### Live tests, `integration/` package
 
@@ -281,6 +322,10 @@ All new live tests carry `//go:build integration`, live in
 they are gated by the same build tag and `testfixture.FromEnv()` configuration as
 every other live test and are covered by `make test-integration-docker`.
 
+`openDatabase` sets `SetMaxOpenConns(1)`, so any test that needs two concurrent
+attachments must call `createFixture` once and `openDatabase` twice against the
+same fixture path rather than taking two `*sql.Conn` from one pool.
+
 - `TestIntrospectionDiagnosticsReportsDialect`: table-driven over dialects 1 and
   3 using `newDatabaseWithDialect(t, dialect)`. Asserts
   `diagnostics.SQLDialect == int64(dialect)` and that `ClientVersion`,
@@ -289,23 +334,57 @@ every other live test and are covered by `make test-integration-docker`.
   (`integration/lifecycle_test.go:234`).
 - `TestIntrospectionPlanReturnsSelectPlan`: `Plan` for
   `SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?` returns a non-empty plan.
-- `TestIntrospectionPlanForDMLDoesNotExecute`: the safety proof. Uses
-  `createFixture` plus two independent pools on the same fixture. Reads the
-  sentinel row from the first pool, calls `Plan` with
+- `TestIntrospectionPlanForDMLDoesNotExecuteImplicitly`: two pools on one
+  fixture. Reads the sentinel row from the first pool, calls `Plan` with
   `UPDATE GO_COUNTRY SET COUNTRY = 'changed' WHERE ID = 1` and with
   `DELETE FROM GO_COUNTRY WHERE ID = 1`, then asserts on row state, not on
   absence of error: the same `*sql.Conn` still reads `COUNTRY = 'USA'` for
   `ID = 1`, the row count for `ID = 1` is still 1, and the second pool — a
   separate native attachment — reads the same values. The plan strings are only
   logged, because an empty DML plan is permitted.
-- `TestIntrospectionPlanUsesActiveTransaction`: on one `*sql.Conn`, begin a
-  writable explicit transaction, `UPDATE` a row inside it, then call `Plan` on a
-  `SELECT` of that row through `Raw` on the same `*sql.Conn`, and also plan
-  `SELECT ... FOR UPDATE`, which only prepares successfully inside a writable
-  transaction. Both return non-empty plans; the same `Plan` calls run before
-  `BeginTx` are used as the contrast case for `FOR UPDATE`. Rolling back
-  afterwards leaves the table unchanged, proving `Plan` did not complete the
-  caller's transaction.
+
+  This case alone is not sufficient evidence. With no explicit transaction the
+  native prepare transaction is read-only, so a hypothetical execute would be
+  refused by the engine and the assertions would pass for the wrong reason. It
+  establishes only that the read-only default path is safe; the next test
+  removes that escape.
+- `TestIntrospectionPlanInsideWritableTransaction`: one test carrying both the
+  transaction-selection check and the load-bearing safety check, because both
+  need the same writable explicit transaction. On a single `*sql.Conn` from the
+  first pool:
+
+  1. `conn.BeginTx(ctx, nil)` — a writable read-committed transaction.
+  2. Inside it, `ExecContext` a `CREATE TABLE GO_INTROSPECTION_TXPROBE (ID
+     INTEGER NOT NULL PRIMARY KEY, TEXT_VALUE VARCHAR(32))` and an `INSERT`
+     of `(1, 'sentinel')`. InterBase metadata is transactional, so neither the
+     table nor the row is visible outside this transaction yet.
+  3. Through `Raw` on the same `*sql.Conn`, `Plan` a
+     `SELECT TEXT_VALUE FROM GO_INTROSPECTION_TXPROBE WHERE ID = 1`. It must
+     succeed with a non-empty plan. **This is the transaction-selection proof:**
+     if `Plan` had started its own implicit transaction, the uncommitted
+     metadata would be invisible and prepare would fail with an unknown-table
+     error.
+  4. Still inside the writable transaction, `Plan`
+     `UPDATE GO_INTROSPECTION_TXPROBE SET TEXT_VALUE = 'changed' WHERE ID = 1`
+     and `DELETE FROM GO_INTROSPECTION_TXPROBE WHERE ID = 1`, then read
+     `TEXT_VALUE` back on the same `*sql.Conn` and assert it is still
+     `'sentinel'` and that exactly one row remains. **This is the safety proof:**
+     the transaction the DML would have run in is writable and the read sees its
+     own uncommitted work, so an execute would be both permitted and visible.
+  5. `tx.Rollback()`, then assert from the second pool that
+     `GO_INTROSPECTION_TXPROBE` does not exist — the rollback proves `Plan`
+     neither committed nor rolled back the caller's transaction at any point.
+
+  An earlier draft of this test used `SELECT ... FOR UPDATE` as the
+  transaction-selection signal, on the assumption that it only prepares inside a
+  writable transaction. That assumption is wrong for the prepare path: the
+  `"SELECT FOR UPDATE requires an explicit writable transaction"` check exists
+  only in the execution paths (`native.c:7504` for direct query,
+  `native.c:8171` for prepared query). `ib_statement_prepare_mode` treats
+  `isc_info_sql_stmt_select_for_upd` purely as an output-describe case
+  (`native.c:7913`) and never inspects `transaction_read_only`. The uncommitted
+  metadata probe is used instead because it depends on visibility, which the
+  prepare path demonstrably does exercise.
 - `TestIntrospectionPlanLeavesNoOpenTransaction`: after `Plan` without an
   explicit transaction, an immediate `ExecContext` insert on the same `*sql.Conn`
   commits normally and is visible from the second pool, showing the implicit
