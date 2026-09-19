@@ -123,6 +123,7 @@ struct ib_connection {
 	int transaction_read_only;
 	int broken;
 	int write_outcome_state;
+	int query_mutating;
 	char *read_tpb;
 	size_t read_tpb_length;
 	char *write_tpb;
@@ -205,6 +206,8 @@ struct ib_cursor {
 	ib_array_view array_view;
 	ib_cursor *next;
 };
+
+static int ib_error_has_native_status(const char *error, ISC_STATUS status);
 
 static void ib_cursor_register(ib_cursor *cursor)
 {
@@ -798,7 +801,10 @@ static int IB_MAYBE_UNUSED ib_cancel_slot_publish(ib_cancel_slot *slot,
 	}
 	result = pthread_mutex_lock(&slot->mutex);
 	if (result != 0) {
-		return ib_pthread_fail(error, "pthread_mutex_lock", result);
+		/* The slot cannot be made safe after losing its synchronization
+		 * boundary.  Continuing could close or reuse a handle while a cancel
+		 * caller still owns it. */
+		abort();
 	}
 	if (slot->generation != generation || !slot->active ||
 		slot->operation_complete || slot->completing || slot->published) {
@@ -850,7 +856,10 @@ static int ib_cancel_slot_republish_if_active(ib_cancel_slot *slot,
 	}
 	result = pthread_mutex_lock(&slot->mutex);
 	if (result != 0) {
-		return ib_pthread_fail(error, "pthread_mutex_lock", result);
+		/* The slot cannot be made safe after losing its synchronization
+		 * boundary.  Continuing could close or reuse a handle while a cancel
+		 * caller still owns it. */
+		abort();
 	}
 	if (slot->generation != generation || !slot->active ||
 		slot->operation_complete || slot->completing) {
@@ -874,8 +883,8 @@ static int ib_cancel_slot_republish_if_active(ib_cancel_slot *slot,
 #endif
 			result = pthread_cond_wait(&slot->condition, &slot->mutex);
 			if (result != 0) {
-				ib_cancel_slot_unlock_or_abort(slot);
-				return ib_pthread_fail(error, "pthread_cond_wait", result);
+				/* A failed wait leaves publication quiescence unproven. */
+				abort();
 			}
 		}
 	}
@@ -909,7 +918,10 @@ static int ib_cancel_slot_unpublish(ib_cancel_slot *slot, uint64_t generation,
 	}
 	result = pthread_mutex_lock(&slot->mutex);
 	if (result != 0) {
-		return ib_pthread_fail(error, "pthread_mutex_lock", result);
+		/* The slot cannot be made safe after losing its synchronization
+		 * boundary.  Continuing could close or reuse a handle while a cancel
+		 * caller still owns it. */
+		abort();
 	}
 	if (slot->generation != generation || !slot->active ||
 		slot->operation_complete || slot->completing) {
@@ -932,8 +944,8 @@ static int ib_cancel_slot_unpublish(ib_cancel_slot *slot, uint64_t generation,
 #endif
 		result = pthread_cond_wait(&slot->condition, &slot->mutex);
 		if (result != 0) {
-			ib_cancel_slot_unlock_or_abort(slot);
-			return ib_pthread_fail(error, "pthread_cond_wait", result);
+			/* A failed wait leaves publication quiescence unproven. */
+			abort();
 		}
 	}
 	result = pthread_mutex_unlock(&slot->mutex);
@@ -6218,8 +6230,14 @@ static void ib_failed_query_cleanup(ib_cursor *cursor, char **error)
 			connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
 		} else if (owns_transaction) {
 			connection->write_outcome_state = IB_WRITE_OUTCOME_ROLLBACK_CONFIRMED;
-		} else {
+		} else if (error != NULL && *error != NULL &&
+			ib_error_has_native_status(*error, isc_cancelled)) {
 			connection->write_outcome_state = IB_WRITE_OUTCOME_EXPLICIT_USABLE;
+		} else {
+			/* Local statement cleanup does not prove that a caller-owned
+			 * transaction is usable after an uncertain response.  Only the
+			 * native isc_cancelled result establishes that contract. */
+			connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
 		}
 	}
 	if (cleanup_error != NULL) {
@@ -6857,6 +6875,11 @@ int ib_connection_write_outcome_state(const ib_connection *connection)
 	return connection->write_outcome_state;
 }
 
+int ib_connection_query_mutating(const ib_connection *connection)
+{
+	return connection != NULL && connection->query_mutating != 0;
+}
+
 int ib_connection_commit_retaining(ib_connection *connection, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
@@ -7393,6 +7416,7 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		return NULL;
 	}
 	connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
+	connection->query_mutating = 0;
 	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
 		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "query is empty or too long");
@@ -7501,6 +7525,8 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 	free(prepared_query);
 	prepared_query = NULL;
 	cursor->statement_type = statement_type;
+	connection->query_mutating =
+		statement_type == isc_info_sql_stmt_exec_procedure;
 	if (ib_describe_bind(cursor, error) != 0 ||
 		ib_bind_input_mode(cursor, bindings, cursor->allow_arrays, error) != 0 ||
 		ib_describe_output(cursor, error) != 0 ||
@@ -7590,6 +7616,7 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 		return ib_fail(error, "connection is unavailable");
 	}
 	connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
+	connection->query_mutating = 0;
 	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
 		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "query is empty or too long");
@@ -8099,6 +8126,12 @@ int ib_statement_write_outcome_state(const ib_statement *statement)
 		return IB_WRITE_OUTCOME_UNKNOWN;
 	}
 	return statement->connection->write_outcome_state;
+}
+
+int ib_statement_query_mutating(const ib_statement *statement)
+{
+	return statement != NULL &&
+		statement->statement_type == isc_info_sql_stmt_exec_procedure;
 }
 
 ib_cursor *ib_statement_query(ib_statement *statement,
@@ -9428,6 +9461,11 @@ int ib_transaction_write_outcome_state(const ib_transaction *transaction)
 		return IB_WRITE_OUTCOME_UNKNOWN;
 	}
 	return transaction->view.write_outcome_state;
+}
+
+int ib_transaction_query_mutating(const ib_transaction *transaction)
+{
+	return transaction != NULL && transaction->view.query_mutating != 0;
 }
 
 int ib_transaction_commit_retaining(ib_transaction *transaction, char **error)

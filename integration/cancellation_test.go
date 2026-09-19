@@ -86,6 +86,15 @@ BEGIN
         EXECUTE PROCEDURE GO_CANCEL_DELAY;
 END^
 
+CREATE PROCEDURE GO_CANCEL_PARTIAL_MUTATION (FIRST_ID INTEGER, SECOND_ID INTEGER) AS
+BEGIN
+    INSERT INTO GO_CANCEL_CONTROL (ID, LABEL, TOKEN)
+    VALUES (:FIRST_ID, 'partial first mutation', GEN_ID(GO_CANCEL_GENERATOR, 1));
+    EXECUTE PROCEDURE GO_CANCEL_DELAY;
+    INSERT INTO GO_CANCEL_TARGET (ID, WRITE_VALUE, LABEL)
+    VALUES (:SECOND_ID, 200, 'partial second mutation');
+END^
+
 CREATE PROCEDURE GO_CANCEL_RACE_DELAY AS
 DECLARE VARIABLE RACE_TOKEN INTEGER;
 BEGIN
@@ -277,6 +286,184 @@ func TestLiveCancellationRaces(t *testing.T) {
 			t.Fatalf("file descriptors after repeated cancellation = %d, baseline = %d", got, beforeFDs)
 		}
 	}
+}
+
+func TestCanceledFetchReturnsContextCancellation(t *testing.T) {
+	requireLiveCancellation(t)
+
+	fixture, cfg, cleanup := createFixture(t, 3, cancellationFixtureSchema)
+	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 3,
+		interbase.TransactionOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rows, err := db.QueryContext(ctx,
+		"SELECT A.ID FROM GO_CANCEL_DELAY_ROWS A, GO_CANCEL_DELAY_ROWS B")
+	if err != nil {
+		t.Fatalf("start large fetch: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				result <- err
+				return
+			}
+		}
+		result <- rows.Err()
+	}()
+
+	timer := time.NewTimer(cancellationStartDelay)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("large fetch completed before cancellation")
+		}
+		runCanceledReadError(t, err)
+	case <-timer.C:
+		cancel()
+		select {
+		case err := <-result:
+			runCanceledReadError(t, err)
+		case <-time.After(cancellationResultLimit):
+			t.Fatal("canceled fetch did not return before its live bound")
+		}
+	}
+
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
+	defer verifyCancel()
+	var count int64
+	if err := db.QueryRowContext(verifyCtx,
+		"SELECT COUNT(*) FROM GO_CANCEL_SEED").Scan(&count); err != nil || count != 16 {
+		t.Fatalf("connection reuse after canceled fetch = (%d, %v), want (16, nil)", count, err)
+	}
+}
+
+func TestCanceledRowLockWaitReturnsNativeCancellation(t *testing.T) {
+	requireLiveCancellation(t)
+
+	fixture, cfg, cleanup := createFixture(t, 3, cancellationFixtureSchema)
+	locker := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 3,
+		interbase.TransactionOptions{})
+	contender := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 3,
+		interbase.TransactionOptions{})
+	ctx := context.Background()
+	lockerTx, err := locker.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin row-lock owner: %v", err)
+	}
+	lockerDone := false
+	t.Cleanup(func() {
+		if !lockerDone {
+			_ = lockerTx.Rollback()
+		}
+	})
+	if _, err := lockerTx.ExecContext(ctx,
+		"UPDATE GO_CANCEL_TARGET SET WRITE_VALUE = ?, LABEL = ? WHERE ID = ?",
+		int64(11), "row-lock owner", int64(1)); err != nil {
+		t.Fatalf("acquire row lock: %v", err)
+	}
+
+	contenderTx, err := contender.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin row-lock contender: %v", err)
+	}
+	contenderDone := false
+	t.Cleanup(func() {
+		if !contenderDone {
+			_ = contenderTx.Rollback()
+		}
+	})
+	runCanceledWrite(t, func(cancelCtx context.Context) error {
+		_, err := contenderTx.ExecContext(cancelCtx,
+			"UPDATE GO_CANCEL_TARGET SET WRITE_VALUE = ?, LABEL = ? WHERE ID = ?",
+			int64(12), "canceled row-lock contender", int64(1))
+		return err
+	})
+
+	assertCancellationTargetTx(t, ctx, contenderTx, 1, true, 10, "initial")
+	if _, err := contenderTx.ExecContext(ctx,
+		"INSERT INTO GO_CANCEL_CONTROL (ID, LABEL, TOKEN) VALUES (?, ?, GEN_ID(GO_CANCEL_GENERATOR, 1))",
+		int64(100), "after row-lock cancellation"); err != nil {
+		t.Fatalf("row-lock contender transaction was not reusable: %v", err)
+	}
+	if err := contenderTx.Rollback(); err != nil {
+		t.Fatalf("rollback row-lock contender: %v", err)
+	}
+	contenderDone = true
+	if err := lockerTx.Rollback(); err != nil {
+		t.Fatalf("rollback row-lock owner: %v", err)
+	}
+	lockerDone = true
+
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
+	defer verifyCancel()
+	assertCancellationTarget(t, verifyCtx, contender, 1, true, 10, "initial")
+}
+
+func TestCanceledPartialProcedureIsAtomic(t *testing.T) {
+	requireLiveCancellation(t)
+
+	db, verifier := newCancellationDatabases(t)
+	const firstID = int64(100)
+	const secondID = int64(20)
+	runCanceledWrite(t, func(ctx context.Context) error {
+		_, err := db.ExecContext(ctx,
+			"EXECUTE PROCEDURE GO_CANCEL_PARTIAL_MUTATION(?, ?)", firstID, secondID)
+		return err
+	})
+
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
+	defer verifyCancel()
+	if got := queryCancellationCount(t, verifyCtx, verifier,
+		"SELECT COUNT(*) FROM GO_CANCEL_CONTROL WHERE ID = ?", firstID); got != 0 {
+		t.Fatalf("partial procedure first mutation rows = %d, want 0", got)
+	}
+	assertCancellationTarget(t, verifyCtx, verifier, secondID, false, 0, "")
+	assertCancellationLogEmpty(t, verifyCtx, verifier)
+}
+
+func TestCanceledPartialProcedurePreservesExplicitTransaction(t *testing.T) {
+	requireLiveCancellation(t)
+
+	db, verifier := newCancellationDatabases(t)
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("begin partial explicit transaction: %v", err)
+	}
+	transactionDone := false
+	t.Cleanup(func() {
+		if !transactionDone {
+			_ = tx.Rollback()
+		}
+	})
+	insertCancellationControlTx(t, context.Background(), tx, 1, "before partial procedure")
+	runCanceledWrite(t, func(ctx context.Context) error {
+		_, err := tx.ExecContext(ctx,
+			"EXECUTE PROCEDURE GO_CANCEL_PARTIAL_MUTATION(?, ?)", int64(101), int64(21))
+		return err
+	})
+	if got := queryCancellationCountTx(t, context.Background(), tx,
+		"SELECT COUNT(*) FROM GO_CANCEL_CONTROL WHERE ID = ?", int64(101)); got != 0 {
+		t.Fatalf("explicit partial first mutation rows = %d, want 0", got)
+	}
+	assertCancellationTargetTx(t, context.Background(), tx, 21, false, 0, "")
+	insertCancellationControlTx(t, context.Background(), tx, 2, "after partial procedure")
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit explicit partial transaction: %v", err)
+	}
+	transactionDone = true
+
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
+	defer verifyCancel()
+	if got := queryCancellationCount(t, verifyCtx, verifier,
+		"SELECT COUNT(*) FROM GO_CANCEL_CONTROL"); got != 2 {
+		t.Fatalf("explicit partial control rows = %d, want 2", got)
+	}
+	assertCancellationTarget(t, verifyCtx, verifier, 21, false, 0, "")
+	assertCancellationLogEmpty(t, verifyCtx, verifier)
 }
 
 func runCompletionWinningRace(t *testing.T, db, verifier *sql.DB) {
@@ -506,6 +693,29 @@ func assertCancellationTarget(t *testing.T, ctx context.Context, db *sql.DB, id 
 	}
 	if value != wantValue || label != wantLabel {
 		t.Fatalf("target %d = (%d, %q), want (%d, %q)",
+			id, value, label, wantValue, wantLabel)
+	}
+}
+
+func assertCancellationTargetTx(t *testing.T, ctx context.Context, tx *sql.Tx, id int64,
+	wantExists bool, wantValue int64, wantLabel string) {
+	t.Helper()
+	var value int64
+	var label string
+	err := tx.QueryRowContext(ctx,
+		"SELECT WRITE_VALUE, LABEL FROM GO_CANCEL_TARGET WHERE ID = ?", id).
+		Scan(&value, &label)
+	if !wantExists {
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("transaction target %d query error = %v, want sql.ErrNoRows", id, err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("transaction target %d query: %v", id, err)
+	}
+	if value != wantValue || label != wantLabel {
+		t.Fatalf("transaction target %d = (%d, %q), want (%d, %q)",
 			id, value, label, wantValue, wantLabel)
 	}
 }

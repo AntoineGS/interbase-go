@@ -559,7 +559,7 @@ func TestClassifyNativeWriteOutcomeUsesOverlappingCancellationForLostResponse(t 
 	const cleanupSecret = "rollback /private/db.ib password=cleanup"
 	primary := &NativeError{
 		Operation:  "execute statement",
-		NativeCode: 335544366,
+		NativeCode: 335544726, // isc_net_read_err
 		Message:    primarySecret,
 	}
 	cleanup := &NativeError{
@@ -605,7 +605,7 @@ func TestClassifyNativeWriteOutcomeUsesOverlappingCancellationForLostResponse(t 
 func TestClassifyNativeWriteOutcomeDoesNotInferCancellationFromExpiredContext(t *testing.T) {
 	primary := &NativeError{
 		Operation:  "execute statement",
-		NativeCode: 335544366,
+		NativeCode: 335544726, // isc_net_read_err
 		Message:    "ordinary native failure",
 	}
 
@@ -624,13 +624,339 @@ func TestClassifyNativeWriteOutcomeDoesNotInferCancellationFromExpiredContext(t 
 	}
 }
 
+func TestClassifyNativeWriteOutcomeKeepsDefinitiveErrorAuthoritativeAfterOverlap(t *testing.T) {
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: 335544349, // isc_no_dup
+		Message:    "duplicate key",
+	}
+	request := &NativeError{
+		Operation:  "cancel statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "cancel request failed",
+	}
+
+	got := classifyNativeWriteOutcome("execute statement", true,
+		context.Canceled, primary, nil, nativeWriteOutcomeUnknown,
+		nativeCancellationEvidence{
+			known:             true,
+			attempted:         true,
+			overlapped:        true,
+			executingCanceled: false,
+		})
+	if !errors.Is(got, primary) {
+		t.Fatalf("overlapped definitive error = %v, lost primary error", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("overlapped definitive error = %v, incorrectly relabeled as cancellation", got)
+	}
+	var cancellation *CancellationError
+	if errors.As(got, &cancellation) {
+		t.Fatalf("overlapped definitive error = %v, unexpectedly became CancellationError", got)
+	}
+	var uncertain *UncertainOutcomeError
+	if errors.As(got, &uncertain) {
+		t.Fatalf("overlapped definitive error = %v, unexpectedly became uncertain", got)
+	}
+
+	// A failed cancellation request is diagnostic only and must not alter the
+	// authoritative server constraint error either.
+	withRequest := wrapNativeExecutionErrorWithMetadata(primary, nil, request,
+		nativeCancellationEvidence{attempted: true, overlapped: true})
+	if !errors.Is(withRequest, primary) || !errors.Is(withRequest, request) {
+		t.Fatalf("request failure error tree = %v, lost execution/request diagnostics", withRequest)
+	}
+	got = classifyNativeWriteOutcome("execute statement", true,
+		context.Canceled, withRequest, nil, nativeWriteOutcomeUnknown,
+		nativeCancellationEvidenceOf(withRequest))
+	if !errors.Is(got, primary) || errors.Is(got, context.Canceled) {
+		t.Fatalf("request failure classification = %v, want authoritative primary error", got)
+	}
+}
+
+func TestPreparedExplicitCancellationRequiresNativeProofOfUsability(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	primary := &NativeError{
+		Operation:  "execute prepared statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	native := &nativeConnection{
+		brokenOverride: func() bool { return false },
+	}
+	statement := &stmt{
+		conn: nativeTestConnection(native),
+		native: &nativeStatement{
+			writeOutcomeStateOverride: func() nativeWriteOutcomeState {
+				return nativeWriteOutcomeUnknown
+			},
+			execOverride: func([]argument) (int64, error) {
+				cancel()
+				return 0, primary
+			},
+		},
+	}
+
+	_, err := statement.ExecContext(ctx, nil)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) {
+		t.Fatalf("prepared explicit cancellation = %v, lost cancellation/native identity", err)
+	}
+	var uncertain *UncertainOutcomeError
+	if !errors.As(err, &uncertain) {
+		t.Fatalf("prepared explicit cancellation = %v, want UncertainOutcomeError", err)
+	}
+	if !uncertain.Mutating {
+		t.Fatal("prepared explicit cancellation uncertainty was not marked mutating")
+	}
+}
+
+func nativeTestConnection(native *nativeConnection) *conn {
+	return &conn{native: native}
+}
+
+func TestQueryCancellationTracksExecutableProcedureMutability(t *testing.T) {
+	primary := &NativeError{
+		Operation:  "execute procedure",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+
+	t.Run("connection query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		slot := &fakeCancelSlot{
+			cancelStarted:    make(chan struct{}),
+			cancelAttempted:  true,
+			cancelOverlapped: true,
+		}
+		native := &nativeConnection{
+			brokenOverride:     func() bool { return false },
+			cancelSlotOverride: slot,
+			writeOutcomeStateOverride: func() nativeWriteOutcomeState {
+				return nativeWriteOutcomeUnknown
+			},
+			queryContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (*nativeCursor, []string, error) {
+				close(entered)
+				<-release
+				return nil, nil, primary
+			},
+			queryMutatingOverride: func() bool { return true },
+		}
+		connection := nativeTestConnection(native)
+		result := make(chan error, 1)
+		go func() {
+			_, err := connection.QueryContext(ctx, "EXECUTE PROCEDURE GO_CANCEL_MUTATING", nil)
+			result <- err
+		}()
+		waitForTestSignal(t, entered, "connection query did not enter the native override")
+		cancel()
+		close(release)
+		assertMutatingQueryCancellation(t, <-result, primary)
+	})
+
+	t.Run("prepared query", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		entered := make(chan struct{})
+		release := make(chan struct{})
+		native := &nativeConnection{brokenOverride: func() bool { return false }}
+		connection := nativeTestConnection(native)
+		statement := &stmt{
+			conn: connection,
+			native: &nativeStatement{
+				writeOutcomeStateOverride: func() nativeWriteOutcomeState {
+					return nativeWriteOutcomeUnknown
+				},
+				queryMutatingOverride: func() bool { return true },
+				queryOverride: func([]argument) (*nativeCursor, []string, error) {
+					close(entered)
+					<-release
+					return nil, nil, primary
+				},
+			},
+		}
+		result := make(chan error, 1)
+		go func() {
+			_, err := statement.QueryContext(ctx, nil)
+			result <- err
+		}()
+		waitForTestSignal(t, entered, "prepared query did not enter the native override")
+		cancel()
+		close(release)
+		assertMutatingQueryCancellation(t, <-result, primary)
+	})
+
+	for _, distributed := range []bool{false, true} {
+		name := "direct query"
+		if distributed {
+			name = "distributed participant query"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			slot := &fakeCancelSlot{
+				cancelStarted:    make(chan struct{}),
+				cancelAttempted:  true,
+				cancelOverlapped: true,
+			}
+			native := &nativeTransaction{
+				cancelSlotOverride: slot,
+				writeOutcomeStateOverride: func() nativeWriteOutcomeState {
+					return nativeWriteOutcomeUnknown
+				},
+				queryMutatingOverride: func() bool { return true },
+				queryContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (*nativeCursor, []string, error) {
+					close(entered)
+					<-release
+					return nil, nil, primary
+				},
+			}
+			connection := &conn{native: &nativeConnection{brokenOverride: func() bool { return false }}}
+			attachment := &Attachment{
+				conn:         connection,
+				transactions: make(map[*Transaction]struct{}),
+				generation:   1,
+			}
+			transaction := &Transaction{
+				attachment: attachment,
+				native:     native,
+				generation: 1,
+				cursors:    make(map[*Cursor]struct{}),
+				blobs:      make(map[*blobStream]struct{}),
+			}
+			attachment.transactions[transaction] = struct{}{}
+			attachment.directTx = transaction
+			if distributed {
+				coordinator := &DistributedTransaction{}
+				coordinator.state.Store(uint32(distributedStateActive))
+				transaction.distributed = coordinator
+			}
+
+			result := make(chan error, 1)
+			go func() {
+				_, err := transaction.Query(ctx, "EXECUTE PROCEDURE GO_CANCEL_MUTATING")
+				result <- err
+			}()
+			waitForTestSignal(t, entered, "direct query did not enter the native override")
+			cancel()
+			close(release)
+			assertMutatingQueryCancellation(t, <-result, primary)
+		})
+	}
+}
+
+func assertMutatingQueryCancellation(t *testing.T, err error, primary error) {
+	t.Helper()
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) {
+		t.Fatalf("mutating query cancellation = %v, lost cancellation/native identity", err)
+	}
+	var cancellation *CancellationError
+	if !errors.As(err, &cancellation) || !cancellation.Mutating {
+		t.Fatalf("mutating query cancellation = %v, want mutating CancellationError", err)
+	}
+	var uncertain *UncertainOutcomeError
+	if !errors.As(err, &uncertain) || !uncertain.Mutating {
+		t.Fatalf("mutating query cancellation = %v, want mutating uncertainty", err)
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("mutating query cancellation = %v, must not be driver.ErrBadConn", err)
+	}
+}
+
+func TestPrepareAndFetchCancellationRetainRequestDiagnostics(t *testing.T) {
+	primary := &NativeError{
+		Operation:  "native DSQL operation",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	request := &NativeError{
+		Operation:  "cancel statement",
+		NativeCode: 335545001,
+		Message:    "cancel request diagnostic",
+	}
+
+	t.Run("prepare", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		entered := make(chan struct{})
+		slot := &fakeCancelSlot{
+			cancelStarted:    make(chan struct{}),
+			cancelErr:        request,
+			cancelAttempted:  true,
+			cancelOverlapped: true,
+		}
+		native := &nativeConnection{
+			brokenOverride:     func() bool { return false },
+			cancelSlotOverride: slot,
+			prepareContextOverride: func(_ string, _ *nativeCancelOperation) (*nativeStatement, error) {
+				close(entered)
+				<-ctx.Done()
+				waitForTestSignal(t, slot.cancelStarted, "prepare cancellation did not overlap the native call")
+				return nil, primary
+			},
+		}
+		connection := nativeTestConnection(native)
+		result := make(chan error, 1)
+		go func() {
+			_, err := connection.PrepareContext(ctx, "SELECT 1")
+			result <- err
+		}()
+		waitForTestSignal(t, entered, "prepare did not enter the native override")
+		cancel()
+		waitForTestSignal(t, slot.cancelStarted, "prepare cancellation did not run")
+		err := <-result
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) || !errors.Is(err, request) {
+			t.Fatalf("prepare cancellation = %v, lost context/operation/request diagnostics", err)
+		}
+	})
+
+	t.Run("fetch", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		entered := make(chan struct{})
+		slot := &fakeCancelSlot{
+			cancelStarted:    make(chan struct{}),
+			cancelErr:        request,
+			cancelAttempted:  true,
+			cancelOverlapped: true,
+		}
+		native := &nativeCursor{
+			cancelSlotOverride: slot,
+			nextContextOverride: func(_ *nativeCancelOperation) (bool, error) {
+				close(entered)
+				<-ctx.Done()
+				waitForTestSignal(t, slot.cancelStarted, "fetch cancellation did not overlap the native call")
+				return false, primary
+			},
+		}
+		connection := &conn{
+			native: &nativeConnection{brokenOverride: func() bool { return false }},
+		}
+		rows := &rows{conn: connection, native: native, ctx: ctx}
+		result := make(chan error, 1)
+		go func() { result <- rows.Next(nil) }()
+		waitForTestSignal(t, entered, "fetch did not enter the native override")
+		cancel()
+		waitForTestSignal(t, slot.cancelStarted, "fetch cancellation did not run")
+		err := <-result
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) || !errors.Is(err, request) {
+			t.Fatalf("fetch cancellation = %v, lost context/operation/request diagnostics", err)
+		}
+	})
+}
+
 func TestExecContextOverlappingLostResponsePreservesFaultTreeAndRedacts(t *testing.T) {
 	const secret = "password=primary-secret attachment=/private/primary.ib"
 	const cleanupSecret = "password=cleanup-secret attachment=/private/cleanup.ib"
 	const requestSecret = "password=request-secret attachment=/private/request.ib"
 	primary := &NativeError{
 		Operation:  "execute statement",
-		NativeCode: 335544366,
+		NativeCode: 335544726, // isc_net_read_err
 		Message:    secret,
 	}
 	cleanup := &NativeError{
@@ -704,7 +1030,7 @@ func TestExecContextOverlappingLostResponsePreservesFaultTreeAndRedacts(t *testi
 func TestExecContextCancellationRequestFailureWithoutOverlapStaysNative(t *testing.T) {
 	primary := &NativeError{
 		Operation:  "execute statement",
-		NativeCode: 335544366,
+		NativeCode: 335544726, // isc_net_read_err
 		Message:    "ordinary native failure",
 	}
 	entered := make(chan struct{})
@@ -844,7 +1170,7 @@ func TestSQLDoesNotReplayUncertainLostResponseAfterConnectionLoss(t *testing.T) 
 	const primarySecret = "password=lost-response attachment=/private/lost.ib"
 	primary := &NativeError{
 		Operation:  "execute statement",
-		NativeCode: 335544366,
+		NativeCode: 335544726, // isc_net_read_err
 		Message:    primarySecret,
 	}
 	entered := make(chan struct{})
@@ -905,7 +1231,7 @@ func TestSQLDoesNotReplayUncertainLostResponseAfterConnectionLoss(t *testing.T) 
 func TestExecContextConnectionLossLeavesOutcomeUnknown(t *testing.T) {
 	primary := &NativeError{
 		Operation:  "execute statement",
-		NativeCode: 335544366,
+		NativeCode: 335544726, // isc_net_read_err
 		Message:    "connection lost after cancellation overlap",
 	}
 	entered := make(chan struct{})

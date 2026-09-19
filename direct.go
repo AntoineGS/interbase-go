@@ -796,8 +796,9 @@ func (t *Transaction) Query(ctx context.Context, query string, args ...any) (*Cu
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := a.conn.sanitizeError("direct query", primaryErr)
 		cleanupErr = a.conn.sanitizeError("", cleanupErr)
-		operationErr = classifyNativeOutcome("direct query", false,
-			contextCancellation(ctx), operationErr, cleanupErr, evidence)
+		operationErr = classifyNativeWriteOutcome("direct query",
+			nativeQueryMutatingOf(err), contextCancellation(ctx), operationErr,
+			cleanupErr, t.native.writeOutcomeState(), evidence)
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
@@ -1039,9 +1040,12 @@ func (t *Transaction) Plan(ctx context.Context, query string) (string, error) {
 		releaseNative()
 	}
 	if err != nil {
-		operationErr := a.conn.sanitizeError("prepare direct plan", err)
+		evidence := nativeCancellationEvidenceOf(err)
+		primaryErr, cleanupErr := splitNativeExecutionError(err)
+		operationErr := a.conn.sanitizeError("prepare direct plan", primaryErr)
+		cleanupErr = a.conn.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeOutcome("prepare direct plan", false,
-			contextCancellation(ctx), operationErr, nil)
+			contextCancellation(ctx), operationErr, cleanupErr, evidence)
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
@@ -1758,9 +1762,12 @@ func (c *Cursor) Next(ctx context.Context) (bool, error) {
 	hasRow, err := c.native.next(ctx)
 	releaseNative()
 	if err != nil {
-		operationErr := c.tx.attachment.conn.sanitizeError("direct fetch", err)
+		evidence := nativeCancellationEvidenceOf(err)
+		primaryErr, cleanupErr := splitNativeExecutionError(err)
+		operationErr := c.tx.attachment.conn.sanitizeError("direct fetch", primaryErr)
+		cleanupErr = c.tx.attachment.conn.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeOutcome("direct fetch", false,
-			contextCancellation(ctx), operationErr, nil)
+			contextCancellation(ctx), operationErr, cleanupErr, evidence)
 		closeErr := c.closeLocked(true, operationErr)
 		return false, errors.Join(operationErr, closeErr)
 	}

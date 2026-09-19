@@ -188,6 +188,9 @@ type nativeConnection struct {
 	dropConsumedOverride      bool
 	execOverride              func(string, []argument, bool) (int64, error)
 	execContextOverride       func(string, []argument, bool, *nativeCancelOperation) (int64, error)
+	queryContextOverride      func(string, []argument, bool, *nativeCancelOperation) (*nativeCursor, []string, error)
+	queryMutatingOverride     func() bool
+	prepareContextOverride    func(string, *nativeCancelOperation) (*nativeStatement, error)
 	cancelSlotOverride        nativeCancelSlotBackend
 	writeOutcomeStateOverride func() nativeWriteOutcomeState
 	prepareOverride           func(string) (*nativeStatement, error)
@@ -201,6 +204,9 @@ type nativeTransaction struct {
 	ptr                       *C.ib_transaction
 	execOverride              func(string, []argument, bool) (int64, error)
 	execContextOverride       func(string, []argument, bool, *nativeCancelOperation) (int64, error)
+	queryContextOverride      func(string, []argument, bool, *nativeCancelOperation) (*nativeCursor, []string, error)
+	queryMutatingOverride     func() bool
+	prepareContextOverride    func(string, bool, *nativeCancelOperation) (*nativeStatement, error)
 	cancelSlotOverride        nativeCancelSlotBackend
 	writeOutcomeStateOverride func() nativeWriteOutcomeState
 	freeOverride              func()
@@ -563,6 +569,21 @@ func (t *nativeTransaction) query(ctx context.Context, query string, args []argu
 	}
 	release := nativegate.Global.Enter()
 	defer release()
+	if t != nil && t.queryContextOverride != nil {
+		operation, err := newNativeCancelOperationWithSlot(ctx, t.cancelSlotOverride)
+		if err != nil {
+			return nil, nil, err
+		}
+		cursor, columns, overrideErr := t.queryContextOverride(query,
+			append([]argument(nil), args...), allowArrays, operation)
+		operation.finish()
+		if overrideErr != nil {
+			primaryErr, cleanupErr := splitNativeCleanupDiagnostic(overrideErr)
+			return nil, nil, operation.wrapQueryExecutionError(primaryErr,
+				cleanupErr, t.queryMutating())
+		}
+		return cursor, columns, nil
+	}
 	if t == nil || t.ptr == nil {
 		return nil, nil, errors.New("interbase: native transaction is unavailable")
 	}
@@ -573,7 +594,7 @@ func (t *nativeTransaction) query(ctx context.Context, query string, args []argu
 	defer C.ib_bindings_free(bindings)
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
-	operation, err := newNativeCancelOperation(ctx)
+	operation, err := newNativeCancelOperationWithSlot(ctx, t.cancelSlotOverride)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -581,12 +602,26 @@ func (t *nativeTransaction) query(ctx context.Context, query string, args []argu
 	cursor := C.ib_transaction_query(t.ptr, queryPointer, C.size_t(len(query)),
 		bindings, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
 		operation.nativeCancelGeneration(), &errorPointer)
+	mutating := C.ib_transaction_query_mutating(t.ptr) != 0
 	operation.finish()
 	if cursor == nil {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
-		return nil, nil, operation.wrapExecutionError(primaryErr, cleanupErr)
+		return nil, nil, operation.wrapQueryExecutionError(primaryErr, cleanupErr, mutating)
 	}
 	return nativeCursorFromPointer(cursor, nil)
+}
+
+func (t *nativeTransaction) queryMutating() bool {
+	if t == nil {
+		return false
+	}
+	if t.queryMutatingOverride != nil {
+		return t.queryMutatingOverride()
+	}
+	if t.ptr == nil {
+		return false
+	}
+	return C.ib_transaction_query_mutating(t.ptr) != 0
 }
 
 func (t *nativeTransaction) exec(ctx context.Context, query string, args []argument,
@@ -640,12 +675,25 @@ func (t *nativeTransaction) prepare(ctx context.Context, query string,
 	}
 	release := nativegate.Global.Enter()
 	defer release()
+	if t != nil && t.prepareContextOverride != nil {
+		operation, err := newNativeCancelOperationWithSlot(ctx, t.cancelSlotOverride)
+		if err != nil {
+			return nil, err
+		}
+		statement, overrideErr := t.prepareContextOverride(query, allowArrays, operation)
+		operation.finish()
+		if overrideErr != nil {
+			primaryErr, cleanupErr := splitNativeCleanupDiagnostic(overrideErr)
+			return nil, operation.wrapExecutionError(primaryErr, cleanupErr)
+		}
+		return statement, nil
+	}
 	if t == nil || t.ptr == nil {
 		return nil, errors.New("interbase: native transaction is unavailable")
 	}
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
-	operation, err := newNativeCancelOperation(ctx)
+	operation, err := newNativeCancelOperationWithSlot(ctx, t.cancelSlotOverride)
 	if err != nil {
 		return nil, err
 	}
@@ -655,7 +703,8 @@ func (t *nativeTransaction) prepare(ctx context.Context, query string,
 		operation.nativeCancelGeneration(), &errorPointer)
 	operation.finish()
 	if statement == nil {
-		return nil, takeNativeError(errorPointer)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
+		return nil, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	return &nativeStatement{ptr: statement}, nil
 }
@@ -713,16 +762,21 @@ func (t *nativeTransaction) free() {
 }
 
 type nativeStatement struct {
-	ptr              *C.ib_statement
-	execOverride     func([]argument) (int64, error)
-	queryOverride    func([]argument) (*nativeCursor, []string, error)
-	closeOverride    func() error
-	numInputOverride func() int
+	ptr                       *C.ib_statement
+	execOverride              func([]argument) (int64, error)
+	queryOverride             func([]argument) (*nativeCursor, []string, error)
+	queryMutatingOverride     func() bool
+	writeOutcomeStateOverride func() nativeWriteOutcomeState
+	closeOverride             func() error
+	numInputOverride          func() int
 }
 
 func (s *nativeStatement) writeOutcomeState() nativeWriteOutcomeState {
 	if s == nil {
 		return nativeWriteOutcomeUnknown
+	}
+	if s.writeOutcomeStateOverride != nil {
+		return s.writeOutcomeStateOverride()
 	}
 	if s.ptr == nil {
 		if s.execOverride != nil || s.queryOverride != nil {
@@ -733,9 +787,24 @@ func (s *nativeStatement) writeOutcomeState() nativeWriteOutcomeState {
 	return nativeWriteOutcomeStateFromC(C.ib_statement_write_outcome_state(s.ptr))
 }
 
+func (s *nativeStatement) queryMutating() bool {
+	if s == nil {
+		return false
+	}
+	if s.queryMutatingOverride != nil {
+		return s.queryMutatingOverride()
+	}
+	if s.ptr == nil {
+		return false
+	}
+	return C.ib_statement_query_mutating(s.ptr) != 0
+}
+
 type nativeCursor struct {
 	ptr                 *C.ib_cursor
 	nextOverride        func() (bool, error)
+	nextContextOverride func(*nativeCancelOperation) (bool, error)
+	cancelSlotOverride  nativeCancelSlotBackend
 	closeOverride       func() error
 	abortOverride       func() error
 	statement           *nativeStatement
@@ -1160,7 +1229,11 @@ func (s *nativeStatement) query(ctx context.Context, args []argument) (*nativeCu
 	release := nativegate.Global.Enter()
 	defer release()
 	if s != nil && s.queryOverride != nil {
-		return s.queryOverride(append([]argument(nil), args...))
+		cursor, columns, overrideErr := s.queryOverride(append([]argument(nil), args...))
+		if overrideErr != nil && s.queryMutatingOverride != nil {
+			return nil, nil, wrapNativeQueryMutability(overrideErr, s.queryMutating())
+		}
+		return cursor, columns, overrideErr
 	}
 	if s == nil || s.ptr == nil {
 		return nil, nil, errors.New("native statement is unavailable")
@@ -1178,10 +1251,11 @@ func (s *nativeStatement) query(ctx context.Context, args []argument) (*nativeCu
 	var errorPointer *C.char
 	cursor := C.ib_statement_query(s.ptr, bindings, operation.nativeCancelSlot(),
 		operation.nativeCancelGeneration(), &errorPointer)
+	mutating := C.ib_statement_query_mutating(s.ptr) != 0
 	operation.finish()
 	if cursor == nil {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
-		return nil, nil, operation.wrapExecutionError(primaryErr, cleanupErr)
+		return nil, nil, operation.wrapQueryExecutionError(primaryErr, cleanupErr, mutating)
 	}
 	nativeRows := &nativeCursor{
 		ptr:                 cursor,
@@ -1416,6 +1490,20 @@ func (c *nativeConnection) query(ctx context.Context, query string, args []argum
 	}
 	release := nativegate.Global.Enter()
 	defer release()
+	if c != nil && c.queryContextOverride != nil {
+		operation, err := newNativeCancelOperationWithSlot(ctx, c.cancelSlotOverride)
+		if err != nil {
+			return nil, nil, err
+		}
+		cursor, columns, overrideErr := c.queryContextOverride(query,
+			append([]argument(nil), args...), allowArrays, operation)
+		operation.finish()
+		if overrideErr != nil && c.queryMutatingOverride != nil {
+			return nil, nil, operation.wrapQueryExecutionError(
+				overrideErr, nil, c.queryMutatingOverride())
+		}
+		return cursor, columns, overrideErr
+	}
 	if c == nil || c.ptr == nil {
 		return nil, nil, errors.New("native connection is unavailable")
 	}
@@ -1435,7 +1523,7 @@ func (c *nativeConnection) query(ctx context.Context, query string, args []argum
 
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
-	operation, err := newNativeCancelOperation(ctx)
+	operation, err := newNativeCancelOperationWithSlot(ctx, c.cancelSlotOverride)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1443,10 +1531,11 @@ func (c *nativeConnection) query(ctx context.Context, query string, args []argum
 	cursor := C.ib_connection_query(c.ptr, queryPointer, C.size_t(len(query)),
 		bindings, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
 		operation.nativeCancelGeneration(), &cursorError)
+	mutating := C.ib_connection_query_mutating(c.ptr) != 0
 	operation.finish()
 	if cursor == nil {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(cursorError))
-		return nil, nil, operation.wrapExecutionError(primaryErr, cleanupErr)
+		return nil, nil, operation.wrapQueryExecutionError(primaryErr, cleanupErr, mutating)
 	}
 	nativeRows := &nativeCursor{
 		ptr:                 cursor,
@@ -1677,12 +1766,25 @@ func (c *nativeConnection) prepare(ctx context.Context, query string) (*nativeSt
 	if c != nil && c.prepareOverride != nil {
 		return c.prepareOverride(query)
 	}
+	if c != nil && c.prepareContextOverride != nil {
+		operation, err := newNativeCancelOperationWithSlot(ctx, c.cancelSlotOverride)
+		if err != nil {
+			return nil, err
+		}
+		statement, overrideErr := c.prepareContextOverride(query, operation)
+		operation.finish()
+		if overrideErr != nil {
+			primaryErr, cleanupErr := splitNativeCleanupDiagnostic(overrideErr)
+			return nil, operation.wrapExecutionError(primaryErr, cleanupErr)
+		}
+		return statement, nil
+	}
 	if c == nil || c.ptr == nil {
 		return nil, errors.New("native connection is unavailable")
 	}
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
-	operation, err := newNativeCancelOperation(ctx)
+	operation, err := newNativeCancelOperationWithSlot(ctx, c.cancelSlotOverride)
 	if err != nil {
 		return nil, err
 	}
@@ -1691,7 +1793,8 @@ func (c *nativeConnection) prepare(ctx context.Context, query string) (*nativeSt
 		operation.nativeCancelSlot(), operation.nativeCancelGeneration(), &errorPointer)
 	operation.finish()
 	if statement == nil {
-		return nil, takeNativeError(errorPointer)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
+		return nil, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	return &nativeStatement{ptr: statement}, nil
 }
@@ -1948,13 +2051,26 @@ func (c *nativeCursor) next(ctx context.Context) (bool, error) {
 	}
 	release := nativegate.Global.Enter()
 	defer release()
+	if c != nil && c.nextContextOverride != nil {
+		operation, err := newNativeCancelOperationWithSlot(ctx, c.cancelSlotOverride)
+		if err != nil {
+			return false, err
+		}
+		hasRow, overrideErr := c.nextContextOverride(operation)
+		operation.finish()
+		if overrideErr != nil {
+			primaryErr, cleanupErr := splitNativeCleanupDiagnostic(overrideErr)
+			return false, operation.wrapExecutionError(primaryErr, cleanupErr)
+		}
+		return hasRow, nil
+	}
 	if c != nil && c.nextOverride != nil {
 		return c.nextOverride()
 	}
 	if c == nil || c.ptr == nil {
 		return false, errors.New("native cursor is unavailable")
 	}
-	operation, err := newNativeCancelOperation(ctx)
+	operation, err := newNativeCancelOperationWithSlot(ctx, c.cancelSlotOverride)
 	if err != nil {
 		return false, err
 	}
@@ -1968,7 +2084,8 @@ func (c *nativeCursor) next(ctx context.Context) (bool, error) {
 	case 1:
 		return true, nil
 	default:
-		return false, takeNativeError(errorPointer)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
+		return false, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 }
 

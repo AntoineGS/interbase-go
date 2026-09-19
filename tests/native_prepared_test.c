@@ -1,13 +1,39 @@
+#include <errno.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <ibase.h>
 
 static int fail_message_allocation;
+static int fail_next_native_mutex_lock;
+static int fail_next_native_cond_wait;
+
+static int injected_native_mutex_lock(pthread_mutex_t *mutex)
+{
+	if (fail_next_native_mutex_lock) {
+		fail_next_native_mutex_lock = 0;
+		return EIO;
+	}
+	return pthread_mutex_lock(mutex);
+}
+
+static int injected_native_cond_wait(pthread_cond_t *condition,
+	pthread_mutex_t *mutex)
+{
+	if (fail_next_native_cond_wait) {
+		fail_next_native_cond_wait = 0;
+		return EIO;
+	}
+	return pthread_cond_wait(condition, mutex);
+}
 
 static void *test_malloc(size_t size)
 {
@@ -47,6 +73,8 @@ static void overlap_publication_wait_hook(struct ib_cancel_slot *slot);
 #define isc_dsql_sql_info test_dsql_sql_info
 #define isc_detach_database test_detach_database
 #define malloc test_malloc
+#define pthread_mutex_lock injected_native_mutex_lock
+#define pthread_cond_wait injected_native_cond_wait
 #define IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK(slot) overlap_completion_wait_hook(slot)
 #define IB_CANCEL_SLOT_TEST_PUBLICATION_WAIT_HOOK(slot) overlap_publication_wait_hook(slot)
 #include "../native.c"
@@ -67,6 +95,8 @@ static void overlap_publication_wait_hook(struct ib_cancel_slot *slot);
 #undef isc_dsql_sql_info
 #undef isc_detach_database
 #undef malloc
+#undef pthread_mutex_lock
+#undef pthread_cond_wait
 
 struct ib_statement;
 struct ib_statement *ib_statement_prepare(ib_connection *, const char *, size_t,
@@ -190,6 +220,9 @@ static int procedure_catalog_scale;
 static int catalog_charset_identifier;
 static int catalog_lookup_bytes_ok;
 static unsigned short expected_dialect;
+static ib_cancel_slot *sync_fault_slot;
+static uint64_t sync_fault_generation;
+static isc_stmt_handle sync_fault_statement;
 
 static void check(int condition, const char *message)
 {
@@ -197,6 +230,115 @@ static void check(int condition, const char *message)
 		(void) fprintf(stderr, "native prepared test failed: %s\n", message);
 		failures++;
 	}
+}
+
+static void require_sync_abort(void (*child_body)(void), const char *message)
+{
+	pid_t child;
+	int wait_status;
+
+	child = fork();
+	check(child >= 0, "fork failed during cancellation-slot fault injection");
+	if (child < 0) {
+		return;
+	}
+	if (child == 0) {
+		(void) alarm(2U);
+		child_body();
+		_exit(EXIT_FAILURE);
+	}
+	check(waitpid(child, &wait_status, 0) == child,
+		"waitpid failed during cancellation-slot fault injection");
+	check(WIFSIGNALED(wait_status) && WTERMSIG(wait_status) == SIGABRT,
+		message);
+}
+
+static void setup_sync_fault_slot(void)
+{
+	char *error = NULL;
+	isc_stmt_handle published_statement = (isc_stmt_handle) &statement_tokens[1];
+
+	sync_fault_slot = ib_cancel_slot_new(&error);
+	check(sync_fault_slot != NULL && error == NULL,
+		"synchronization fault slot allocation failed");
+	ib_error_free(error);
+	if (sync_fault_slot == NULL) {
+		return;
+	}
+	sync_fault_generation = ib_cancel_slot_begin(sync_fault_slot, &error);
+	check(sync_fault_generation != 0U && error == NULL,
+		"synchronization fault slot begin failed");
+	ib_error_free(error);
+	if (sync_fault_generation == 0U) {
+		ib_cancel_slot_free(sync_fault_slot);
+		sync_fault_slot = NULL;
+		return;
+	}
+	sync_fault_statement = (isc_stmt_handle) &statement_tokens[2];
+	check(ib_cancel_slot_publish(sync_fault_slot, sync_fault_generation,
+		&published_statement, &error) == 0 && error == NULL,
+		"synchronization fault slot publication failed");
+	ib_error_free(error);
+}
+
+static void teardown_sync_fault_slot(void)
+{
+	if (sync_fault_slot == NULL) {
+		return;
+	}
+	/* A child-only injected wait failure must not poison the parent's copy. */
+	sync_fault_slot->cancel_users = 0U;
+	ib_cancel_slot_complete(sync_fault_slot, sync_fault_generation);
+	ib_cancel_slot_free(sync_fault_slot);
+	sync_fault_slot = NULL;
+	sync_fault_generation = 0U;
+	sync_fault_statement = NULL;
+}
+
+static void child_republish_mutex_failure(void)
+{
+	char *error = NULL;
+
+	fail_next_native_mutex_lock = 1;
+	(void) ib_cancel_slot_republish_if_active(sync_fault_slot,
+		sync_fault_generation, &sync_fault_statement, &error);
+	ib_error_free(error);
+	_exit(EXIT_FAILURE);
+}
+
+static void child_republish_wait_failure(void)
+{
+	char *error = NULL;
+
+	sync_fault_slot->cancel_users = 1U;
+	fail_next_native_cond_wait = 1;
+	(void) ib_cancel_slot_republish_if_active(sync_fault_slot,
+		sync_fault_generation, &sync_fault_statement, &error);
+	ib_error_free(error);
+	_exit(EXIT_FAILURE);
+}
+
+static void child_unpublish_mutex_failure(void)
+{
+	char *error = NULL;
+
+	fail_next_native_mutex_lock = 1;
+	(void) ib_cancel_slot_unpublish(sync_fault_slot,
+		sync_fault_generation, &error);
+	ib_error_free(error);
+	_exit(EXIT_FAILURE);
+}
+
+static void child_unpublish_wait_failure(void)
+{
+	char *error = NULL;
+
+	sync_fault_slot->cancel_users = 1U;
+	fail_next_native_cond_wait = 1;
+	(void) ib_cancel_slot_unpublish(sync_fault_slot,
+		sync_fault_generation, &error);
+	ib_error_free(error);
+	_exit(EXIT_FAILURE);
 }
 
 static void check_cancel_publication(isc_stmt_handle *statement, int *seen,
@@ -557,6 +699,8 @@ static void reset_mocks(void)
 	describe_procedure_decimal = 0;
 	describe_procedure_source = 0;
 	complete_during_prepare = 0;
+	fail_next_native_mutex_lock = 0;
+	fail_next_native_cond_wait = 0;
 	user_execute2_calls = 0;
 	catalog_statement = NULL;
 	expected_cancel_slot = NULL;
@@ -3441,6 +3585,41 @@ static void test_cancel_overlap_transient_catalog_execute2(void)
 	free(connection);
 }
 
+static void test_slot_synchronization_failures_abort(void)
+{
+	reset_mocks();
+	setup_sync_fault_slot();
+	if (sync_fault_slot != NULL) {
+		require_sync_abort(child_republish_mutex_failure,
+			"republish mutex failure did not fail closed");
+	}
+	teardown_sync_fault_slot();
+
+	reset_mocks();
+	setup_sync_fault_slot();
+	if (sync_fault_slot != NULL) {
+		require_sync_abort(child_republish_wait_failure,
+			"republish wait failure did not fail closed");
+	}
+	teardown_sync_fault_slot();
+
+	reset_mocks();
+	setup_sync_fault_slot();
+	if (sync_fault_slot != NULL) {
+		require_sync_abort(child_unpublish_mutex_failure,
+			"unpublish mutex failure did not fail closed");
+	}
+	teardown_sync_fault_slot();
+
+	reset_mocks();
+	setup_sync_fault_slot();
+	if (sync_fault_slot != NULL) {
+		require_sync_abort(child_unpublish_wait_failure,
+			"unpublish wait failure did not fail closed");
+	}
+	teardown_sync_fault_slot();
+}
+
 int main(void)
 {
 	test_dialect_arguments_are_propagated();
@@ -3482,6 +3661,7 @@ int main(void)
 	test_cancel_distributed_participant_execute_and_recover();
 	test_cancel_overlap_transient_procedure_execute2();
 	test_cancel_overlap_transient_catalog_execute2();
+	test_slot_synchronization_failures_abort();
 	if (failures != 0) {
 		return EXIT_FAILURE;
 	}

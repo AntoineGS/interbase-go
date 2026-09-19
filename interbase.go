@@ -900,8 +900,9 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := conn.sanitizeError("query prepared statement", primaryErr)
 		cleanupErr = conn.sanitizeError("", cleanupErr)
-		operationErr = classifyNativeOutcome("execute prepared query", false,
-			contextCancellation(ctx), operationErr, cleanupErr, evidence)
+		operationErr = classifyNativeWriteOutcome("execute prepared query",
+			nativeQueryMutatingOf(err), contextCancellation(ctx), operationErr,
+			cleanupErr, native.writeOutcomeState(), evidence)
 		if conn.native == nil || conn.native.broken() {
 			conn.invalidateLocked(operationErr)
 		}
@@ -1089,9 +1090,11 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	}
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
-		operationErr := c.sanitizeError("prepare", err)
+		primaryErr, cleanupErr := splitNativeExecutionError(err)
+		operationErr := c.sanitizeError("prepare", primaryErr)
+		cleanupErr = c.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeOutcome("prepare", false,
-			contextCancellation(ctx), operationErr, nil, evidence)
+			contextCancellation(ctx), operationErr, cleanupErr, evidence)
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1271,8 +1274,9 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := c.sanitizeError("query", primaryErr)
 		cleanupErr = c.sanitizeError("", cleanupErr)
-		operationErr = classifyNativeOutcome("query", false,
-			contextCancellation(ctx), operationErr, cleanupErr, evidence)
+		operationErr = classifyNativeWriteOutcome("query", nativeQueryMutatingOf(err),
+			contextCancellation(ctx), operationErr, cleanupErr,
+			c.native.writeOutcomeState(), evidence)
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1447,9 +1451,12 @@ func (r *rows) Next(dest []driver.Value) error {
 	hasRow, err := r.native.next(r.ctx)
 	if err != nil {
 		releaseNative()
-		operationErr := r.conn.sanitizeError("fetch", err)
+		evidence := nativeCancellationEvidenceOf(err)
+		primaryErr, cleanupErr := splitNativeExecutionError(err)
+		operationErr := r.conn.sanitizeError("fetch", primaryErr)
+		cleanupErr = r.conn.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeOutcome("fetch row", false,
-			contextCancellation(r.ctx), operationErr, nil)
+			contextCancellation(r.ctx), operationErr, cleanupErr, evidence)
 		return errors.Join(operationErr, r.abortLocked(operationErr))
 	}
 	if !hasRow {

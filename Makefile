@@ -64,7 +64,7 @@ test-soak:
 	IMAGE="$(IMAGE)" INTERBASE_INCLUDE="$(INTERBASE_INCLUDE)" bash scripts/test-integration-docker.sh --soak --soak-duration="$(SOAK_DURATION)" --soak-workers="$(SOAK_WORKERS)" --soak-sample-interval="$(SOAK_SAMPLE_INTERVAL)" -run '^TestSoakConcurrentWorkload$$' -v
 
 test-cancellation:
-	IMAGE="$(IMAGE)" INTERBASE_INCLUDE="$(INTERBASE_INCLUDE)" bash scripts/test-integration-docker.sh --cancellation --cancellation-iterations="$(CANCELLATION_ITERATIONS)" -run '^TestLiveCancellationRaces$$' -v
+	IMAGE="$(IMAGE)" INTERBASE_INCLUDE="$(INTERBASE_INCLUDE)" bash scripts/test-integration-docker.sh --cancellation --cancellation-iterations="$(CANCELLATION_ITERATIONS)" -run '^Test(LiveCancellationRaces|CanceledFetchReturnsContextCancellation|CanceledRowLockWaitReturnsNativeCancellation|CanceledImplicitDMLRollsBackAndDoesNotReplay|CanceledExplicitWritePreservesTransactionOwnership|CanceledPartialProcedureIsAtomic|CanceledPartialProcedurePreservesExplicitTransaction|CanceledDistributedParticipantRemainsUsable)$$' -v
 
 test-native-lifecycle:
 	IMAGE="$(IMAGE)" INTERBASE_INCLUDE="$(INTERBASE_INCLUDE)" bash scripts/test-integration-docker.sh --native-lifecycle -run '^TestNativeLifecycleRace$$' -v
