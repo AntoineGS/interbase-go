@@ -475,6 +475,14 @@ func TestConnPlanReturnsPlanAndClosesTheStatementExactlyOnce(t *testing.T) {
 		return &nativeStatement{
 			planOverride:  func() (string, error) { return "PLAN (GO_COUNTRY NATURAL)", nil },
 			closeOverride: func() error { closeCalls++; return nil },
+			// The live suite is the real prepare-only proof, but it needs a
+			// server. This makes a regression fail fast in `make test`: if a
+			// later edit to (*conn).Plan ever reaches an execute path, this
+			// fires immediately instead of waiting for the Docker fixture.
+			execOverride: func([]argument) (int64, error) {
+				t.Fatal("(*conn).Plan executed the statement; it must only prepare")
+				return 0, nil
+			},
 		}, nil
 	}
 	connection := &conn{native: native}
@@ -1194,8 +1202,13 @@ func TestPooledDiagnosticsBrokenAttachmentLeavesThePool(t *testing.T) {
 		t.Fatalf("Diagnostics() = %#v, want %#v", got, want)
 	}
 
-	if connections := connector.mintedConnections(); len(connections) != 2 {
-		t.Fatalf("minted driver connections = %d, want 2", len(connections))
+	// Asserted as "at least two" rather than exactly two: database/sql mints
+	// spare connections only when connRequests is non-empty, which these
+	// sequential tests never produce, but a strict equality on pool internals
+	// is the kind of assertion that flakes rarely and costs an afternoon. The
+	// identity check and the infoCalls count below carry the actual proof.
+	if connections := connector.mintedConnections(); len(connections) < 2 {
+		t.Fatalf("minted driver connections = %d, want at least 2", len(connections))
 	} else if connections[0] == connections[1] {
 		t.Fatal("the replacement connection is the discarded one")
 	}
@@ -1274,8 +1287,10 @@ func TestPooledPlanBrokenAttachmentLeavesThePool(t *testing.T) {
 	if plan != "PLAN (GO_COUNTRY NATURAL)" {
 		t.Fatalf("Plan() = %q, want the native plan", plan)
 	}
-	if connections := connector.mintedConnections(); len(connections) != 2 {
-		t.Fatalf("minted driver connections = %d, want 2", len(connections))
+	// "At least two" for the same reason as the Diagnostics test above: the
+	// identity check and the prepares count are what prove eviction.
+	if connections := connector.mintedConnections(); len(connections) < 2 {
+		t.Fatalf("minted driver connections = %d, want at least 2", len(connections))
 	} else if connections[0] == connections[1] {
 		t.Fatal("the replacement connection is the discarded one")
 	}
@@ -1826,6 +1841,15 @@ Triage guidance if one fails:
 - `TestIntrospectionPlanInsideWritableTransaction` failing at step "pooled Plan() inside the writable transaction" with an unknown-table error means native prepare did **not** select the connection's active explicit transaction. That contradicts the spec's reading of `ib_statement_prepare_mode` (`native.c:7801`); stop and report it rather than weakening the test.
 - Any `assertTxProbeUnchanged` failure means `Plan` executed something. Stop and report it; that is the failure this whole sub-project exists to exclude.
 - A failure only on the `RDB$RELATIONS` lookup is a query-shape problem, not a safety problem: confirm the relation name comparison against the padded `CHAR` column on this server before changing anything else.
+- **Fixture setup failure — pre-authorized fallback.** This test seeds and then mutates `GO_INTROSPECTION_TXPROBE` inside the *same uncommitted* transaction as its `CREATE TABLE`, and creates a procedure referencing that table after DML has touched it. Nothing in this repo proves InterBase permits that, and the existing precedent hedges the other way: `createLifecycleTable` commits the `CREATE TABLE` before a fresh transaction runs the `INSERT` (`integration/lifecycle_test.go:106-124`). If `t.Fatalf("insert probe sentinel: ...")` or the `CREATE PROCEDURE` fails with a metadata or object-in-use error, that is a *fixture* limitation, not a finding about `Plan`.
+
+  Restructure as follows rather than weakening any assertion. Both properties survive intact, and neither the transaction-selection proof nor the safety proof is reduced:
+
+  1. Before `BeginTx`, create `GO_INTROSPECTION_PROBE` with the sentinel row and **commit** it, following the `createLifecycleTable` pattern. Run the UPDATE, DELETE, INSERT and `EXECUTE PROCEDURE` legs against this committed table from inside the writable transaction. The safety proof is unchanged: the transaction is writable and its read-back sees its own uncommitted work, so an execute would be both permitted and visible.
+  2. Inside the writable transaction, `CREATE TABLE GO_INTROSPECTION_TXMETA (ID INTEGER)` and leave it uncommitted, used *only* as the transaction-selection signal — `Plan` a `SELECT` against it and require a non-empty plan. Uncommitted metadata is invisible to any other transaction, so this still fails with unknown-table if `Plan` started its own.
+  3. Keep step 5 unchanged: `tx.Rollback()` must return nil, and both `GO_INTROSPECTION_TXMETA` and the mutations must be absent from the second pool.
+
+  Do **not** respond to a fixture failure by dropping the procedure leg, by moving the DML legs outside the writable transaction, or by relaxing the non-empty-plan requirement. Those are the three changes that would silently hollow out the proof.
 
 - [ ] **Step 5: Commit**
 
