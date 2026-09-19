@@ -71,6 +71,103 @@ type cancellationCleanupError struct {
 	Cleanup   error
 }
 
+// nativeWriteOutcomeState records what the native execution wrapper proved
+// after a mutating statement returned isc_cancelled.  A successful implicit
+// rollback and a still-live caller-owned transaction are both safe to report
+// as cancellation.  Every other state is deliberately conservative: the
+// caller must reconcile the write before retrying it.
+type nativeWriteOutcomeState uint8
+
+const (
+	nativeWriteOutcomeUnknown nativeWriteOutcomeState = iota
+	nativeWriteOutcomeRollbackConfirmed
+	nativeWriteOutcomeExplicitUsable
+)
+
+var errWriteOutcomeUnknown = errors.New("interbase: canceled write outcome could not be established")
+
+// nativeExecutionError keeps an execution failure separate from cleanup
+// diagnostics returned by the native wrapper.  The public classifier needs to
+// distinguish a failed implicit rollback from the authoritative DSQL result,
+// while the error tree must retain both diagnostics for callers.
+type nativeExecutionError struct {
+	primary error
+	cleanup error
+}
+
+func (e *nativeExecutionError) Error() string {
+	if e == nil || e.primary == nil {
+		return "interbase: native execution failed"
+	}
+	return e.primary.Error()
+}
+
+func (e *nativeExecutionError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	return joinErrorValues(e.primary, e.cleanup)
+}
+
+func splitNativeExecutionError(err error) (primary, cleanup error) {
+	if err == nil {
+		return nil, nil
+	}
+	var executionErr *nativeExecutionError
+	if !errors.As(err, &executionErr) || executionErr == nil {
+		return splitNativeCleanupDiagnostic(err)
+	}
+	return executionErr.primary, executionErr.cleanup
+}
+
+// splitNativeCleanupDiagnostic decodes the legacy C error representation used
+// by wrappers that predate nativeExecutionError.  The C bridge preserves both
+// messages as "primary; cleanup" in one status string; split it before Go
+// sanitization so the public uncertain error retains a distinct cleanup
+// NativeError without requiring a second borrowed C allocation.
+func splitNativeCleanupDiagnostic(err error) (primary, cleanup error) {
+	var nativeErr *NativeError
+	if err == nil || !errors.As(err, &nativeErr) || nativeErr == nil {
+		return err, nil
+	}
+	const separator = "; "
+	separatorIndex := strings.Index(nativeErr.Message, separator)
+	if separatorIndex < 0 {
+		return err, nil
+	}
+	cleanupMessage := strings.TrimSpace(nativeErr.Message[separatorIndex+len(separator):])
+	if !strings.Contains(cleanupMessage, " failed (SQLCODE ") {
+		return err, nil
+	}
+	primaryCopy := *nativeErr
+	primaryCopy.Message = nativeErr.Message[:separatorIndex]
+	return &primaryCopy, parseNativeError(cleanupMessage)
+}
+
+func wrapNativeExecutionError(primary, cleanup error) error {
+	if primary == nil {
+		return cleanup
+	}
+	if cleanup == nil {
+		return primary
+	}
+	return &nativeExecutionError{primary: primary, cleanup: cleanup}
+}
+
+// withRequestDiagnostics retains a failed cancellation request only when the
+// authoritative native operation itself failed.  A successful operation must
+// remain a success even if the best-effort cancellation call reported an
+// error, so callers invoke this helper on failure paths only.
+func (o *nativeCancelOperation) withRequestDiagnostics(err error) error {
+	if err == nil || o == nil {
+		return err
+	}
+	if requestErr := o.requestError(); requestErr != nil {
+		return errors.Join(err, requestErr)
+	}
+	return err
+}
+
 func (e *cancellationCleanupError) Error() string {
 	if e == nil {
 		return "interbase: canceled operation cleanup failed"
@@ -340,6 +437,17 @@ func contextCancellation(ctx context.Context) error {
 // canceled mutating operation uncertain.
 func classifyNativeOutcome(operation string, mutating bool, contextErr error,
 	nativeErr, cleanupErr error) error {
+	return classifyNativeWriteOutcome(operation, mutating, contextErr, nativeErr,
+		cleanupErr, nativeWriteOutcomeExplicitUsable)
+}
+
+// classifyNativeWriteOutcome applies the authoritative executing-result rule
+// and additionally requires a known post-cancellation state for mutating
+// operations.  Unknown state is an uncertainty even when the native wrapper
+// could not return a separate cleanup diagnostic (for example, after a broken
+// connection consumed the response).
+func classifyNativeWriteOutcome(operation string, mutating bool, contextErr error,
+	nativeErr, cleanupErr error, outcomeState nativeWriteOutcomeState) error {
 	if nativeErr == nil {
 		if cleanupErr != nil {
 			return cleanupErr
@@ -356,7 +464,10 @@ func classifyNativeOutcome(operation string, mutating bool, contextErr error,
 		Context:   contextErr,
 		Native:    nativeErr,
 	}
-	if mutating && cleanupErr != nil {
+	if mutating && (cleanupErr != nil || outcomeState == nativeWriteOutcomeUnknown) {
+		if cleanupErr == nil {
+			cleanupErr = errWriteOutcomeUnknown
+		}
 		return &UncertainOutcomeError{
 			Operation: operation,
 			Mutating:  true,

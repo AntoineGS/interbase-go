@@ -465,3 +465,65 @@ func TestClassifyNativeOutcomeKeepsExecutingResultAuthoritative(t *testing.T) {
 		})
 	}
 }
+
+func TestClassifyNativeWriteOutcomeRequiresKnownCleanup(t *testing.T) {
+	native := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+
+	tests := []struct {
+		name          string
+		state         nativeWriteOutcomeState
+		wantUncertain bool
+	}{
+		{
+			name:          "confirmed implicit rollback",
+			state:         nativeWriteOutcomeRollbackConfirmed,
+			wantUncertain: false,
+		},
+		{
+			name:          "usable explicit transaction",
+			state:         nativeWriteOutcomeExplicitUsable,
+			wantUncertain: false,
+		},
+		{
+			name:          "unknown cleanup state",
+			state:         nativeWriteOutcomeUnknown,
+			wantUncertain: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := classifyNativeWriteOutcome("execute statement", true,
+				context.Canceled, native, nil, test.state)
+			if !errors.Is(got, context.Canceled) {
+				t.Fatalf("classification = %v, want context.Canceled", got)
+			}
+			var uncertain *UncertainOutcomeError
+			if errors.As(got, &uncertain) != test.wantUncertain {
+				t.Fatalf("uncertain outcome = %v, want %v", uncertain != nil, test.wantUncertain)
+			}
+			if errors.Is(got, driver.ErrBadConn) {
+				t.Fatal("cancellation outcome must not be driver.ErrBadConn")
+			}
+		})
+	}
+}
+
+func TestNativeExecutionErrorPreservesPrimaryAndCleanupDiagnostics(t *testing.T) {
+	primary := &NativeError{Operation: "execute statement", NativeCode: nativeCancelledCode}
+	cleanup := &NativeError{Operation: "rollback transaction", NativeCode: 335545000}
+	original := &nativeExecutionError{primary: primary, cleanup: cleanup}
+
+	gotPrimary, gotCleanup := splitNativeExecutionError(original)
+	if !errors.Is(gotPrimary, primary) || !errors.Is(gotCleanup, cleanup) {
+		t.Fatalf("splitNativeExecutionError() = (%v, %v), want primary and cleanup diagnostics",
+			gotPrimary, gotCleanup)
+	}
+	if !errors.Is(original, primary) || !errors.Is(original, cleanup) {
+		t.Fatal("native execution error did not retain both diagnostics in its error tree")
+	}
+}

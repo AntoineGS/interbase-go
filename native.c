@@ -122,6 +122,7 @@ struct ib_connection {
 	int dialect;
 	int transaction_read_only;
 	int broken;
+	int write_outcome_state;
 	char *read_tpb;
 	size_t read_tpb_length;
 	char *write_tpb;
@@ -6183,15 +6184,28 @@ static void ib_failed_query_cleanup(ib_cursor *cursor, char **error)
 {
 	char *cleanup_error;
 	ib_connection *connection;
+	int owns_transaction;
+	int close_result;
 
 	if (cursor == NULL) {
 		return;
 	}
 	connection = cursor->connection;
+	owns_transaction = cursor->owns_transaction;
 	cleanup_error = NULL;
-	if (ib_cursor_close_internal(cursor, &cleanup_error, 0) != 0) {
+	close_result = ib_cursor_close_internal(cursor, &cleanup_error, 0);
+	if (close_result != 0) {
 		if (connection != NULL) {
 			ib_mark_broken(connection);
+		}
+	}
+	if (connection != NULL) {
+		if (close_result != 0 || connection->broken) {
+			connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
+		} else if (owns_transaction) {
+			connection->write_outcome_state = IB_WRITE_OUTCOME_ROLLBACK_CONFIRMED;
+		} else {
+			connection->write_outcome_state = IB_WRITE_OUTCOME_EXPLICIT_USABLE;
 		}
 	}
 	if (cleanup_error != NULL) {
@@ -6821,6 +6835,14 @@ int ib_connection_transaction_state(const ib_connection *connection)
 	return connection->transaction == NULL ? IB_HANDLE_CONSUMED : IB_HANDLE_LIVE;
 }
 
+int ib_connection_write_outcome_state(const ib_connection *connection)
+{
+	if (connection == NULL) {
+		return IB_WRITE_OUTCOME_UNKNOWN;
+	}
+	return connection->write_outcome_state;
+}
+
 int ib_connection_commit_retaining(ib_connection *connection, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
@@ -7356,6 +7378,7 @@ ib_cursor *ib_connection_query(ib_connection *connection, const char *query,
 		ib_fail(error, "connection is unavailable");
 		return NULL;
 	}
+	connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
 	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
 		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "query is empty or too long");
@@ -7552,6 +7575,7 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "connection is unavailable");
 	}
+	connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
 	if (query == NULL || query_length == 0U || query_length > (size_t) USHRT_MAX) {
 		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "query is empty or too long");
@@ -7934,6 +7958,7 @@ int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "prepared statement is unavailable");
 	}
+	statement->connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
 	if (bindings == NULL || bindings->count > (size_t) SHRT_MAX) {
 		ib_cancel_slot_complete(cancel, generation);
 		return ib_fail(error, "query arguments are invalid");
@@ -8054,6 +8079,14 @@ int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	return 0;
 }
 
+int ib_statement_write_outcome_state(const ib_statement *statement)
+{
+	if (statement == NULL || statement->connection == NULL) {
+		return IB_WRITE_OUTCOME_UNKNOWN;
+	}
+	return statement->connection->write_outcome_state;
+}
+
 ib_cursor *ib_statement_query(ib_statement *statement,
 	const ib_bindings *bindings, ib_cancel_slot *cancel, uint64_t generation,
 	char **error)
@@ -8069,6 +8102,7 @@ ib_cursor *ib_statement_query(ib_statement *statement,
 		ib_fail(error, "prepared statement is unavailable");
 		return NULL;
 	}
+	statement->connection->write_outcome_state = IB_WRITE_OUTCOME_UNKNOWN;
 	if (bindings == NULL || bindings->count > (size_t) SHRT_MAX) {
 		ib_cancel_slot_complete(cancel, generation);
 		ib_fail(error, "query arguments are invalid");
@@ -9372,6 +9406,14 @@ int ib_transaction_handle_state(const ib_transaction *transaction)
 	}
 	return transaction->view.transaction == NULL ?
 		IB_HANDLE_CONSUMED : IB_HANDLE_LIVE;
+}
+
+int ib_transaction_write_outcome_state(const ib_transaction *transaction)
+{
+	if (transaction == NULL) {
+		return IB_WRITE_OUTCOME_UNKNOWN;
+	}
+	return transaction->view.write_outcome_state;
 }
 
 int ib_transaction_commit_retaining(ib_transaction *transaction, char **error)

@@ -33,6 +33,17 @@ type nativeCancelResult struct {
 	nativeCode int64
 }
 
+func nativeWriteOutcomeStateFromC(value C.int) nativeWriteOutcomeState {
+	switch int(value) {
+	case int(C.IB_WRITE_OUTCOME_ROLLBACK_CONFIRMED):
+		return nativeWriteOutcomeRollbackConfirmed
+	case int(C.IB_WRITE_OUTCOME_EXPLICIT_USABLE):
+		return nativeWriteOutcomeExplicitUsable
+	default:
+		return nativeWriteOutcomeUnknown
+	}
+}
+
 type nativeCancelSlotBackend interface {
 	begin() (uint64, error)
 	cancel(generation uint64) (nativeCancelResult, error)
@@ -159,6 +170,7 @@ type nativeConnection struct {
 	execOverride              func(string, []argument, bool) (int64, error)
 	execContextOverride       func(string, []argument, bool, *nativeCancelOperation) (int64, error)
 	cancelSlotOverride        nativeCancelSlotBackend
+	writeOutcomeStateOverride func() nativeWriteOutcomeState
 	prepareOverride           func(string) (*nativeStatement, error)
 	databaseInfoOverride      func(byte) ([]byte, error)
 	clientVersionOverride     func() (string, error)
@@ -167,19 +179,20 @@ type nativeConnection struct {
 }
 
 type nativeTransaction struct {
-	ptr                     *C.ib_transaction
-	execOverride            func(string, []argument, bool) (int64, error)
-	execContextOverride     func(string, []argument, bool, *nativeCancelOperation) (int64, error)
-	cancelSlotOverride      nativeCancelSlotBackend
-	freeOverride            func()
-	commitOverride          func() error
-	rollbackOverride        func() error
-	rollbackCleanupOverride func() (error, nativeHandleState)
-	handleStateOverride     func() nativeHandleState
-	commitRetainOverride    func() error
-	rollbackRetainOverride  func() error
-	infoOverride            func(byte) ([]byte, error)
-	openBlobOverride        func(int32, uint32, int16, int16) (*blobStream, error)
+	ptr                       *C.ib_transaction
+	execOverride              func(string, []argument, bool) (int64, error)
+	execContextOverride       func(string, []argument, bool, *nativeCancelOperation) (int64, error)
+	cancelSlotOverride        nativeCancelSlotBackend
+	writeOutcomeStateOverride func() nativeWriteOutcomeState
+	freeOverride              func()
+	commitOverride            func() error
+	rollbackOverride          func() error
+	rollbackCleanupOverride   func() (error, nativeHandleState)
+	handleStateOverride       func() nativeHandleState
+	commitRetainOverride      func() error
+	rollbackRetainOverride    func() error
+	infoOverride              func(byte) ([]byte, error)
+	openBlobOverride          func(int32, uint32, int16, int16) (*blobStream, error)
 }
 
 type nativeDistributedTransaction struct {
@@ -445,6 +458,22 @@ func (t *nativeTransaction) handleState() nativeHandleState {
 	return nativeHandleState(C.ib_transaction_handle_state(t.ptr))
 }
 
+func (t *nativeTransaction) writeOutcomeState() nativeWriteOutcomeState {
+	if t == nil {
+		return nativeWriteOutcomeUnknown
+	}
+	if t.writeOutcomeStateOverride != nil {
+		return t.writeOutcomeStateOverride()
+	}
+	if t.ptr == nil {
+		if t.execOverride != nil || t.execContextOverride != nil {
+			return nativeWriteOutcomeExplicitUsable
+		}
+		return nativeWriteOutcomeUnknown
+	}
+	return nativeWriteOutcomeStateFromC(C.ib_transaction_write_outcome_state(t.ptr))
+}
+
 func (t *nativeTransaction) commitRetaining() error {
 	release := nativegate.Global.Enter()
 	defer release()
@@ -535,7 +564,9 @@ func (t *nativeTransaction) query(ctx context.Context, query string, args []argu
 		operation.nativeCancelGeneration(), &errorPointer)
 	operation.finish()
 	if cursor == nil {
-		return nil, nil, takeNativeError(errorPointer)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
+		return nil, nil, wrapNativeExecutionError(
+			operation.withRequestDiagnostics(primaryErr), cleanupErr)
 	}
 	return nativeCursorFromPointer(cursor, nil)
 }
@@ -568,7 +599,7 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 		affected, overrideErr := t.execContextOverride(query,
 			append([]argument(nil), args...), allowArrays, operation)
 		operation.finish()
-		return affected, overrideErr
+		return affected, operation.withRequestDiagnostics(overrideErr)
 	}
 	var affected C.int64_t
 	var errorPointer *C.char
@@ -576,7 +607,9 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 		bindings, &affected, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
 		operation.nativeCancelGeneration(), &errorPointer); result != 0 {
 		operation.finish()
-		return 0, takeNativeError(errorPointer)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
+		return 0, wrapNativeExecutionError(
+			operation.withRequestDiagnostics(primaryErr), cleanupErr)
 	}
 	operation.finish()
 	return int64(affected), nil
@@ -667,6 +700,19 @@ type nativeStatement struct {
 	queryOverride    func([]argument) (*nativeCursor, []string, error)
 	closeOverride    func() error
 	numInputOverride func() int
+}
+
+func (s *nativeStatement) writeOutcomeState() nativeWriteOutcomeState {
+	if s == nil {
+		return nativeWriteOutcomeUnknown
+	}
+	if s.ptr == nil {
+		if s.execOverride != nil || s.queryOverride != nil {
+			return nativeWriteOutcomeExplicitUsable
+		}
+		return nativeWriteOutcomeUnknown
+	}
+	return nativeWriteOutcomeStateFromC(C.ib_statement_write_outcome_state(s.ptr))
 }
 
 type nativeCursor struct {
@@ -1005,6 +1051,28 @@ func (c *nativeConnection) broken() bool {
 	return c == nil || c.ptr == nil || C.ib_connection_is_broken(c.ptr) != 0
 }
 
+func (c *nativeConnection) writeOutcomeState() nativeWriteOutcomeState {
+	if c == nil {
+		return nativeWriteOutcomeUnknown
+	}
+	if c.broken() {
+		return nativeWriteOutcomeUnknown
+	}
+	if c.writeOutcomeStateOverride != nil {
+		return c.writeOutcomeStateOverride()
+	}
+	if c.ptr == nil {
+		// Test-only execution overrides do not have a C-owned outcome record.
+		// Treat their live connection as usable so cancellation tests exercise
+		// classification without inventing a broken connection.
+		if c.execOverride != nil || c.execContextOverride != nil {
+			return nativeWriteOutcomeExplicitUsable
+		}
+		return nativeWriteOutcomeUnknown
+	}
+	return nativeWriteOutcomeStateFromC(C.ib_connection_write_outcome_state(c.ptr))
+}
+
 func newNativeBindings(args []argument) (*C.ib_bindings, error) {
 	var errorPointer *C.char
 	bindings := C.ib_bindings_new(C.size_t(len(args)), &errorPointer)
@@ -1060,7 +1128,9 @@ func (s *nativeStatement) exec(ctx context.Context, args []argument) (int64, err
 		operation.nativeCancelGeneration(), &affected, &errorPointer)
 	operation.finish()
 	if result != 0 {
-		return 0, takeNativeError(errorPointer)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
+		return 0, wrapNativeExecutionError(
+			operation.withRequestDiagnostics(primaryErr), cleanupErr)
 	}
 	return int64(affected), nil
 }
@@ -1092,7 +1162,9 @@ func (s *nativeStatement) query(ctx context.Context, args []argument) (*nativeCu
 		operation.nativeCancelGeneration(), &errorPointer)
 	operation.finish()
 	if cursor == nil {
-		return nil, nil, takeNativeError(errorPointer)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
+		return nil, nil, wrapNativeExecutionError(
+			operation.withRequestDiagnostics(primaryErr), cleanupErr)
 	}
 	nativeRows := &nativeCursor{
 		ptr:                 cursor,
@@ -1356,7 +1428,9 @@ func (c *nativeConnection) query(ctx context.Context, query string, args []argum
 		operation.nativeCancelGeneration(), &cursorError)
 	operation.finish()
 	if cursor == nil {
-		return nil, nil, takeNativeError(cursorError)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(cursorError))
+		return nil, nil, wrapNativeExecutionError(
+			operation.withRequestDiagnostics(primaryErr), cleanupErr)
 	}
 	nativeRows := &nativeCursor{
 		ptr:                 cursor,
@@ -1422,7 +1496,7 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 		affected, overrideErr := c.execContextOverride(query,
 			append([]argument(nil), args...), allowArrays, operation)
 		operation.finish()
-		return affected, overrideErr
+		return affected, operation.withRequestDiagnostics(overrideErr)
 	}
 	var affected C.int64_t
 	var execError *C.char
@@ -1430,7 +1504,9 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 		bindings, &affected, C.int(boolToInt(allowArrays)), operation.nativeCancelSlot(),
 		operation.nativeCancelGeneration(), &execError); result != 0 {
 		operation.finish()
-		return 0, takeNativeError(execError)
+		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(execError))
+		return 0, wrapNativeExecutionError(
+			operation.withRequestDiagnostics(primaryErr), cleanupErr)
 	}
 	operation.finish()
 	return int64(affected), nil

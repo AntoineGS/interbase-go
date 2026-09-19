@@ -44,6 +44,16 @@ enum ib_handle_state {
 	IB_HANDLE_CONSUMED = 2
 };
 
+/* Post-cancellation state for a mutating DSQL operation.  Unknown is
+ * intentionally conservative: callers must not replay a write unless the
+ * wrapper proved either a successful implicit rollback or a usable explicit
+ * transaction. */
+enum ib_write_outcome_state {
+	IB_WRITE_OUTCOME_UNKNOWN = 0,
+	IB_WRITE_OUTCOME_ROLLBACK_CONFIRMED = 1,
+	IB_WRITE_OUTCOME_EXPLICIT_USABLE = 2
+};
+
 enum ib_array_element_kind {
 	IB_ARRAY_ELEMENT_STRING = 1,
 	IB_ARRAY_ELEMENT_INT64 = 2,
@@ -165,6 +175,7 @@ int ib_connection_commit(ib_connection *connection, char **error);
 int ib_connection_rollback(ib_connection *connection, char **error);
 int ib_connection_rollback_cleanup(ib_connection *connection, char **error);
 int ib_connection_transaction_state(const ib_connection *connection);
+int ib_connection_write_outcome_state(const ib_connection *connection);
 int ib_connection_commit_retaining(ib_connection *connection, char **error);
 int ib_connection_rollback_retaining(ib_connection *connection, char **error);
 int ib_connection_database_info(ib_connection *connection, uint8_t item,
@@ -178,6 +189,7 @@ int ib_transaction_commit(ib_transaction *transaction, char **error);
 int ib_transaction_rollback(ib_transaction *transaction, char **error);
 int ib_transaction_rollback_cleanup(ib_transaction *transaction, char **error);
 int ib_transaction_handle_state(const ib_transaction *transaction);
+int ib_transaction_write_outcome_state(const ib_transaction *transaction);
 int ib_transaction_commit_retaining(ib_transaction *transaction, char **error);
 int ib_transaction_rollback_retaining(ib_transaction *transaction, char **error);
 int ib_transaction_info(ib_transaction *transaction, uint8_t item,
@@ -260,6 +272,7 @@ int ib_statement_num_input(const ib_statement *statement);
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,
 	char **error);
+int ib_statement_write_outcome_state(const ib_statement *statement);
 ib_cursor *ib_statement_query(ib_statement *statement,
 	const ib_bindings *bindings, ib_cancel_slot *cancel, uint64_t generation,
 	char **error);
