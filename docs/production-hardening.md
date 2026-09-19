@@ -16,8 +16,13 @@ even if cancellation arrives during that call; returning an error would make
 `database/sql` discard the result and could invite an unsafe retry. A successful
 cancellation request is not itself an operation result. An executing
 `isc_cancelled` result after context cancellation is reported as a typed
-cancellation error, while another native error remains the native operation
-error. DSQL cancellation is never converted to `driver.ErrBadConn`.
+cancellation error. If there is no proven overlapping cancellation, another
+native error remains the authoritative native operation error. If the watcher
+proves that cancellation overlapped an active DSQL call but the response is
+lost, the driver may instead report context cancellation or typed
+`UncertainOutcomeError` even when the native error is not `isc_cancelled`; the
+error tree retains the native execution and cleanup diagnostics. DSQL
+cancellation is never converted to `driver.ErrBadConn` or replayed.
 
 The supported DSQL entry points are `database/sql` `PrepareContext`, direct and
 prepared `ExecContext`, `QueryContext`/`QueryRowContext` and each `Rows.Next`,
@@ -95,47 +100,52 @@ Hardening entry points:
 
 ```sh
 # Real TCP response loss, blackhole, stale pool and owned-server restart tests.
-make test-faults IMAGE=private-interbase:local INTERBASE_INCLUDE=/path/to/sdk/include
+make test-faults IMAGE="$IMAGE" INTERBASE_INCLUDE=/path/to/sdk/include
 
 # Concurrent work, commit/rollback correctness, early rows.Close, physical churn.
-make test-soak IMAGE=private-interbase:local INTERBASE_INCLUDE=/path/to/sdk/include \
+make test-soak IMAGE="$IMAGE" INTERBASE_INCLUDE=/path/to/sdk/include \
   SOAK_DURATION=120s SOAK_WORKERS=4 SOAK_SAMPLE_INTERVAL=1s
 
 # Longer runs use the same workload; duration is not a claim of prior verification.
-make test-soak IMAGE=private-interbase:local INTERBASE_INCLUDE=/path/to/sdk/include \
+make test-soak IMAGE="$IMAGE" INTERBASE_INCLUDE=/path/to/sdk/include \
   SOAK_DURATION=2h SOAK_WORKERS=8 SOAK_SAMPLE_INTERVAL=10s
 
-make test-native-lifecycle IMAGE=private-interbase:local INTERBASE_INCLUDE=/path/to/sdk/include
+make test-native-lifecycle IMAGE="$IMAGE" INTERBASE_INCLUDE=/path/to/sdk/include
 make test-fuzz INTERBASE_INCLUDE=/path/to/sdk/include INTERBASE_LIB=/path/to/client/lib FUZZ_TIME=10s
 make bench INTERBASE_INCLUDE=/path/to/sdk/include INTERBASE_LIB=/path/to/client/lib
-make bench-live IMAGE=private-interbase:local INTERBASE_INCLUDE=/path/to/sdk/include BENCH_TIME=1s
+make bench-live IMAGE="$IMAGE" INTERBASE_INCLUDE=/path/to/sdk/include BENCH_TIME=1s
 ```
 
 For the complete DSQL-cancellation acceptance run used by this repository,
 execute the commands serially with the matching SDK and client library:
 
 ```sh
-LD_LIBRARY_PATH=/tmp/opencode make test INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include INTERBASE_LIB=/tmp/opencode
-LD_LIBRARY_PATH=/tmp/opencode \
-  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
-  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
-  go test -race ./... -count=1 -timeout=300s
-LD_LIBRARY_PATH=/tmp/opencode \
-  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
-  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
-  go test -gcflags=all=-d=checkptr=2 ./... -count=1 -timeout=180s
-LD_LIBRARY_PATH=/tmp/opencode \
-  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
-  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
-  go vet -tags=integration ./...
-make test-runner BATS=/tmp/opencode/parity-bats/bin/bats
-make test-cancellation IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include
-make test-faults IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include
-make test-native-lifecycle IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include
-make test-soak IMAGE=interbase-go-parity-test:local INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include SOAK_DURATION=120s
-make build INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include INTERBASE_LIB=/tmp/opencode
+# Set IMAGE to an existing local InterBase image and BATS to a bats executable.
+: "${IMAGE:?set IMAGE to an existing local InterBase image}"
+: "${BATS:?set BATS to a bats executable}"
+export IMAGE BATS
+export INTERBASE_INCLUDE=/path/to/sdk/include
+export INTERBASE_LIB=/path/to/client/lib
+export LD_LIBRARY_PATH="$INTERBASE_LIB"
+export CGO_CFLAGS="-I$INTERBASE_INCLUDE"
+export CGO_LDFLAGS="-L$INTERBASE_LIB -Wl,-rpath,$INTERBASE_LIB -lgds"
+
+make test INTERBASE_INCLUDE="$INTERBASE_INCLUDE" INTERBASE_LIB="$INTERBASE_LIB"
+go test -race ./... -count=1 -timeout=300s
+go test -gcflags=all=-d=checkptr=2 ./... -count=1 -timeout=180s
+go vet -tags=integration ./...
+make test-runner BATS="$BATS"
+make test-cancellation IMAGE="$IMAGE" INTERBASE_INCLUDE="$INTERBASE_INCLUDE"
+make test-faults IMAGE="$IMAGE" INTERBASE_INCLUDE="$INTERBASE_INCLUDE"
+make test-native-lifecycle IMAGE="$IMAGE" INTERBASE_INCLUDE="$INTERBASE_INCLUDE"
+make test-soak IMAGE="$IMAGE" INTERBASE_INCLUDE="$INTERBASE_INCLUDE" SOAK_DURATION=120s
+make build INTERBASE_INCLUDE="$INTERBASE_INCLUDE" INTERBASE_LIB="$INTERBASE_LIB"
 git diff --check
 ```
+
+The Go commands above inherit the exported SDK include, link, and runtime
+variables. If those variables are not exported, prefix each command with the
+corresponding `/path/to/sdk/include` and `/path/to/client/lib` values.
 
 The soak runner accepts positive integer durations in seconds, minutes or hours,
 up to 24 hours, and 1–64 workers. It allows setup/cleanup time beyond the selected
@@ -191,12 +201,11 @@ supervision and the documented uncertain-result/reconciliation rules in place.
 ### Final verification — September 18, 2026
 
 The complete Task 7 sequence ran serially with the Linux/amd64 InterBase 15.1
-client, SDK `/tmp/opencode/interbase-parity-include`, runtime `/tmp/opencode`,
-image `interbase-go-parity-test:local`, and Bats
-`/tmp/opencode/parity-bats/bin/bats`:
+client and a configured SDK, client runtime, local image, and Bats executable:
 
-- `make test` passed in 19.99 seconds with eight Go packages and ten native
-  ASan/leak harnesses. The temporary runtime path was supplied through
+- `make test` passed in 19.99 seconds with eight Go packages and eleven native
+  ASan/leak harnesses, including native cancellation. The configured runtime
+  path was supplied through
   `LD_LIBRARY_PATH`.
 - Go race passed in 28.90 seconds; checkptr passed in 3.38 seconds; tagged
   integration vet passed in 1.34 seconds. These Go commands used explicit
@@ -219,14 +228,15 @@ image `interbase-go-parity-test:local`, and Bats
   3.925199 ms, and maximum latency was 27.478933 ms. After close, both pools
   had zero open/in-use/idle connections; the process had six file descriptors
   and two goroutines. RSS was 32,370,688 bytes after close, recorded as a
-  measurement rather than a claim of native leak-freedom. The raw log is
-  `/tmp/opencode/dsql-context-task-7-20260918/09-test-soak-120s.log`.
+  measurement rather than a claim of native leak-freedom. The raw log was
+  retained only in the verification environment.
 - `make build` passed in 0.37 seconds. The final `git diff --check` is run
   after the documentation commit preparation.
 
 The first unqualified `make test`, race, and vet attempts failed before the
-tests because the temporary client library/include paths were not present in
-the process environment. They are retained as failures in the Task 7 report;
+complete check could pass because the client library/include paths were not
+present in the process environment. They are retained as failures in the Task
+7 report;
 the reruns above used the explicit paths documented in the command block and
 passed. No claim is made here for a multi-hour soak or for a universal native
 client latency/thread-safety guarantee.

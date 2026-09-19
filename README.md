@@ -25,7 +25,7 @@ make build
 make test
 ```
 
-`make build` creates `bin/ibprobe`. `make test` runs Go tests and ten native
+`make build` creates `bin/ibprobe`. `make test` runs Go tests and eleven native
 AddressSanitizer harnesses, including leak detection. Without the environment
 variables below, live Go tests explicitly skip. Native harnesses use synthetic
 descriptors/status vectors and injected lifecycle failures, and do not attach
@@ -34,14 +34,14 @@ to a database.
 For a non-default SDK layout, override the paths used by both Makefile targets:
 
 ```sh
-make test INTERBASE_INCLUDE=/path/to/include INTERBASE_LIB=/path/to/lib
+make test INTERBASE_INCLUDE=/path/to/sdk/include INTERBASE_LIB=/path/to/client/lib
 ```
 
 The disposable write/transaction/type contracts are separate from the read-only
-probe. Run them with an existing local server image:
+probe. Set `IMAGE` to an existing local server image, then run:
 
 ```sh
-IMAGE=your-local-interbase-image INTERBASE_INCLUDE=/path/to/include make test-integration-docker
+make test-integration-docker IMAGE="$IMAGE" INTERBASE_INCLUDE=/path/to/sdk/include
 ```
 
 See [integration/README.md](integration/README.md) for prerequisites, isolation,
@@ -443,9 +443,14 @@ do not run untrusted SQL. The supplied probe/tests never call them.
   after native entry. The executing result is authoritative: a successful
   prepare, execute, or fetch remains successful even if the context expires
   concurrently, while an executing `isc_cancelled` result is reported through
-  a typed cancellation error. A successful cancellation request by itself does
-  not establish the operation outcome. Each fetch watcher is joined before the
-  rows, cursor, or statement can be closed or reused.
+  a typed cancellation error. If there is no proven overlapping cancellation,
+  another native error remains authoritative. If cancellation is proven to have
+  overlapped an active DSQL call but the response is lost, context cancellation
+  or `UncertainOutcomeError` may be reported even without `isc_cancelled`; the
+  error tree retains the native execution and cleanup diagnostics. A successful
+  cancellation request by itself does not establish the operation outcome. Each
+  fetch watcher is joined before the rows, cursor, or statement can be closed or
+  reused.
 - Cancellation latency depends on the native client and operation. On the
   tested Linux/amd64 InterBase 15.1 `LI-V15.1.0.42` stack, a roughly
   3.2-second aggregate fetch returned `isc_cancelled` about 101 ms after the
@@ -516,8 +521,8 @@ Production-hardening commands and execution semantics are documented in
 requests are tracked in [docs/TODO.md](docs/TODO.md).
 
 On 2026-09-18, the complete serial DSQL-cancellation verification passed with
-the Linux/amd64 InterBase 15.1 client: `make test` (eight Go packages and ten
-native ASan/leak harnesses) took 19.99 seconds, race took 28.90 seconds,
+the Linux/amd64 InterBase 15.1 client: `make test` (eight Go packages and eleven
+native ASan/leak harnesses, including native cancellation) took 19.99 seconds,
 checkptr 3.38 seconds, tagged integration vet 1.34 seconds, and the runner
 reported **42/42** in 11.09 seconds. The cancellation target passed ten
 iterations in 12.88 seconds (16.68 seconds including Docker setup/cleanup),
@@ -528,11 +533,11 @@ writes, 61,143 persisted values, 30,573 physical opens/closes, and 30,572
 identity replacements. Throughput was 1,018.99 operations/s; average and
 maximum latencies were 3.925199 ms and 27.478933 ms. After close, both pools
 were empty, with six file descriptors and two goroutines. `make build` took
-0.37 seconds. The raw soak log is
-`/tmp/opencode/dsql-context-task-7-20260918/09-test-soak-120s.log`.
+0.37 seconds. The raw soak log was retained only in the verification
+environment.
 
 The initial unqualified `make test`, race, and vet invocations failed before
-testing because the temporary SDK include/runtime paths were not supplied;
+the complete check could pass because the SDK include/runtime paths were not supplied;
 reruns with the explicit paths in
 [production-hardening.md](docs/production-hardening.md) passed. These results
 measure a two-minute soak only and do not add a cross-version latency or
@@ -540,7 +545,7 @@ thread-safety guarantee.
 
 On 2026-09-16, a fresh controller run completed `make test` with the official
 SDK: all six Go packages and all ten native ASan/leak harnesses passed.
-`make test-runner BATS=/tmp/opencode/parity-bats/bin/bats` reported **21/21**
+The configured Bats runner reported **21/21**
 passing tests, `go vet -tags=integration ./...` passed, and the ordinary full
 Docker integration runner passed, including its Services framing precheck.
 The ordinary runner deliberately excludes the strict TLS matrix because its
@@ -553,9 +558,9 @@ The race command requires a runtime library path when cgo is linked to an
 explicit SDK directory. For the temporary SDK used in this verification:
 
 ```sh
-LD_LIBRARY_PATH=/tmp/opencode \
-  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
-  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/path/to/client/lib \
+  CGO_CFLAGS=-I/path/to/sdk/include \
+  CGO_LDFLAGS='-L/path/to/client/lib -Wl,-rpath,/path/to/client/lib -lgds' \
   go test -race ./... -count=1 -timeout=120s
 ```
 

@@ -179,8 +179,8 @@ status 1 alone is never evidence of successful provisioning or cleanup.
 > the ordinary full Docker integration pass.
 
 ```sh
-IMAGE=interbase-go-parity-test:local \
-  INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
+IMAGE="$IMAGE" \
+  INTERBASE_INCLUDE="$INTERBASE_INCLUDE" \
   bash scripts/test-tls-docker.sh
 ```
 
@@ -270,13 +270,13 @@ and terminal marker, and then validates the same frame with the Go decoder.
 
 ```sh
 # Use an image that is already present in the local Docker daemon.
-INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
-IMAGE='sha256:2787b636c0c39d3eeab23d9365d30292e45015704cbd9cdee42510d21a043f73' \
+INTERBASE_INCLUDE="$INTERBASE_INCLUDE" \
+IMAGE="$IMAGE" \
   make test-integration-docker
 
 # Run a focused contract selection; the runner still performs readiness checks.
-INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
-IMAGE='sha256:2787b636c0c39d3eeab23d9365d30292e45015704cbd9cdee42510d21a043f73' \
+INTERBASE_INCLUDE="$INTERBASE_INCLUDE" \
+IMAGE="$IMAGE" \
   ./scripts/test-integration-docker.sh -run '^TestReadFixtureSmoke$'
 ```
 
@@ -324,8 +324,8 @@ library resolved it; no host installation or driver source was changed:
 docker cp -L "$TEST_CONTAINER:/opt/interbase/lib/libgds.so" "$TEST_ROOT/libgds.so"
 docker cp -L "$TEST_CONTAINER:/opt/interbase/bin/isql" "$TEST_ROOT/isql"
 
-INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
-CGO_CFLAGS='-I/tmp/opencode/interbase-parity-include' \
+INTERBASE_INCLUDE="$INTERBASE_INCLUDE" \
+CGO_CFLAGS="-I$INTERBASE_INCLUDE" \
 CGO_LDFLAGS="-L$TEST_ROOT -Wl,-rpath,$TEST_ROOT" \
 go test -tags=integration -c ./integration -o "$TEST_ROOT/integration.test"
 docker cp "$TEST_ROOT/integration.test" "$TEST_CONTAINER:$TEST_ROOT/integration.test"
@@ -437,9 +437,10 @@ any failing contract makes the live test command fail.
 
 On 2026-09-18, the serial DSQL-cancellation verification passed with the
 temporary Linux/amd64 InterBase client and the requested local image. The Go
-and native checks passed as eight Go packages plus ten native ASan/leak
-harnesses (`make test`, 19.99s), race (28.90s), checkptr (3.38s), and tagged
-integration vet (1.34s). The Bats runner passed **42/42** (11.09s). The live
+and native checks passed as eight Go packages plus eleven native ASan/leak
+harnesses, including native cancellation (`make test`, 19.99s), race (28.90s),
+checkptr (3.38s), and tagged integration vet (1.34s). The Bats runner passed
+**42/42** (11.09s). The live
 DSQL cancellation target passed ten race iterations (12.88s test time; 16.68s
 including setup/cleanup), the owned fault matrix passed in 16.72s, and native
 lifecycle passed in 6.80s. The final four-worker soak ran for
@@ -460,7 +461,7 @@ latency or native-client thread-safety guarantee.
 
 On 2026-09-16, the fresh controller run passed `make test` with the official
 SDK (all six Go packages and all ten native ASan/leak harnesses),
-`make test-runner BATS=/tmp/opencode/parity-bats/bin/bats` (**21/21**), and
+the configured Bats runner (**21/21**), and
 `go vet -tags=integration ./...`. The ordinary full Docker runner also passed,
 including the Services framing precheck. Its runners cleaned up only the
 resources they owned; a persistent controller-owned
@@ -476,9 +477,9 @@ tests. The final TLS rerun still reported 12 passing checks and four
 wrong-hostname failures. Run the race checks with the matching SDK flags:
 
 ```sh
-LD_LIBRARY_PATH=/tmp/opencode \
-  CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
-  CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+LD_LIBRARY_PATH=/path/to/client/lib \
+  CGO_CFLAGS=-I/path/to/sdk/include \
+  CGO_LDFLAGS='-L/path/to/client/lib -Wl,-rpath,/path/to/client/lib -lgds' \
   go test -race ./... -count=1 -timeout=120s
 ```
 
