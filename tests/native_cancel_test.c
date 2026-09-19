@@ -216,6 +216,8 @@ struct cancel_call {
 	uint64_t generation;
 	int request_status;
 	int64_t native_code;
+	int attempted;
+	int overlapped;
 	char *error;
 };
 
@@ -223,8 +225,9 @@ static void *cancel_worker(void *argument)
 {
 	struct cancel_call *call = (struct cancel_call *) argument;
 
-	call->request_status = ib_cancel_slot_cancel(call->slot, call->generation,
-		&call->native_code, &call->error);
+	call->request_status = ib_cancel_slot_cancel_evidence(call->slot,
+		call->generation, &call->native_code, &call->attempted,
+		&call->overlapped, &call->error);
 	return NULL;
 }
 
@@ -514,6 +517,9 @@ static void test_waiting_cancel_completion_is_noop(void)
 		"completion-before-publication cancellation request failed");
 	require_condition(cancel_call_data.native_code == 0,
 		"completion-before-publication cancellation returned a native status");
+	require_condition(cancel_call_data.attempted == 1 &&
+		cancel_call_data.overlapped == 0,
+		"completion-before-publication cancellation evidence was incorrect");
 	require_condition(cancel_calls == 0,
 		"completion-before-publication cancellation called the native client");
 	ib_cancel_slot_free(slot);
@@ -550,6 +556,9 @@ static void test_free_waits_for_unpublished_cancel(void)
 		"free-lifetime cancellation request failed");
 	require_condition(cancel_call_data.native_code == 0,
 		"free-lifetime cancellation returned a native status");
+	require_condition(cancel_call_data.attempted == 1 &&
+		cancel_call_data.overlapped == 0,
+		"free-lifetime cancellation evidence was incorrect");
 	require_condition(cancel_calls == 0,
 		"free-lifetime cancellation called the native client");
 	require_condition(cancel_reference_release_order != 0U &&
@@ -658,6 +667,9 @@ static void test_cancel_failure_is_reported_separately(void)
 		"failed cancellation returned a request error message");
 	require_condition(cancel_call_data.native_code == 37,
 		"failed cancellation did not preserve native status");
+	require_condition(cancel_call_data.attempted == 1 &&
+		cancel_call_data.overlapped == 1,
+		"failed cancellation evidence did not record overlap");
 	require_condition(cancel_calls == 1, "failed cancellation was not attempted once");
 	complete_slot(slot, generation);
 	ib_cancel_slot_free(slot);

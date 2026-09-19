@@ -994,8 +994,8 @@ static void IB_MAYBE_UNUSED ib_cancel_slot_complete(ib_cancel_slot *slot,
 	}
 }
 
-int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
-	int64_t *native_code, char **error)
+int ib_cancel_slot_cancel_evidence(ib_cancel_slot *slot, uint64_t generation,
+	int64_t *native_code, int *attempted, int *overlapped, char **error)
 {
 	isc_stmt_handle statement;
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
@@ -1005,13 +1005,16 @@ int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
 	if (error != NULL) {
 		*error = NULL;
 	}
-	if (native_code == NULL) {
+	if (native_code == NULL || attempted == NULL || overlapped == NULL) {
 		return ib_fail(error, "cancellation native status output is unavailable");
 	}
 	*native_code = 0;
+	*attempted = 0;
+	*overlapped = 0;
 	if (slot == NULL) {
 		return ib_fail(error, "cancellation slot is unavailable");
 	}
+	*attempted = 1;
 	statement = NULL;
 	result = pthread_mutex_lock(&slot->mutex);
 	if (result != 0) {
@@ -1050,6 +1053,7 @@ int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
 			return ib_pthread_fail(error, "pthread_cond_wait", result);
 		}
 	}
+	*overlapped = 1;
 	result = pthread_mutex_unlock(&slot->mutex);
 	if (result != 0) {
 		abort();
@@ -1068,6 +1072,16 @@ int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
 	ib_cancel_slot_unlock_or_abort(slot);
 	*native_code = (int64_t) result_status;
 	return 0;
+}
+
+int ib_cancel_slot_cancel(ib_cancel_slot *slot, uint64_t generation,
+	int64_t *native_code, char **error)
+{
+	int attempted;
+	int overlapped;
+
+	return ib_cancel_slot_cancel_evidence(slot, generation, native_code,
+		&attempted, &overlapped, error);
 }
 
 void ib_cancel_slot_free(ib_cancel_slot *slot)

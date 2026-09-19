@@ -26,15 +26,22 @@ import (
 // not require a second cgo translation unit or expose a raw SDK constant.
 const nativeCancelledCode int64 = 335544794
 
-// nativeCancelResult keeps the request status separate from the executing
-// operation's result. A non-zero nativeCode is cancellation-call diagnostics;
-// it never establishes the outcome of the operation being canceled.
+// nativeCancelResult keeps cancellation-call diagnostics and overlap evidence
+// separate from the executing operation's result. A non-zero nativeCode is
+// cancellation-call diagnostics; it never establishes the outcome of the
+// operation being canceled.
 type nativeCancelResult struct {
 	nativeCode int64
+	attempted  bool
+	overlapped bool
 }
 
 func nativeWriteOutcomeStateFromC(value C.int) nativeWriteOutcomeState {
-	switch int(value) {
+	return nativeWriteOutcomeStateFromValue(int(value))
+}
+
+func nativeWriteOutcomeStateFromValue(value int) nativeWriteOutcomeState {
+	switch value {
 	case int(C.IB_WRITE_OUTCOME_ROLLBACK_CONFIRMED):
 		return nativeWriteOutcomeRollbackConfirmed
 	case int(C.IB_WRITE_OUTCOME_EXPLICIT_USABLE):
@@ -53,6 +60,8 @@ type nativeCancelSlotBackend interface {
 type cNativeCancelSlot struct {
 	ptr *C.ib_cancel_slot
 }
+
+var nativeCancelSlotFactory = newNativeCancelSlot
 
 func newNativeCancelSlot() (nativeCancelSlotBackend, error) {
 	var errorPointer *C.char
@@ -80,12 +89,22 @@ func (s *cNativeCancelSlot) cancel(generation uint64) (nativeCancelResult, error
 		return nativeCancelResult{}, errors.New("interbase: native cancellation slot is unavailable")
 	}
 	var nativeCode C.int64_t
+	var attempted C.int
+	var overlapped C.int
 	var errorPointer *C.char
-	if result := C.ib_cancel_slot_cancel(s.ptr, C.uint64_t(generation), &nativeCode,
-		&errorPointer); result != 0 {
-		return nativeCancelResult{}, takeNativeError(errorPointer)
+	if result := C.ib_cancel_slot_cancel_evidence(s.ptr, C.uint64_t(generation), &nativeCode,
+		&attempted, &overlapped, &errorPointer); result != 0 {
+		return nativeCancelResult{
+			nativeCode: int64(nativeCode),
+			attempted:  attempted != 0,
+			overlapped: overlapped != 0,
+		}, takeNativeError(errorPointer)
 	}
-	return nativeCancelResult{nativeCode: int64(nativeCode)}, nil
+	return nativeCancelResult{
+		nativeCode: int64(nativeCode),
+		attempted:  attempted != 0,
+		overlapped: overlapped != 0,
+	}, nil
 }
 
 func (s *cNativeCancelSlot) close() {
@@ -565,8 +584,7 @@ func (t *nativeTransaction) query(ctx context.Context, query string, args []argu
 	operation.finish()
 	if cursor == nil {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
-		return nil, nil, wrapNativeExecutionError(
-			operation.withRequestDiagnostics(primaryErr), cleanupErr)
+		return nil, nil, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	return nativeCursorFromPointer(cursor, nil)
 }
@@ -599,7 +617,7 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 		affected, overrideErr := t.execContextOverride(query,
 			append([]argument(nil), args...), allowArrays, operation)
 		operation.finish()
-		return affected, operation.withRequestDiagnostics(overrideErr)
+		return affected, operation.wrapExecutionError(overrideErr, nil)
 	}
 	var affected C.int64_t
 	var errorPointer *C.char
@@ -608,8 +626,7 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 		operation.nativeCancelGeneration(), &errorPointer); result != 0 {
 		operation.finish()
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
-		return 0, wrapNativeExecutionError(
-			operation.withRequestDiagnostics(primaryErr), cleanupErr)
+		return 0, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	operation.finish()
 	return int64(affected), nil
@@ -1129,8 +1146,7 @@ func (s *nativeStatement) exec(ctx context.Context, args []argument) (int64, err
 	operation.finish()
 	if result != 0 {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
-		return 0, wrapNativeExecutionError(
-			operation.withRequestDiagnostics(primaryErr), cleanupErr)
+		return 0, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	return int64(affected), nil
 }
@@ -1163,8 +1179,7 @@ func (s *nativeStatement) query(ctx context.Context, args []argument) (*nativeCu
 	operation.finish()
 	if cursor == nil {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
-		return nil, nil, wrapNativeExecutionError(
-			operation.withRequestDiagnostics(primaryErr), cleanupErr)
+		return nil, nil, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	nativeRows := &nativeCursor{
 		ptr:                 cursor,
@@ -1429,8 +1444,7 @@ func (c *nativeConnection) query(ctx context.Context, query string, args []argum
 	operation.finish()
 	if cursor == nil {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(cursorError))
-		return nil, nil, wrapNativeExecutionError(
-			operation.withRequestDiagnostics(primaryErr), cleanupErr)
+		return nil, nil, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	nativeRows := &nativeCursor{
 		ptr:                 cursor,
@@ -1496,7 +1510,7 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 		affected, overrideErr := c.execContextOverride(query,
 			append([]argument(nil), args...), allowArrays, operation)
 		operation.finish()
-		return affected, operation.withRequestDiagnostics(overrideErr)
+		return affected, operation.wrapExecutionError(overrideErr, nil)
 	}
 	var affected C.int64_t
 	var execError *C.char
@@ -1505,8 +1519,7 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 		operation.nativeCancelGeneration(), &execError); result != 0 {
 		operation.finish()
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(execError))
-		return 0, wrapNativeExecutionError(
-			operation.withRequestDiagnostics(primaryErr), cleanupErr)
+		return 0, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
 	operation.finish()
 	return int64(affected), nil

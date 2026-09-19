@@ -840,11 +840,12 @@ func (s *stmt) ExecContext(ctx context.Context, values []driver.NamedValue) (dri
 	affected, err := native.exec(ctx, args)
 	releaseNative()
 	if err != nil {
+		evidence := nativeCancellationEvidenceOf(err)
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := conn.sanitizeError("exec prepared statement", primaryErr)
 		cleanupErr = conn.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeWriteOutcome("execute prepared statement", true,
-			contextCancellation(ctx), operationErr, cleanupErr, native.writeOutcomeState())
+			contextCancellation(ctx), operationErr, cleanupErr, native.writeOutcomeState(), evidence)
 		if conn.native == nil || conn.native.broken() {
 			conn.invalidateLocked(operationErr)
 		}
@@ -895,11 +896,12 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 	nativeRows, columns, err := native.query(ctx, args)
 	releaseNative()
 	if err != nil {
+		evidence := nativeCancellationEvidenceOf(err)
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := conn.sanitizeError("query prepared statement", primaryErr)
 		cleanupErr = conn.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeOutcome("execute prepared query", false,
-			contextCancellation(ctx), operationErr, cleanupErr)
+			contextCancellation(ctx), operationErr, cleanupErr, evidence)
 		if conn.native == nil || conn.native.broken() {
 			conn.invalidateLocked(operationErr)
 		}
@@ -1086,9 +1088,10 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 		releaseNative()
 	}
 	if err != nil {
+		evidence := nativeCancellationEvidenceOf(err)
 		operationErr := c.sanitizeError("prepare", err)
 		operationErr = classifyNativeOutcome("prepare", false,
-			contextCancellation(ctx), operationErr, nil)
+			contextCancellation(ctx), operationErr, nil, evidence)
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1209,11 +1212,12 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 	affected, err := c.native.exec(ctx, query, args, false)
 	releaseNative()
 	if err != nil {
+		evidence := nativeCancellationEvidenceOf(err)
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := c.sanitizeError("exec", primaryErr)
 		cleanupErr = c.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeWriteOutcome("execute", true,
-			contextCancellation(ctx), operationErr, cleanupErr, c.native.writeOutcomeState())
+			contextCancellation(ctx), operationErr, cleanupErr, c.native.writeOutcomeState(), evidence)
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1263,9 +1267,12 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	nativeRows, columns, err := c.native.query(ctx, query, args, false)
 	releaseNative()
 	if err != nil {
-		operationErr := c.sanitizeError("query", err)
+		evidence := nativeCancellationEvidenceOf(err)
+		primaryErr, cleanupErr := splitNativeExecutionError(err)
+		operationErr := c.sanitizeError("query", primaryErr)
+		cleanupErr = c.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeOutcome("query", false,
-			contextCancellation(ctx), operationErr, nil)
+			contextCancellation(ctx), operationErr, cleanupErr, evidence)
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}

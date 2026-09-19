@@ -792,11 +792,12 @@ func (t *Transaction) Query(ctx context.Context, query string, args ...any) (*Cu
 	nativeCursor, columns, err := t.native.query(ctx, query, converted, true)
 	releaseNative()
 	if err != nil {
+		evidence := nativeCancellationEvidenceOf(err)
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := a.conn.sanitizeError("direct query", primaryErr)
 		cleanupErr = a.conn.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeOutcome("direct query", false,
-			contextCancellation(ctx), operationErr, cleanupErr)
+			contextCancellation(ctx), operationErr, cleanupErr, evidence)
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}
@@ -854,11 +855,12 @@ func (t *Transaction) Exec(ctx context.Context, query string, args ...any) (int6
 	affected, err := t.native.exec(ctx, query, converted, true)
 	releaseNative()
 	if err != nil {
+		evidence := nativeCancellationEvidenceOf(err)
 		primaryErr, cleanupErr := splitNativeExecutionError(err)
 		operationErr := a.conn.sanitizeError("direct exec", primaryErr)
 		cleanupErr = a.conn.sanitizeError("", cleanupErr)
 		operationErr = classifyNativeWriteOutcome("direct exec", true,
-			contextCancellation(ctx), operationErr, cleanupErr, t.native.writeOutcomeState())
+			contextCancellation(ctx), operationErr, cleanupErr, t.native.writeOutcomeState(), evidence)
 		if a.conn.native.broken() {
 			t.invalidateLocked(operationErr)
 		}

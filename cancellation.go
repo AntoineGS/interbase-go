@@ -86,13 +86,27 @@ const (
 
 var errWriteOutcomeUnknown = errors.New("interbase: canceled write outcome could not be established")
 
+// nativeCancellationEvidence records what the cancellation backend observed,
+// independently of the executing call's result.  attempted is true when the
+// watcher entered the cancellation backend; overlapped is true only when the
+// backend observed a published, still-active native statement and invoked the
+// native cancellation operation against it.
+type nativeCancellationEvidence struct {
+	known             bool
+	attempted         bool
+	overlapped        bool
+	executingCanceled bool
+}
+
 // nativeExecutionError keeps an execution failure separate from cleanup
 // diagnostics returned by the native wrapper.  The public classifier needs to
 // distinguish a failed implicit rollback from the authoritative DSQL result,
 // while the error tree must retain both diagnostics for callers.
 type nativeExecutionError struct {
-	primary error
-	cleanup error
+	primary      error
+	cleanup      error
+	request      error
+	cancellation nativeCancellationEvidence
 }
 
 func (e *nativeExecutionError) Error() string {
@@ -106,7 +120,7 @@ func (e *nativeExecutionError) Unwrap() []error {
 	if e == nil {
 		return nil
 	}
-	return joinErrorValues(e.primary, e.cleanup)
+	return joinErrorValues(e.primary, e.cleanup, e.request)
 }
 
 func splitNativeExecutionError(err error) (primary, cleanup error) {
@@ -117,7 +131,20 @@ func splitNativeExecutionError(err error) (primary, cleanup error) {
 	if !errors.As(err, &executionErr) || executionErr == nil {
 		return splitNativeCleanupDiagnostic(err)
 	}
-	return executionErr.primary, executionErr.cleanup
+	return joinPrimaryCleanup(executionErr.primary, executionErr.request), executionErr.cleanup
+}
+
+func nativeCancellationEvidenceOf(err error) nativeCancellationEvidence {
+	if err == nil {
+		return nativeCancellationEvidence{}
+	}
+	var executionErr *nativeExecutionError
+	if !errors.As(err, &executionErr) || executionErr == nil {
+		return nativeCancellationEvidence{}
+	}
+	evidence := executionErr.cancellation
+	evidence.known = true
+	return evidence
 }
 
 // splitNativeCleanupDiagnostic decodes the legacy C error representation used
@@ -144,28 +171,40 @@ func splitNativeCleanupDiagnostic(err error) (primary, cleanup error) {
 	return &primaryCopy, parseNativeError(cleanupMessage)
 }
 
-func wrapNativeExecutionError(primary, cleanup error) error {
-	if primary == nil {
-		return cleanup
+func wrapNativeExecutionErrorWithMetadata(primary, cleanup, request error,
+	evidence nativeCancellationEvidence) error {
+	if primary == nil && cleanup == nil && request == nil {
+		return nil
 	}
-	if cleanup == nil {
+	if primary == nil {
+		if cleanup != nil && request == nil && !evidence.known &&
+			!evidence.attempted && !evidence.overlapped && !evidence.executingCanceled {
+			return cleanup
+		}
+	}
+	if cleanup == nil && request == nil && !evidence.known &&
+		!evidence.attempted && !evidence.overlapped && !evidence.executingCanceled {
 		return primary
 	}
-	return &nativeExecutionError{primary: primary, cleanup: cleanup}
+	evidence.known = true
+	evidence.executingCanceled = isNativeCancellation(primary)
+	return &nativeExecutionError{
+		primary:      primary,
+		cleanup:      cleanup,
+		request:      request,
+		cancellation: evidence,
+	}
 }
 
-// withRequestDiagnostics retains a failed cancellation request only when the
-// authoritative native operation itself failed.  A successful operation must
-// remain a success even if the best-effort cancellation call reported an
-// error, so callers invoke this helper on failure paths only.
-func (o *nativeCancelOperation) withRequestDiagnostics(err error) error {
-	if err == nil || o == nil {
-		return err
+func (o *nativeCancelOperation) wrapExecutionError(primary, cleanup error) error {
+	var nested *nativeExecutionError
+	if errors.As(primary, &nested) && nested != nil {
+		var nestedCleanup error
+		primary, nestedCleanup = splitNativeExecutionError(primary)
+		cleanup = joinPrimaryCleanup(nestedCleanup, cleanup)
 	}
-	if requestErr := o.requestError(); requestErr != nil {
-		return errors.Join(err, requestErr)
-	}
-	return err
+	return wrapNativeExecutionErrorWithMetadata(primary, cleanup,
+		o.requestError(), o.cancellationEvidence())
 }
 
 func (e *cancellationCleanupError) Error() string {
@@ -203,10 +242,12 @@ type nativeCancelOperation struct {
 	finished atomic.Bool
 	closed   atomic.Bool
 
-	diagnosticsMu sync.Mutex
-	contextErr    error
-	requestErr    error
-	nativeCode    int64
+	diagnosticsMu     sync.Mutex
+	contextErr        error
+	requestErr        error
+	nativeCode        int64
+	requestAttempted  bool
+	requestOverlapped bool
 }
 
 // beginNativeCancelOperation allocates a slot, starts its generation, and
@@ -248,7 +289,7 @@ func (o *nativeCancelOperation) begin(ctx context.Context) error {
 	slot := o.slot
 	if slot == nil {
 		var err error
-		slot, err = newNativeCancelSlot()
+		slot, err = nativeCancelSlotFactory()
 		if err != nil {
 			o.started.Store(false)
 			return err
@@ -303,6 +344,8 @@ func (o *nativeCancelOperation) watch() {
 	o.contextErr = contextErr
 	o.requestErr = requestErr
 	o.nativeCode = result.nativeCode
+	o.requestAttempted = result.attempted
+	o.requestOverlapped = result.overlapped
 	if requestErr == nil && result.nativeCode != 0 {
 		o.requestErr = &NativeError{
 			Operation:  "cancel statement",
@@ -365,6 +408,19 @@ func (o *nativeCancelOperation) requestNativeCode() int64 {
 	o.diagnosticsMu.Lock()
 	defer o.diagnosticsMu.Unlock()
 	return o.nativeCode
+}
+
+func (o *nativeCancelOperation) cancellationEvidence() nativeCancellationEvidence {
+	if o == nil {
+		return nativeCancellationEvidence{}
+	}
+	o.diagnosticsMu.Lock()
+	defer o.diagnosticsMu.Unlock()
+	return nativeCancellationEvidence{
+		known:      true,
+		attempted:  o.requestAttempted,
+		overlapped: o.requestOverlapped,
+	}
 }
 
 func (o *nativeCancelOperation) cancellationContext() error {
@@ -436,9 +492,9 @@ func contextCancellation(ctx context.Context) error {
 // diagnostic only for a successful operation, but a failed cleanup makes a
 // canceled mutating operation uncertain.
 func classifyNativeOutcome(operation string, mutating bool, contextErr error,
-	nativeErr, cleanupErr error) error {
+	nativeErr, cleanupErr error, evidence ...nativeCancellationEvidence) error {
 	return classifyNativeWriteOutcome(operation, mutating, contextErr, nativeErr,
-		cleanupErr, nativeWriteOutcomeExplicitUsable)
+		cleanupErr, nativeWriteOutcomeExplicitUsable, evidence...)
 }
 
 // classifyNativeWriteOutcome applies the authoritative executing-result rule
@@ -447,14 +503,24 @@ func classifyNativeOutcome(operation string, mutating bool, contextErr error,
 // could not return a separate cleanup diagnostic (for example, after a broken
 // connection consumed the response).
 func classifyNativeWriteOutcome(operation string, mutating bool, contextErr error,
-	nativeErr, cleanupErr error, outcomeState nativeWriteOutcomeState) error {
+	nativeErr, cleanupErr error, outcomeState nativeWriteOutcomeState,
+	evidence ...nativeCancellationEvidence) error {
 	if nativeErr == nil {
 		if cleanupErr != nil {
 			return cleanupErr
 		}
 		return nil
 	}
-	if !isNativeCancellation(nativeErr) || contextErr == nil {
+	cancellationEvidence := nativeCancellationEvidence{}
+	if len(evidence) != 0 {
+		cancellationEvidence = evidence[0]
+	}
+	executingCanceled := isNativeCancellation(nativeErr)
+	if cancellationEvidence.known {
+		executingCanceled = cancellationEvidence.executingCanceled
+	}
+	overlappedCancellation := cancellationEvidence.attempted && cancellationEvidence.overlapped
+	if (!executingCanceled && !overlappedCancellation) || contextErr == nil {
 		return joinPrimaryCleanup(nativeErr, cleanupErr)
 	}
 

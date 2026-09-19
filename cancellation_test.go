@@ -27,6 +27,8 @@ type fakeCancelSlot struct {
 	cancelRelease     <-chan struct{}
 	cancelErr         error
 	nativeCode        int64
+	cancelAttempted   bool
+	cancelOverlapped  bool
 	closeCalls        int
 	closeBeforeWatch  bool
 	watcherDone       <-chan struct{}
@@ -61,7 +63,11 @@ func (s *fakeCancelSlot) cancel(generation uint64) (nativeCancelResult, error) {
 	if release != nil {
 		<-release
 	}
-	return nativeCancelResult{nativeCode: nativeCode}, cancelErr
+	return nativeCancelResult{
+		nativeCode: nativeCode,
+		attempted:  s.cancelAttempted,
+		overlapped: s.cancelOverlapped,
+	}, cancelErr
 }
 
 func (s *fakeCancelSlot) close() {
@@ -513,6 +519,26 @@ func TestClassifyNativeWriteOutcomeRequiresKnownCleanup(t *testing.T) {
 	}
 }
 
+func TestNativeWriteOutcomeStateParsingIsConservative(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		value int
+		want  nativeWriteOutcomeState
+	}{
+		{name: "unknown", value: 0, want: nativeWriteOutcomeUnknown},
+		{name: "rollback confirmed", value: 1, want: nativeWriteOutcomeRollbackConfirmed},
+		{name: "explicit usable", value: 2, want: nativeWriteOutcomeExplicitUsable},
+		{name: "unrecognized", value: 99, want: nativeWriteOutcomeUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := nativeWriteOutcomeStateFromValue(test.value); got != test.want {
+				t.Fatalf("nativeWriteOutcomeStateFromValue(%d) = %d, want %d",
+					test.value, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNativeExecutionErrorPreservesPrimaryAndCleanupDiagnostics(t *testing.T) {
 	primary := &NativeError{Operation: "execute statement", NativeCode: nativeCancelledCode}
 	cleanup := &NativeError{Operation: "rollback transaction", NativeCode: 335545000}
@@ -525,5 +551,401 @@ func TestNativeExecutionErrorPreservesPrimaryAndCleanupDiagnostics(t *testing.T)
 	}
 	if !errors.Is(original, primary) || !errors.Is(original, cleanup) {
 		t.Fatal("native execution error did not retain both diagnostics in its error tree")
+	}
+}
+
+func TestClassifyNativeWriteOutcomeUsesOverlappingCancellationForLostResponse(t *testing.T) {
+	const primarySecret = "transport /private/db.ib password=primary"
+	const cleanupSecret = "rollback /private/db.ib password=cleanup"
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: 335544366,
+		Message:    primarySecret,
+	}
+	cleanup := &NativeError{
+		Operation:  "rollback transaction",
+		NativeCode: 335545000,
+		Message:    cleanupSecret,
+	}
+
+	got := classifyNativeWriteOutcome("execute statement", true,
+		context.Canceled, primary, cleanup, nativeWriteOutcomeUnknown,
+		nativeCancellationEvidence{attempted: true, overlapped: true})
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("classification = %v, want context.Canceled", got)
+	}
+	var uncertain *UncertainOutcomeError
+	if !errors.As(got, &uncertain) {
+		t.Fatalf("classification = %v, want UncertainOutcomeError", got)
+	}
+	var cancellation *CancellationError
+	if !errors.As(got, &cancellation) {
+		t.Fatalf("classification = %v, want CancellationError cause", got)
+	}
+	if !errors.Is(got, primary) || !errors.Is(got, cleanup) {
+		t.Fatalf("classification lost primary or cleanup diagnostics: %v", got)
+	}
+	if errors.Is(got, driver.ErrBadConn) {
+		t.Fatal("uncertain cancellation must not match driver.ErrBadConn")
+	}
+	confirmed := classifyNativeWriteOutcome("execute statement", true,
+		context.Canceled, primary, nil, nativeWriteOutcomeRollbackConfirmed,
+		nativeCancellationEvidence{attempted: true, overlapped: true})
+	var confirmedUncertain *UncertainOutcomeError
+	if errors.As(confirmed, &confirmedUncertain) {
+		t.Fatalf("confirmed rollback outcome became uncertain: %v", confirmed)
+	}
+	var confirmedCancellation *CancellationError
+	if !errors.As(confirmed, &confirmedCancellation) ||
+		!errors.Is(confirmed, context.Canceled) {
+		t.Fatalf("confirmed rollback outcome = %v, want CancellationError matching context", confirmed)
+	}
+}
+
+func TestClassifyNativeWriteOutcomeDoesNotInferCancellationFromExpiredContext(t *testing.T) {
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: 335544366,
+		Message:    "ordinary native failure",
+	}
+
+	got := classifyNativeWriteOutcome("execute statement", true,
+		context.DeadlineExceeded, primary, nil, nativeWriteOutcomeUnknown,
+		nativeCancellationEvidence{})
+	if !errors.Is(got, primary) {
+		t.Fatalf("classification = %v, lost ordinary native error", got)
+	}
+	if errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("ordinary native failure was relabeled as deadline cancellation: %v", got)
+	}
+	var uncertain *UncertainOutcomeError
+	if errors.As(got, &uncertain) {
+		t.Fatalf("ordinary native failure became uncertain without cancellation evidence: %v", got)
+	}
+}
+
+func TestExecContextOverlappingLostResponsePreservesFaultTreeAndRedacts(t *testing.T) {
+	const secret = "password=primary-secret attachment=/private/primary.ib"
+	const cleanupSecret = "password=cleanup-secret attachment=/private/cleanup.ib"
+	const requestSecret = "password=request-secret attachment=/private/request.ib"
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: 335544366,
+		Message:    secret,
+	}
+	cleanup := &NativeError{
+		Operation:  "rollback transaction",
+		NativeCode: 335545000,
+		Message:    cleanupSecret,
+	}
+	requestErr := &NativeError{
+		Operation:  "cancel statement",
+		NativeCode: 335545001,
+		Message:    requestSecret,
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	slot := &fakeCancelSlot{
+		cancelStarted:    make(chan struct{}),
+		cancelErr:        requestErr,
+		cancelAttempted:  true,
+		cancelOverlapped: true,
+	}
+	native := &nativeConnection{
+		brokenOverride:     func() bool { return false },
+		cancelSlotOverride: slot,
+		writeOutcomeStateOverride: func() nativeWriteOutcomeState {
+			return nativeWriteOutcomeUnknown
+		},
+		execContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (int64, error) {
+			close(entered)
+			<-release
+			return 0, &nativeExecutionError{primary: primary, cleanup: cleanup}
+		},
+	}
+	connection := &conn{
+		native:           native,
+		redactionSecrets: []string{"primary-secret", "cleanup-secret", "request-secret", "/private/primary.ib", "/private/cleanup.ib", "/private/request.ib"},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := connection.ExecContext(ctx, "UPDATE example SET value = 1", nil)
+		result <- err
+	}()
+	waitForTestSignal(t, entered, "execution did not enter native override")
+	cancel()
+	waitForTestSignal(t, slot.cancelStarted, "cancellation request did not overlap execution")
+	close(release)
+
+	err := <-result
+	var uncertain *UncertainOutcomeError
+	if !errors.As(err, &uncertain) {
+		t.Fatalf("ExecContext() error = %v, want UncertainOutcomeError", err)
+	}
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) ||
+		!errors.Is(err, cleanup) || !errors.Is(err, requestErr) {
+		t.Fatalf("ExecContext() error lost context/fault diagnostics: %v", err)
+	}
+	if !errors.Is(uncertain.Cleanup, cleanup) {
+		t.Fatalf("UncertainOutcomeError cleanup = %v, lost rollback diagnostic", uncertain.Cleanup)
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("ExecContext() error = %v, must not match driver.ErrBadConn", err)
+	}
+	for _, secretValue := range []string{secret, cleanupSecret, requestSecret} {
+		if strings.Contains(err.Error(), secretValue) {
+			t.Fatalf("ExecContext() rendered unsanitized secret %q: %v", secretValue, err)
+		}
+	}
+}
+
+func TestExecContextCancellationRequestFailureWithoutOverlapStaysNative(t *testing.T) {
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: 335544366,
+		Message:    "ordinary native failure",
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	slot := &fakeCancelSlot{
+		cancelStarted: make(chan struct{}),
+		cancelErr: &NativeError{
+			Operation:  "cancel statement",
+			NativeCode: nativeCancelledCode,
+			Message:    "cancel request completed after execution ended",
+		},
+	}
+	native := &nativeConnection{
+		brokenOverride:     func() bool { return false },
+		cancelSlotOverride: slot,
+		writeOutcomeStateOverride: func() nativeWriteOutcomeState {
+			return nativeWriteOutcomeUnknown
+		},
+		execContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (int64, error) {
+			close(entered)
+			<-release
+			return 0, primary
+		},
+	}
+	connection := &conn{native: native}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := connection.ExecContext(ctx, "UPDATE example SET value = 1", nil)
+		result <- err
+	}()
+	waitForTestSignal(t, entered, "execution did not enter native override")
+	cancel()
+	waitForTestSignal(t, slot.cancelStarted, "cancellation request did not run")
+	close(release)
+
+	err := <-result
+	if !errors.Is(err, primary) {
+		t.Fatalf("ExecContext() error = %v, lost ordinary native error", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("ordinary native error was relabeled as context cancellation: %v", err)
+	}
+	var uncertain *UncertainOutcomeError
+	if errors.As(err, &uncertain) {
+		t.Fatalf("ordinary native error became uncertain without overlap evidence: %v", err)
+	}
+}
+
+func TestExecContextSlotAllocationFailureDoesNotEnterExecution(t *testing.T) {
+	allocationErr := errors.New("injected cancellation slot allocation failure")
+	originalFactory := nativeCancelSlotFactory
+	nativeCancelSlotFactory = func() (nativeCancelSlotBackend, error) {
+		return nil, allocationErr
+	}
+	defer func() { nativeCancelSlotFactory = originalFactory }()
+
+	called := false
+	native := &nativeConnection{
+		brokenOverride: func() bool { return false },
+		execContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (int64, error) {
+			called = true
+			return 1, nil
+		},
+	}
+	connection := &conn{native: native}
+	got, err := connection.ExecContext(context.Background(),
+		"UPDATE example SET value = 1", nil)
+	if got != nil {
+		t.Fatalf("ExecContext() result = %v, want nil", got)
+	}
+	if !errors.Is(err, allocationErr) {
+		t.Fatalf("ExecContext() error = %v, want allocation error", err)
+	}
+	if called {
+		t.Fatal("execution entered native override after cancellation slot allocation failed")
+	}
+}
+
+func TestExecContextSuccessfulCompletionWinsCancellationRaceExactlyOnce(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	slot := &fakeCancelSlot{
+		cancelStarted:    make(chan struct{}),
+		cancelAttempted:  true,
+		cancelOverlapped: true,
+	}
+	attempts := 0
+	native := &nativeConnection{
+		brokenOverride:     func() bool { return false },
+		cancelSlotOverride: slot,
+		execContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (int64, error) {
+			attempts++
+			close(entered)
+			<-release
+			return 1, nil
+		},
+	}
+	connection := &conn{native: native}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan struct {
+		affected driver.Result
+		err      error
+	}, 1)
+	go func() {
+		affected, err := connection.ExecContext(ctx, "UPDATE example SET value = value + 1", nil)
+		result <- struct {
+			affected driver.Result
+			err      error
+		}{affected: affected, err: err}
+	}()
+	waitForTestSignal(t, entered, "execution did not enter native override")
+	cancel()
+	waitForTestSignal(t, slot.cancelStarted, "cancellation request did not overlap execution")
+	close(release)
+
+	completed := <-result
+	if completed.err != nil {
+		t.Fatalf("successful completion returned error after cancellation race: %v", completed.err)
+	}
+	if completed.affected == nil {
+		t.Fatal("successful completion returned nil result")
+	}
+	rowsAffected, err := completed.affected.RowsAffected()
+	if err != nil || rowsAffected != 1 {
+		t.Fatalf("successful completion rows affected = %d, error = %v; want 1, nil",
+			rowsAffected, err)
+	}
+	if attempts != 1 {
+		t.Fatalf("non-idempotent execution attempts = %d, want exactly one", attempts)
+	}
+}
+
+func TestSQLDoesNotReplayUncertainLostResponseAfterConnectionLoss(t *testing.T) {
+	const primarySecret = "password=lost-response attachment=/private/lost.ib"
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: 335544366,
+		Message:    primarySecret,
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	slot := &fakeCancelSlot{
+		cancelStarted:    make(chan struct{}),
+		cancelAttempted:  true,
+		cancelOverlapped: true,
+	}
+	attempts := 0
+	native := &nativeConnection{
+		brokenOverride:     func() bool { return true },
+		cancelSlotOverride: slot,
+		execContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (int64, error) {
+			attempts++
+			close(entered)
+			<-release
+			return 0, primary
+		},
+	}
+	connection := &conn{
+		native:           native,
+		redactionSecrets: []string{"lost-response", "/private/lost.ib"},
+	}
+	db := openDatabaseSQLTestDB(t, connection)
+	db.SetMaxOpenConns(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, "UPDATE example SET value = value + 1")
+		result <- err
+	}()
+	waitForTestSignal(t, entered, "execution did not enter native override")
+	cancel()
+	waitForTestSignal(t, slot.cancelStarted, "cancellation request did not overlap execution")
+	close(release)
+
+	err := <-result
+	var uncertain *UncertainOutcomeError
+	if !errors.As(err, &uncertain) {
+		t.Fatalf("database/sql error = %v, want UncertainOutcomeError", err)
+	}
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) {
+		t.Fatalf("database/sql error lost cancellation/native identity: %v", err)
+	}
+	if errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("database/sql error = %v, must not match driver.ErrBadConn", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("uncertain lost-response execution attempts = %d, want exactly one", attempts)
+	}
+	if strings.Contains(err.Error(), primarySecret) {
+		t.Fatalf("database/sql error rendered unsanitized native secret: %v", err)
+	}
+}
+
+func TestExecContextConnectionLossLeavesOutcomeUnknown(t *testing.T) {
+	primary := &NativeError{
+		Operation:  "execute statement",
+		NativeCode: 335544366,
+		Message:    "connection lost after cancellation overlap",
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	slot := &fakeCancelSlot{
+		cancelStarted:    make(chan struct{}),
+		cancelAttempted:  true,
+		cancelOverlapped: true,
+	}
+	native := &nativeConnection{
+		brokenOverride:     func() bool { return true },
+		cancelSlotOverride: slot,
+		execContextOverride: func(_ string, _ []argument, _ bool, _ *nativeCancelOperation) (int64, error) {
+			close(entered)
+			<-release
+			return 0, primary
+		},
+	}
+	connection := &conn{native: native}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := connection.ExecContext(ctx, "UPDATE example SET value = value + 1", nil)
+		result <- err
+	}()
+	waitForTestSignal(t, entered, "execution did not enter native override")
+	cancel()
+	waitForTestSignal(t, slot.cancelStarted, "cancellation request did not overlap execution")
+	close(release)
+
+	err := <-result
+	var uncertain *UncertainOutcomeError
+	if !errors.As(err, &uncertain) {
+		t.Fatalf("ExecContext() error = %v, want UncertainOutcomeError", err)
+	}
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, primary) {
+		t.Fatalf("ExecContext() error lost cancellation/native identity: %v", err)
+	}
+	if connection.native != nil {
+		t.Fatal("connection-loss path retained a broken native connection")
 	}
 }
