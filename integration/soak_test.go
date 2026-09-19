@@ -21,20 +21,21 @@ import (
 )
 
 const (
-	soakOptInEnv       = "INTERBASE_SOAK"
-	soakDurationEnv    = "INTERBASE_SOAK_DURATION"
-	soakWorkersEnv     = "INTERBASE_SOAK_WORKERS"
-	soakSampleEnv      = "INTERBASE_SOAK_SAMPLE_INTERVAL"
-	soakDefaultRuntime = 15 * time.Second
-	soakDefaultWorkers = 4
-	soakDefaultSample  = time.Second
-	soakMaxRuntime     = 24 * time.Hour
-	soakMaxWorkers     = 64
-	soakOperationLimit = 30 * time.Second
-	soakQuery          = "SELECT ID, COUNTRY FROM GO_COUNTRY WHERE ID = ?"
-	soakEarlyQuery     = "SELECT ID, COUNTRY FROM GO_COUNTRY ORDER BY ID"
-	soakWriteQuery     = "UPDATE GO_WRITE SET WRITE_VALUE = WRITE_VALUE + 1 WHERE ID = ?"
-	soakWriteReadQuery = "SELECT WRITE_VALUE FROM GO_WRITE WHERE ID = ?"
+	soakOptInEnv          = "INTERBASE_SOAK"
+	soakDurationEnv       = "INTERBASE_SOAK_DURATION"
+	soakWorkersEnv        = "INTERBASE_SOAK_WORKERS"
+	soakSampleEnv         = "INTERBASE_SOAK_SAMPLE_INTERVAL"
+	soakDefaultRuntime    = 15 * time.Second
+	soakDefaultWorkers    = 4
+	soakDefaultSample     = time.Second
+	soakMaxRuntime        = 24 * time.Hour
+	soakMaxWorkers        = 64
+	soakOperationLimit    = 30 * time.Second
+	soakQuery             = "SELECT ID, COUNTRY FROM GO_COUNTRY WHERE ID = ?"
+	soakEarlyQuery        = "SELECT ID, COUNTRY FROM GO_COUNTRY ORDER BY ID"
+	soakWriteQuery        = "UPDATE GO_WRITE SET WRITE_VALUE = WRITE_VALUE + 1 WHERE ID = ?"
+	soakWriteReadQuery    = "SELECT WRITE_VALUE FROM GO_WRITE WHERE ID = ?"
+	soakCancellationQuery = "EXECUTE PROCEDURE GO_CANCEL_DELAY"
 )
 
 func TestSoakConcurrentWorkload(t *testing.T) {
@@ -44,12 +45,21 @@ func TestSoakConcurrentWorkload(t *testing.T) {
 	duration := soakDuration(t, soakDurationEnv, soakDefaultRuntime)
 	workers := soakInt(t, soakWorkersEnv, soakDefaultWorkers, 1, soakMaxWorkers)
 	sampleInterval := soakDuration(t, soakSampleEnv, soakDefaultSample)
+	cancellationEnabled := os.Getenv(cancellationOptIn) == "1"
 
-	fixture, cfg, cleanup := createFixture(t, 1)
+	schema := fixtureSchema
+	if cancellationEnabled {
+		schema += cancellationFixtureSchema
+	}
+	fixture, cfg, cleanup := createFixture(t, 1, schema)
 	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 1, interbase.TransactionOptions{})
 	churnDB := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 1, interbase.TransactionOptions{})
-	db.SetMaxOpenConns(workers)
-	db.SetMaxIdleConns(workers)
+	cancellationWorkers := 0
+	if cancellationEnabled {
+		cancellationWorkers = max(1, workers/4)
+	}
+	db.SetMaxOpenConns(workers + cancellationWorkers)
+	db.SetMaxIdleConns(workers + cancellationWorkers)
 	churnDB.SetMaxOpenConns(1)
 	churnDB.SetMaxIdleConns(0)
 	if stats := churnDB.Stats(); stats.OpenConnections != 0 || stats.InUse != 0 || stats.Idle != 0 {
@@ -97,6 +107,8 @@ func TestSoakConcurrentWorkload(t *testing.T) {
 	var rolledBackWrites atomic.Uint64
 	var operationNanos atomic.Uint64
 	var maxOperationNanos atomic.Uint64
+	var cancellationAttempts atomic.Uint64
+	var canceledOperations atomic.Uint64
 	committedByWorker := make([]atomic.Uint64, workers)
 	rolledBackByWorker := make([]atomic.Uint64, workers)
 	var churnTracker soakChurnTracker
@@ -171,6 +183,31 @@ func TestSoakConcurrentWorkload(t *testing.T) {
 			}
 		}()
 	}
+	for worker := 0; worker < cancellationWorkers; worker++ {
+		workerGroup.Add(1)
+		go func(worker int) {
+			defer workerGroup.Done()
+			for {
+				select {
+				case <-durationCtx.Done():
+					return
+				case <-runCtx.Done():
+					return
+				default:
+				}
+				cancellationAttempts.Add(1)
+				if err := runSoakCancellation(runCtx, db); err != nil {
+					select {
+					case errorsCh <- fmt.Errorf("cancellation worker %d: %w", worker, err):
+					default:
+					}
+					runCancel()
+					return
+				}
+				canceledOperations.Add(1)
+			}
+		}(worker)
+	}
 
 	workerGroup.Wait()
 	workloadElapsed := time.Since(workloadStarted)
@@ -184,6 +221,9 @@ func TestSoakConcurrentWorkload(t *testing.T) {
 
 	if got := operations.Load(); got == 0 {
 		t.Fatal("soak completed without a successful operation")
+	}
+	if cancellationEnabled && (cancellationAttempts.Load() == 0 || canceledOperations.Load() == 0) {
+		t.Fatalf("cancellation soak operations = attempted %d canceled %d; want both nonzero", cancellationAttempts.Load(), canceledOperations.Load())
 	}
 	if got, want := rowValidations.Load(), operations.Load(); got != want {
 		t.Fatalf("row validations = %d, want %d", got, want)
@@ -239,9 +279,39 @@ func TestSoakConcurrentWorkload(t *testing.T) {
 		throughput = float64(operations.Load()) / workloadElapsed.Seconds()
 	}
 	averageLatency := time.Duration(operationNanos.Load() / operations.Load())
-	t.Logf("soak summary: elapsed=%s configured_duration=%s workers=%d operations=%d row_validations=%d early_close_rows=%d early_row_closes=%d write_attempts=%d committed_writes=%d rolled_back_writes=%d persisted_write_values=%d throughput_ops_per_second=%.2f average_operation_latency=%s max_operation_latency=%s", workloadElapsed, duration, workers, operations.Load(), rowValidations.Load(), earlyCloseRows.Load(), earlyCloses.Load(), writeAttempts.Load(), committedWrites.Load(), rolledBackWrites.Load(), persistedWrites, throughput, averageLatency, time.Duration(maxOperationNanos.Load()))
+	t.Logf("soak summary: elapsed=%s configured_duration=%s workers=%d cancellation_workers=%d operations=%d cancellation_attempts=%d canceled_operations=%d row_validations=%d early_close_rows=%d early_row_closes=%d write_attempts=%d committed_writes=%d rolled_back_writes=%d persisted_write_values=%d throughput_ops_per_second=%.2f average_operation_latency=%s max_operation_latency=%s", workloadElapsed, duration, workers, cancellationWorkers, operations.Load(), cancellationAttempts.Load(), canceledOperations.Load(), rowValidations.Load(), earlyCloseRows.Load(), earlyCloses.Load(), writeAttempts.Load(), committedWrites.Load(), rolledBackWrites.Load(), persistedWrites, throughput, averageLatency, time.Duration(maxOperationNanos.Load()))
 	t.Logf("soak churn: borrow_return_operations=%d physical_opens=%d physical_closes=%d attachment_identity_replacements=%d prepare_recreations=%d", churnMetrics.borrowReturns, churnMetrics.physicalOpens, churnMetrics.physicalCloses, churnMetrics.identityReplacements, churnMetrics.prepareRecreations)
 	t.Log("soak note: database/sql OpenConnections is the available pool attachment proxy; exact native allocation counters and server-wide attachment counts are unavailable")
+}
+
+func runSoakCancellation(parent context.Context, db *sql.DB) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := db.ExecContext(ctx, soakCancellationQuery)
+		result <- err
+	}()
+	timer := time.NewTimer(cancellationStartDelay)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		if err == nil {
+			return errors.New("cancellation query completed before cancellation request")
+		}
+		return fmt.Errorf("cancellation query returned before request: %w", err)
+	case <-timer.C:
+		cancel()
+	}
+	select {
+	case err := <-result:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("cancellation query error = %v, want context cancellation", err)
+		}
+		return nil
+	case <-time.After(cancellationResultLimit):
+		return errors.New("cancellation query did not return before its live bound")
+	}
 }
 
 type soakWriteOutcome uint8

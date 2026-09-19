@@ -1,4 +1,4 @@
-.PHONY: build test test-native test-runner test-integration-docker test-faults test-soak test-native-lifecycle test-fuzz bench bench-live vet
+.PHONY: build test test-native test-runner test-integration-docker test-faults test-soak test-cancellation test-native-lifecycle test-fuzz bench bench-live vet
 
 BATS ?= bats
 FUZZ_TIME ?= 10s
@@ -7,6 +7,7 @@ BENCH_TIME ?= 1s
 SOAK_DURATION ?= 120s
 SOAK_WORKERS ?= 4
 SOAK_SAMPLE_INTERVAL ?= 1s
+CANCELLATION_ITERATIONS ?= 10
 INTERBASE_INCLUDE ?= /opt/interbase/include
 INTERBASE_LIB ?= /opt/interbase/lib
 NATIVE_CFLAGS ?= -I$(INTERBASE_INCLUDE)
@@ -61,6 +62,9 @@ test-faults:
 
 test-soak:
 	IMAGE="$(IMAGE)" INTERBASE_INCLUDE="$(INTERBASE_INCLUDE)" bash scripts/test-integration-docker.sh --soak --soak-duration="$(SOAK_DURATION)" --soak-workers="$(SOAK_WORKERS)" --soak-sample-interval="$(SOAK_SAMPLE_INTERVAL)" -run '^TestSoakConcurrentWorkload$$' -v
+
+test-cancellation:
+	IMAGE="$(IMAGE)" INTERBASE_INCLUDE="$(INTERBASE_INCLUDE)" bash scripts/test-integration-docker.sh --cancellation --cancellation-iterations="$(CANCELLATION_ITERATIONS)" -run '^TestLiveCancellationRaces$$' -v
 
 test-native-lifecycle:
 	IMAGE="$(IMAGE)" INTERBASE_INCLUDE="$(INTERBASE_INCLUDE)" bash scripts/test-integration-docker.sh --native-lifecycle -run '^TestNativeLifecycleRace$$' -v

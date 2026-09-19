@@ -31,7 +31,51 @@ teardown() {
   [[ "$output" == *"--soak-workers=WORKERS"* ]]
   [[ "$output" == *"--soak-sample-interval=DURATION"* ]]
   [[ "$output" == *"--native-lifecycle"* ]]
+  [[ "$output" == *"--cancellation"* ]]
+  [[ "$output" == *"--cancellation-iterations=COUNT"* ]]
   [[ "$output" == *"positive integer duration"* ]]
+}
+
+@test "passes cancellation configuration only to the requested test command" {
+  run "$RUNNER" --cancellation --cancellation-iterations=37 -run '^TestLiveCancellationRaces$'
+
+  [ "$status" -eq 0 ]
+  go_log="$(<"$FAKE_GO_LOG")"
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native= cancellation= iterations=$' <<<"$go_log")" -eq 3 ]
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native= cancellation=1 iterations=37$' <<<"$go_log")" -eq 1 ]
+}
+
+@test "does not inherit cancellation configuration from the host environment" {
+  export INTERBASE_CANCELLATION=1
+  export INTERBASE_CANCELLATION_ITERATIONS=10000
+
+  run "$RUNNER" -run '^TestRead$'
+
+  [ "$status" -eq 0 ]
+  go_log="$(<"$FAKE_GO_LOG")"
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native= cancellation= iterations=$' <<<"$go_log")" -eq 4 ]
+}
+
+@test "requires cancellation opt-in and validates cancellation iteration bounds before Docker" {
+  run "$RUNNER" --cancellation-iterations=2
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"require --cancellation"* ]]
+  [ ! -s "$FAKE_DOCKER_LOG" ]
+
+  run "$RUNNER" --cancellation --cancellation-iterations=0
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"between 1 and 10000"* ]]
+  [ ! -s "$FAKE_DOCKER_LOG" ]
+
+  run "$RUNNER" --cancellation --cancellation-iterations=10001
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"between 1 and 10000"* ]]
+  [ ! -s "$FAKE_DOCKER_LOG" ]
+
+  run "$RUNNER" --cancellation --cancellation-iterations=not-a-number
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"between 1 and 10000"* ]]
+  [ ! -s "$FAKE_DOCKER_LOG" ]
 }
 
 @test "passes performance opt-in only to the requested test command" {
@@ -39,8 +83,8 @@ teardown() {
 
   [ "$status" -eq 0 ]
   go_log="$(<"$FAKE_GO_LOG")"
-  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native=$' <<<"$go_log")" -eq 3 ]
-  [ "$(grep -c '^workload-env perf=1 soak= duration= workers= sample= native=$' <<<"$go_log")" -eq 1 ]
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native= cancellation= iterations=$' <<<"$go_log")" -eq 3 ]
+  [ "$(grep -c '^workload-env perf=1 soak= duration= workers= sample= native= cancellation= iterations=$' <<<"$go_log")" -eq 1 ]
 }
 
 @test "passes soak configuration only to the requested test command" {
@@ -49,8 +93,8 @@ teardown() {
 
   [ "$status" -eq 0 ]
   go_log="$(<"$FAKE_GO_LOG")"
-  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native=$' <<<"$go_log")" -eq 3 ]
-  [ "$(grep -c '^workload-env perf= soak=1 duration=120s workers=4 sample=1s native=$' <<<"$go_log")" -eq 1 ]
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native= cancellation= iterations=$' <<<"$go_log")" -eq 3 ]
+  [ "$(grep -c '^workload-env perf= soak=1 duration=120s workers=4 sample=1s native= cancellation= iterations=$' <<<"$go_log")" -eq 1 ]
 }
 
 @test "passes native lifecycle opt-in only to the requested test command" {
@@ -58,8 +102,8 @@ teardown() {
 
   [ "$status" -eq 0 ]
   go_log="$(<"$FAKE_GO_LOG")"
-  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native=$' <<<"$go_log")" -eq 3 ]
-  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native=1$' <<<"$go_log")" -eq 1 ]
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native= cancellation= iterations=$' <<<"$go_log")" -eq 3 ]
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native=1 cancellation= iterations=$' <<<"$go_log")" -eq 1 ]
 }
 
 @test "supports split workload values and preserves the double-dash Go argument boundary" {
@@ -68,7 +112,7 @@ teardown() {
 
   [ "$status" -eq 0 ]
   go_log="$(<"$FAKE_GO_LOG")"
-  [ "$(grep -c '^workload-env perf= soak=1 duration=2m workers=1 sample=2s native=$' <<<"$go_log")" -eq 1 ]
+  [ "$(grep -c '^workload-env perf= soak=1 duration=2m workers=1 sample=2s native= cancellation= iterations=$' <<<"$go_log")" -eq 1 ]
   [[ "$go_log" == *'-test.run \^TestRead\$'* ]]
 }
 
@@ -101,7 +145,7 @@ teardown() {
 
   [ "$status" -eq 0 ]
   go_log="$(<"$FAKE_GO_LOG")"
-  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native=$' <<<"$go_log")" -eq 4 ]
+  [ "$(grep -c '^workload-env perf= soak= duration= workers= sample= native= cancellation= iterations=$' <<<"$go_log")" -eq 4 ]
   [[ "$go_log" != *"UNSAFE_WORKLOAD_OVERRIDE"* ]]
 }
 

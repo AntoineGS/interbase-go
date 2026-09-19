@@ -8,6 +8,8 @@ import (
 	"database/sql/driver"
 	"errors"
 	"os"
+	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -77,6 +79,12 @@ BEGIN
     END
 END^
 
+CREATE PROCEDURE GO_CANCEL_MAYBE_DELAY (DELAY_ENABLED INTEGER) AS
+BEGIN
+    IF (DELAY_ENABLED = 1) THEN
+        EXECUTE PROCEDURE GO_CANCEL_DELAY;
+END^
+
 CREATE TRIGGER GO_CANCEL_TARGET_BI FOR GO_CANCEL_TARGET
 ACTIVE BEFORE INSERT POSITION 0
 AS
@@ -114,16 +122,145 @@ COMMIT;
 `
 
 const (
-	cancellationOptIn       = "INTERBASE_CANCELLATION"
-	cancellationStartDelay  = 250 * time.Millisecond
-	cancellationResultLimit = 30 * time.Second
-	nativeCancelledStatus   = int64(335544794)
+	cancellationOptIn         = "INTERBASE_CANCELLATION"
+	cancellationStartDelay    = 250 * time.Millisecond
+	cancellationResultLimit   = 30 * time.Second
+	cancellationIterationsEnv = "INTERBASE_CANCELLATION_ITERATIONS"
+	nativeCancelledStatus     = int64(335544794)
 )
 
 func requireLiveCancellation(t *testing.T) {
 	t.Helper()
 	if os.Getenv(cancellationOptIn) != "1" {
 		t.Skipf("set %s=1 to run live DSQL cancellation contracts", cancellationOptIn)
+	}
+}
+
+func cancellationIterations(t *testing.T) int {
+	t.Helper()
+	value := os.Getenv(cancellationIterationsEnv)
+	if value == "" {
+		return 10
+	}
+	iterations, err := strconv.Atoi(value)
+	if err != nil || iterations < 1 || iterations > 10000 {
+		t.Fatalf("%s = %q is invalid; want an integer in [1, 10000]", cancellationIterationsEnv, value)
+	}
+	return iterations
+}
+
+// TestLiveCancellationRaces repeats the live paths that can overlap a DSQL
+// call. The runner supplies a process-level deadline because native cancel is
+// best effort rather than a deadline guarantee.
+func TestLiveCancellationRaces(t *testing.T) {
+	requireLiveCancellation(t)
+	iterations := cancellationIterations(t)
+	fixture, cfg, cleanup := createFixture(t, 3, cancellationFixtureSchema)
+	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 3, interbase.TransactionOptions{})
+	verifier := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 3, interbase.TransactionOptions{})
+	db.SetMaxOpenConns(3)
+	db.SetMaxIdleConns(3)
+	beforeGoroutines := runtime.NumGoroutine()
+	beforeFDs, fdsAvailable := openFileDescriptorCount()
+
+	const cpuQuery = "EXECUTE PROCEDURE GO_CANCEL_DELAY"
+	for iteration := 0; iteration < iterations; iteration++ {
+		t.Run("iteration", func(t *testing.T) {
+			// Direct CPU query cancellation and a cancel/complete race.
+			runCanceledRead(t, func(ctx context.Context) error {
+				_, err := db.ExecContext(ctx, cpuQuery)
+				return err
+			})
+			raceCtx, raceCancel := context.WithCancel(context.Background())
+			var raceCount int64
+			raceDone := make(chan error, 1)
+			go func() {
+				raceDone <- db.QueryRowContext(raceCtx, "SELECT COUNT(*) FROM GO_CANCEL_SEED").Scan(&raceCount)
+			}()
+			raceCancel()
+			select {
+			case err := <-raceDone:
+				if err != nil && !errors.Is(err, context.Canceled) {
+					t.Fatalf("completion race error = %v, want success or cancellation", err)
+				}
+			case <-time.After(cancellationResultLimit):
+				t.Fatal("completion race did not return before its live bound")
+			}
+
+			prepared, err := db.PrepareContext(context.Background(), "EXECUTE PROCEDURE GO_CANCEL_MAYBE_DELAY(?)")
+			if err != nil {
+				t.Fatalf("prepare repeated CPU query: %v", err)
+			}
+			runCanceledRead(t, func(ctx context.Context) error {
+				_, err := prepared.ExecContext(ctx, 1)
+				return err
+			})
+			if _, err := prepared.ExecContext(context.Background(), 0); err != nil {
+				t.Fatalf("reuse prepared statement after cancellation: %v", err)
+			}
+			if err := prepared.Close(); err != nil {
+				t.Fatalf("close canceled prepared query: %v", err)
+			}
+
+			runCanceledRead(t, func(ctx context.Context) error {
+				rows, err := db.QueryContext(ctx, "SELECT A.ID FROM GO_CANCEL_DELAY_ROWS A, GO_CANCEL_DELAY_ROWS B")
+				if err != nil {
+					return err
+				}
+				defer rows.Close()
+				for rows.Next() {
+					var id int64
+					if err := rows.Scan(&id); err != nil {
+						return err
+					}
+				}
+				return rows.Err()
+			})
+
+			id := int64(iteration + 100)
+			runCanceledWrite(t, func(ctx context.Context) error {
+				_, err := db.ExecContext(ctx, "INSERT INTO GO_CANCEL_TARGET (ID, WRITE_VALUE, LABEL) VALUES (?, ?, ?)", id, id, "repeated implicit cancellation")
+				return err
+			})
+			verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
+			defer verifyCancel()
+			assertCancellationTarget(t, verifyCtx, verifier, id, false, 0, "")
+
+			tx, err := db.BeginTx(context.Background(), nil)
+			if err != nil {
+				t.Fatalf("begin repeated explicit transaction: %v", err)
+			}
+			runCanceledWrite(t, func(ctx context.Context) error {
+				_, err := tx.ExecContext(ctx, "INSERT INTO GO_CANCEL_TARGET (ID, WRITE_VALUE, LABEL) VALUES (?, ?, ?)", id+10000, id, "repeated explicit cancellation")
+				return err
+			})
+			assertCanceledTransactionTargetAbsent(t, verifyCtx, tx, id+10000)
+			if err := tx.Rollback(); err != nil {
+				t.Fatalf("rollback repeated explicit transaction: %v", err)
+			}
+			insertCancellationControl(t, verifyCtx, db, id, "pool recovery")
+		})
+	}
+	if stats := db.Stats(); stats.InUse != 0 {
+		t.Fatalf("cancellation pool retained in-use connections: %+v", stats)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close cancellation pool: %v", err)
+	}
+	if err := verifier.Close(); err != nil {
+		t.Fatalf("close cancellation verifier pool: %v", err)
+	}
+	if stats := db.Stats(); stats.OpenConnections != 0 || stats.InUse != 0 || stats.Idle != 0 {
+		t.Fatalf("cancellation pool remained open after cleanup: %+v", stats)
+	}
+	runtime.GC()
+	if got := runtime.NumGoroutine(); got > beforeGoroutines {
+		t.Fatalf("goroutines after repeated cancellation = %d, baseline = %d", got, beforeGoroutines)
+	}
+	if fdsAvailable {
+		if got, available := openFileDescriptorCount(); available && got > beforeFDs {
+			t.Fatalf("file descriptors after repeated cancellation = %d, baseline = %d", got, beforeFDs)
+		}
 	}
 }
 
@@ -165,6 +302,33 @@ func runCanceledWrite(t *testing.T, execute func(context.Context) error) {
 		assertCanceledWriteError(t, err)
 	case <-time.After(cancellationResultLimit):
 		t.Fatal("canceled mutating operation did not return before its live bound")
+	}
+}
+
+func runCanceledRead(t *testing.T, execute func(context.Context) error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- execute(ctx) }()
+	timer := time.NewTimer(cancellationStartDelay)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		if err == nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled read returned %v, want context cancellation", err)
+		}
+		return
+	case <-timer.C:
+		cancel()
+	}
+	select {
+	case err := <-result:
+		if err == nil || !errors.Is(err, context.Canceled) || errors.Is(err, driver.ErrBadConn) {
+			t.Fatalf("canceled read returned %v, want non-bad-connection context cancellation", err)
+		}
+	case <-time.After(cancellationResultLimit):
+		t.Fatal("canceled read did not return before its live bound")
 	}
 }
 

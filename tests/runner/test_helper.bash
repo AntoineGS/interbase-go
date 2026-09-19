@@ -51,7 +51,8 @@ setup_runner_test() {
     FAKE_GO_REQUIRE_QUOTED_CGO_PATHS
   unset INTERBASE_PERF INTERBASE_SOAK INTERBASE_SOAK_DURATION \
     INTERBASE_SOAK_WORKERS INTERBASE_SOAK_SAMPLE_INTERVAL \
-    INTERBASE_NATIVE_LIFECYCLE_RACE INTERBASE_UNSAFE_WORKLOAD_OVERRIDE
+    INTERBASE_NATIVE_LIFECYCLE_RACE INTERBASE_CANCELLATION \
+    INTERBASE_CANCELLATION_ITERATIONS INTERBASE_UNSAFE_WORKLOAD_OVERRIDE
 
   : > "$FAKE_DOCKER_LOG"
   : > "$FAKE_TIMEOUT_LOG"
@@ -281,11 +282,12 @@ else
   printf 'unexpected\n' >> "$FAKE_GO_LOG"
   password_state=unexpected
 fi
-printf 'workload-env perf=%s soak=%s duration=%s workers=%s sample=%s native=%s\n' \
+  printf 'workload-env perf=%s soak=%s duration=%s workers=%s sample=%s native=%s cancellation=%s iterations=%s\n' \
   "${INTERBASE_PERF-}" "${INTERBASE_SOAK-}" \
   "${INTERBASE_SOAK_DURATION-}" "${INTERBASE_SOAK_WORKERS-}" \
   "${INTERBASE_SOAK_SAMPLE_INTERVAL-}" \
-  "${INTERBASE_NATIVE_LIFECYCLE_RACE-}" >> "$FAKE_GO_LOG"
+    "${INTERBASE_NATIVE_LIFECYCLE_RACE-}" "${INTERBASE_CANCELLATION-}" \
+    "${INTERBASE_CANCELLATION_ITERATIONS-}" >> "$FAKE_GO_LOG"
 printf '%s\n' "$TMPDIR" > "$FAKE_ROOT_FILE"
 
 is_smoke=0
