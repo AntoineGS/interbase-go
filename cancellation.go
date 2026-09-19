@@ -116,17 +116,22 @@ type nativeCancelOperation struct {
 // launches exactly one context watcher. A context already carrying an error is
 // rejected before any slot is allocated or generation is begun.
 func beginNativeCancelOperation(ctx context.Context) (*nativeCancelOperation, error) {
-	op := new(nativeCancelOperation)
-	if err := op.begin(ctx); err != nil {
-		return nil, err
-	}
-	return op, nil
+	return newNativeCancelOperationWithSlot(ctx, nil)
 }
 
 // newNativeCancelOperation is kept as the descriptive constructor used by
 // native call sites that do not need to distinguish allocation from begin.
 func newNativeCancelOperation(ctx context.Context) (*nativeCancelOperation, error) {
-	return beginNativeCancelOperation(ctx)
+	return newNativeCancelOperationWithSlot(ctx, nil)
+}
+
+func newNativeCancelOperationWithSlot(ctx context.Context,
+	slot nativeCancelSlotBackend) (*nativeCancelOperation, error) {
+	op := &nativeCancelOperation{slot: slot}
+	if err := op.begin(ctx); err != nil {
+		return nil, err
+	}
+	return op, nil
 }
 
 // begin initializes the operation. Tests and native wrappers may provide a

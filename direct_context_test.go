@@ -162,6 +162,8 @@ func TestDirectExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 	connection, _, transaction := newDirectContextTestTransaction(t)
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	cancelRelease := make(chan struct{})
+	slot := &fakeCancelSlot{cancelStarted: make(chan struct{}), cancelRelease: cancelRelease}
 	nativeErr := &Error{
 		Operation:  "execute prepared statement",
 		NativeCode: nativeCancelledCode,
@@ -169,7 +171,11 @@ func TestDirectExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 	}
 	connection.native.brokenOverride = func() bool { return false }
 	transaction.native = &nativeTransaction{
-		execOverride: func(string, []argument, bool) (int64, error) {
+		cancelSlotOverride: slot,
+		execContextOverride: func(_ string, _ []argument, _ bool, operation *nativeCancelOperation) (int64, error) {
+			slot.mu.Lock()
+			slot.watcherDone = operation.watcherDone
+			slot.mu.Unlock()
 			close(entered)
 			<-release
 			return 0, nativeErr
@@ -191,11 +197,14 @@ func TestDirectExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 		connection.mu.Unlock()
 	}()
 	cancel()
+	waitForTestSignal(t, slot.cancelStarted,
+		"direct operation watcher did not request native cancellation")
 	select {
 	case <-lockAcquired:
 		t.Fatal("direct operation released its connection lock before native completion")
 	case <-time.After(20 * time.Millisecond):
 	}
+	close(cancelRelease)
 	close(release)
 
 	select {
@@ -213,6 +222,11 @@ func TestDirectExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 	case <-lockAcquired:
 	case <-time.After(time.Second):
 		t.Fatal("direct operation did not release its connection lock")
+	}
+	_, cancelCalls, closeCalls, _, beforeWatch := slot.snapshot()
+	if cancelCalls != 1 || closeCalls != 1 || beforeWatch {
+		t.Fatalf("direct cancellation slot lifecycle = cancel %d close %d beforeWatch=%v; want 1, 1, false",
+			cancelCalls, closeCalls, beforeWatch)
 	}
 }
 

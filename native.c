@@ -1836,6 +1836,7 @@ static int ib_cursor_prepare_statement(ib_cursor *cursor, const char *query,
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
 	char *unpublish_error;
+	int unpublish_result;
 
 	if (cursor == NULL || cursor->connection == NULL ||
 		cursor->connection->database == NULL || cursor->transaction == NULL ||
@@ -1857,7 +1858,9 @@ static int ib_cursor_prepare_statement(ib_cursor *cursor, const char *query,
 		(unsigned short) query_length, (char *) query,
 		ib_connection_dialect(cursor->connection), NULL);
 	unpublish_error = NULL;
-	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+	unpublish_result = ib_cancel_slot_unpublish(cancel, generation,
+		&unpublish_error);
+	if (unpublish_result != 0) {
 		ib_append_error(error, unpublish_error);
 	}
 	if (result != 0) {
@@ -1865,6 +1868,9 @@ static int ib_cursor_prepare_statement(ib_cursor *cursor, const char *query,
 
 		(void) ib_fail_status(&prepare_error, "prepare statement", status);
 		ib_append_error(error, prepare_error);
+		return -1;
+	}
+	if (unpublish_result != 0) {
 		return -1;
 	}
 	return 0;

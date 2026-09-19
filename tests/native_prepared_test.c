@@ -17,6 +17,7 @@ static void *test_malloc(size_t size)
 ISC_STATUS test_start_transaction(ISC_STATUS *, isc_tr_handle *, short, ...);
 ISC_STATUS test_commit_transaction(ISC_STATUS *, isc_tr_handle *);
 ISC_STATUS test_rollback_transaction(ISC_STATUS *, isc_tr_handle *);
+ISC_STATUS test_prepare_transaction2(ISC_STATUS *, isc_tr_handle *, unsigned short, char *);
 ISC_STATUS test_dsql_allocate_statement(ISC_STATUS *, isc_db_handle *, isc_stmt_handle *);
 ISC_STATUS test_dsql_describe_bind(ISC_STATUS *, isc_stmt_handle *, unsigned short, XSQLDA *);
 ISC_STATUS test_dsql_describe(ISC_STATUS *, isc_stmt_handle *, unsigned short, XSQLDA *);
@@ -34,6 +35,7 @@ static void overlap_publication_wait_hook(struct ib_cancel_slot *slot);
 #define isc_start_transaction test_start_transaction
 #define isc_commit_transaction test_commit_transaction
 #define isc_rollback_transaction test_rollback_transaction
+#define isc_prepare_transaction2 test_prepare_transaction2
 #define isc_dsql_allocate_statement test_dsql_allocate_statement
 #define isc_dsql_describe_bind test_dsql_describe_bind
 #define isc_dsql_describe test_dsql_describe
@@ -53,6 +55,7 @@ static void overlap_publication_wait_hook(struct ib_cancel_slot *slot);
 #undef isc_start_transaction
 #undef isc_commit_transaction
 #undef isc_rollback_transaction
+#undef isc_prepare_transaction2
 #undef isc_dsql_allocate_statement
 #undef isc_dsql_describe_bind
 #undef isc_dsql_describe
@@ -98,6 +101,7 @@ static int failures;
 static int start_calls;
 static int commit_calls;
 static int rollback_calls;
+static int prepare_transaction_calls;
 static int allocate_calls;
 static int prepare_calls;
 static int describe_bind_calls;
@@ -137,8 +141,10 @@ static int describe_user_charset_identifier;
 static int describe_user_column_alias;
 static int describe_procedure_decimal;
 static int describe_procedure_source;
+static int complete_during_prepare;
 static int user_execute2_calls;
 static int64_t last_execute_value;
+static int64_t persisted_execute_value;
 static ib_cancel_slot *expected_cancel_slot;
 static uint64_t expected_cancel_generation;
 static isc_stmt_handle expected_cancel_statement;
@@ -511,6 +517,7 @@ static void reset_mocks(void)
 	start_calls = 0;
 	commit_calls = 0;
 	rollback_calls = 0;
+	prepare_transaction_calls = 0;
 	allocate_calls = 0;
 	prepare_calls = 0;
 	describe_bind_calls = 0;
@@ -549,6 +556,7 @@ static void reset_mocks(void)
 	describe_user_column_alias = 0;
 	describe_procedure_decimal = 0;
 	describe_procedure_source = 0;
+	complete_during_prepare = 0;
 	user_execute2_calls = 0;
 	catalog_statement = NULL;
 	expected_cancel_slot = NULL;
@@ -564,6 +572,7 @@ static void reset_mocks(void)
 	catalog_lookup_bytes_ok = 0;
 	expected_dialect = SQL_DIALECT_V5;
 	last_execute_value = 0;
+	persisted_execute_value = 0;
 	statement_type = isc_info_sql_stmt_insert;
 	procedure_output_count = 1;
 }
@@ -847,6 +856,17 @@ ISC_STATUS ISC_EXPORT test_commit_transaction(ISC_STATUS *status,
 	return status_result(status, fail_commit);
 }
 
+ISC_STATUS ISC_EXPORT test_prepare_transaction2(ISC_STATUS *status,
+	isc_tr_handle *transaction, unsigned short message_length, char *message)
+{
+	(void) message_length;
+	(void) message;
+	check(transaction != NULL && *transaction != NULL,
+		"distributed prepare did not receive a live transaction");
+	prepare_transaction_calls++;
+	return status_result(status, 0);
+}
+
 ISC_STATUS ISC_EXPORT test_rollback_transaction(ISC_STATUS *status,
 	isc_tr_handle *transaction)
 {
@@ -883,6 +903,10 @@ ISC_STATUS ISC_EXPORT test_dsql_prepare(ISC_STATUS *status,
 	(void) output;
 	check(dialect == expected_dialect, "prepare used the wrong SQL dialect");
 	prepare_calls++;
+	if (complete_during_prepare && expected_cancel_slot != NULL &&
+		expected_cancel_generation != 0U) {
+		ib_cancel_slot_complete(expected_cancel_slot, expected_cancel_generation);
+	}
 	if (query != NULL && strstr(query, "RDB$RELATION_FIELDS") != NULL) {
 		catalog_statement = *statement;
 		procedure_catalog_statement = 0;
@@ -1027,6 +1051,8 @@ ISC_STATUS ISC_EXPORT test_dsql_execute(ISC_STATUS *status,
 	isc_tr_handle *transaction, isc_stmt_handle *statement,
 	unsigned short dialect, XSQLDA *input)
 {
+	int failed;
+
 	(void) transaction;
 	check(dialect == expected_dialect, "execute used the wrong SQL dialect");
 	check_cancel_publication(statement, &execute_publication_calls,
@@ -1041,7 +1067,11 @@ ISC_STATUS ISC_EXPORT test_dsql_execute(ISC_STATUS *status,
 		memcpy(&last_execute_value, input->sqlvar[0].sqldata,
 			sizeof(last_execute_value));
 	}
-	return status_result(status, fail_execute_once-- > 0);
+	failed = fail_execute_once-- > 0;
+	if (!failed) {
+		persisted_execute_value = last_execute_value;
+	}
+	return status_result(status, failed);
 }
 
 ISC_STATUS ISC_EXPORT test_dsql_execute2(ISC_STATUS *status,
@@ -3021,6 +3051,56 @@ static void test_cancel_overlap_transient_prepare(void)
 	free(connection);
 }
 
+static void test_unpublish_failure_aborts_transient_prepare(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+	ib_connection *connection;
+	ib_bindings *bindings;
+	ib_cancel_slot *slot;
+	ib_cursor *cursor;
+	char *error = NULL;
+	uint64_t generation;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	complete_during_prepare = 1;
+	connection = new_connection();
+	connection->transaction = &transaction_tokens[0];
+	bindings = new_integer_binding(60);
+	slot = ib_cancel_slot_new(&error);
+	check(bindings != NULL && slot != NULL && error == NULL,
+		"transient prepare unpublication setup failed");
+	ib_error_free(error);
+	if (bindings == NULL || slot == NULL) {
+		ib_bindings_free(bindings);
+		ib_cancel_slot_free(slot);
+		free(connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	check(generation != 0U && error == NULL,
+		"transient prepare unpublication slot begin failed");
+	ib_error_free(error);
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = (isc_stmt_handle) &statement_tokens[1];
+	cursor = (ib_connection_query)(connection, query, sizeof(query) - 1U,
+		bindings, 0, slot, generation, &error);
+	check(cursor == NULL && error != NULL &&
+		strstr(error, "cannot be unpublished") != NULL,
+		"successful prepare unpublication failure was not returned");
+	check(sql_info_calls == 0 && describe_calls == 0 && user_execute2_calls == 0,
+		"transient prepare unpublication failure continued into describe or execute");
+	check_cancel_complete("transient prepare unpublication failure left its slot active");
+	ib_error_free(error);
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	ib_cancel_slot_free(slot);
+	ib_bindings_free(bindings);
+	free(connection);
+}
+
 static void test_transient_catalog_cleanup_failure_propagates(void)
 {
 	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
@@ -3133,17 +3213,20 @@ static void test_cancel_overlap_transient_execute(void)
 static void test_cancel_distributed_participant_execute_and_recover(void)
 {
 	static const char query[] = "INSERT INTO T (ID) VALUES (?)";
+	static const char recovery_query[] = "INSERT INTO T (ID) VALUES (?)";
 	ib_connection parent;
 	ib_connection *parents[1];
 	ib_distributed_transaction distributed;
 	ib_transaction participant;
 	ib_bindings *bindings;
+	ib_bindings *recovery_bindings;
 	ib_cancel_slot *slot;
 	struct overlap_operation_call operation;
 	struct overlap_cancel_call cancel;
 	char database;
 	char *error = NULL;
 	uint64_t generation;
+	int64_t rows_affected;
 
 	reset_mocks();
 	memset(&parent, 0, sizeof(parent));
@@ -3196,15 +3279,39 @@ static void test_cancel_distributed_participant_execute_and_recover(void)
 		"distributed participant execution did not return cancellation");
 	check(parent.broken == 0 && participant.view.broken == 0,
 		"distributed participant cancellation poisoned its parent attachment");
+	check(persisted_execute_value == 0 && distributed.handle == &transaction_tokens[0] &&
+		participant.view.transaction == distributed.handle,
+		"distributed participant cancellation changed persisted state or consumed the coordinator");
 	ib_error_free(operation.error);
 	ib_error_free(cancel.error);
 	expected_cancel_slot = NULL;
 	expected_cancel_generation = 0U;
 	expected_cancel_statement = NULL;
 	overlap_reset(OVERLAP_NONE, 0, 0);
-	check(ib_distributed_rollback(&distributed, &error) == 0 && error == NULL &&
-		distributed.handle == NULL && participant.view.transaction == NULL,
-		"distributed participant cancellation did not permit rollback recovery");
+	recovery_bindings = new_integer_binding(640);
+	rows_affected = -1;
+	error = NULL;
+	check(recovery_bindings != NULL &&
+		ib_transaction_exec(&participant, recovery_query, sizeof(recovery_query) - 1U,
+			recovery_bindings, &rows_affected, 0, NULL, 0U, &error) == 0 &&
+		error == NULL && rows_affected == 1 && execute_calls == 1 &&
+		persisted_execute_value == 640 && distributed.handle == &transaction_tokens[0] &&
+		participant.view.transaction == distributed.handle,
+		"distributed participant did not execute the exact recovery write after cancellation");
+	ib_error_free(error);
+	ib_bindings_free(recovery_bindings);
+	error = NULL;
+	check(ib_distributed_prepare(&distributed, "round-2", sizeof("round-2") - 1U,
+		&error) == 0 && error == NULL && prepare_transaction_calls == 1 &&
+		distributed.prepared,
+		"distributed coordinator was not usable for prepare after participant cancellation");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_distributed_commit(&distributed, &error) == 0 && error == NULL &&
+		commit_calls == 1 && distributed.handle == NULL &&
+		participant.view.transaction == NULL && parent.broken == 0 &&
+		participant.view.broken == 0,
+		"distributed coordinator did not commit the recovered exact state");
 	ib_error_free(error);
 	ib_bindings_free(bindings);
 	ib_cancel_slot_free(slot);
@@ -3369,6 +3476,7 @@ int main(void)
 	test_cancel_publication_and_cleanup_order();
 	test_transient_catalog_fallback_and_cancelled_propagation();
 	test_cancel_overlap_transient_prepare();
+	test_unpublish_failure_aborts_transient_prepare();
 	test_transient_catalog_cleanup_failure_propagates();
 	test_cancel_overlap_transient_execute();
 	test_cancel_distributed_participant_execute_and_recover();

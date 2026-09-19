@@ -55,6 +55,8 @@ func TestExecContextCancellationWhileNativeGateWaitsDoesNotEnterNativeCall(t *te
 func TestRootExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	cancelRelease := make(chan struct{})
+	slot := &fakeCancelSlot{cancelStarted: make(chan struct{}), cancelRelease: cancelRelease}
 	nativeErr := &Error{
 		Operation:  "execute statement",
 		NativeCode: nativeCancelledCode,
@@ -62,8 +64,12 @@ func TestRootExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 	}
 	connection := &conn{
 		native: &nativeConnection{
-			brokenOverride: func() bool { return false },
-			execOverride: func(string, []argument, bool) (int64, error) {
+			brokenOverride:     func() bool { return false },
+			cancelSlotOverride: slot,
+			execContextOverride: func(_ string, _ []argument, _ bool, operation *nativeCancelOperation) (int64, error) {
+				slot.mu.Lock()
+				slot.watcherDone = operation.watcherDone
+				slot.mu.Unlock()
 				close(entered)
 				<-release
 				return 0, nativeErr
@@ -86,11 +92,14 @@ func TestRootExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 		connection.mu.Unlock()
 	}()
 	cancel()
+	waitForTestSignal(t, slot.cancelStarted,
+		"root operation watcher did not request native cancellation")
 	select {
 	case <-lockAcquired:
 		t.Fatal("root operation released its connection lock before native completion")
 	case <-time.After(20 * time.Millisecond):
 	}
+	close(cancelRelease)
 	close(release)
 
 	select {
@@ -108,6 +117,11 @@ func TestRootExecContextCancellationWhileOwningConnectionLock(t *testing.T) {
 	case <-lockAcquired:
 	case <-time.After(time.Second):
 		t.Fatal("root operation did not release its connection lock")
+	}
+	_, cancelCalls, closeCalls, _, beforeWatch := slot.snapshot()
+	if cancelCalls != 1 || closeCalls != 1 || beforeWatch {
+		t.Fatalf("root cancellation slot lifecycle = cancel %d close %d beforeWatch=%v; want 1, 1, false",
+			cancelCalls, closeCalls, beforeWatch)
 	}
 }
 

@@ -157,6 +157,8 @@ type nativeConnection struct {
 	dropOverride              func() error
 	dropConsumedOverride      bool
 	execOverride              func(string, []argument, bool) (int64, error)
+	execContextOverride       func(string, []argument, bool, *nativeCancelOperation) (int64, error)
+	cancelSlotOverride        nativeCancelSlotBackend
 	prepareOverride           func(string) (*nativeStatement, error)
 	databaseInfoOverride      func(byte) ([]byte, error)
 	clientVersionOverride     func() (string, error)
@@ -167,6 +169,8 @@ type nativeConnection struct {
 type nativeTransaction struct {
 	ptr                     *C.ib_transaction
 	execOverride            func(string, []argument, bool) (int64, error)
+	execContextOverride     func(string, []argument, bool, *nativeCancelOperation) (int64, error)
+	cancelSlotOverride      nativeCancelSlotBackend
 	freeOverride            func()
 	commitOverride          func() error
 	rollbackOverride        func() error
@@ -546,7 +550,7 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 	if t != nil && t.execOverride != nil {
 		return t.execOverride(query, append([]argument(nil), args...), allowArrays)
 	}
-	if t == nil || t.ptr == nil {
+	if t == nil || (t.ptr == nil && t.execContextOverride == nil) {
 		return 0, errors.New("interbase: native transaction is unavailable")
 	}
 	bindings, err := newNativeBindings(args)
@@ -556,9 +560,15 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 	defer C.ib_bindings_free(bindings)
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
-	operation, err := newNativeCancelOperation(ctx)
+	operation, err := newNativeCancelOperationWithSlot(ctx, t.cancelSlotOverride)
 	if err != nil {
 		return 0, err
+	}
+	if t.execContextOverride != nil {
+		affected, overrideErr := t.execContextOverride(query,
+			append([]argument(nil), args...), allowArrays, operation)
+		operation.finish()
+		return affected, overrideErr
 	}
 	var affected C.int64_t
 	var errorPointer *C.char
@@ -1385,7 +1395,7 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 	if c != nil && c.execOverride != nil {
 		return c.execOverride(query, append([]argument(nil), args...), allowArrays)
 	}
-	if c == nil || c.ptr == nil {
+	if c == nil || (c.ptr == nil && c.execContextOverride == nil) {
 		return 0, errors.New("native connection is unavailable")
 	}
 
@@ -1404,9 +1414,15 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 
 	queryPointer := C.CString(query)
 	defer C.free(unsafe.Pointer(queryPointer))
-	operation, err := newNativeCancelOperation(ctx)
+	operation, err := newNativeCancelOperationWithSlot(ctx, c.cancelSlotOverride)
 	if err != nil {
 		return 0, err
+	}
+	if c.execContextOverride != nil {
+		affected, overrideErr := c.execContextOverride(query,
+			append([]argument(nil), args...), allowArrays, operation)
+		operation.finish()
+		return affected, overrideErr
 	}
 	var affected C.int64_t
 	var execError *C.char

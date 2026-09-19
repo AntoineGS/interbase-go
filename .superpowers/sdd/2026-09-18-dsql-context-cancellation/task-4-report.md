@@ -209,3 +209,61 @@ INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
 ./scripts/test-integration-docker.sh --native-lifecycle \
   -run '^TestNativeLifecycleRace$' -v                       PASS
 ```
+
+## Fix round 2
+
+### RED
+
+The new native regression was run before changing transient preparation. The
+successful native prepare was incorrectly allowed to continue after slot
+unpublication had failed:
+
+```text
+native prepared test failed: successful prepare unpublication failure was not returned
+native prepared test failed: transient prepare unpublication failure continued into describe or execute
+```
+
+The root/direct lock regressions were also changed from the old pre-operation
+`execOverride` seam to an override below a real `nativeCancelOperation`; their
+assertions wait for the production watcher to invoke the cancellation slot
+while the owning connection mutex is deliberately held.
+
+### GREEN
+
+- `ib_cursor_prepare_statement` now preserves unpublication diagnostics and
+  returns failure even when `isc_dsql_prepare` succeeded. Its callers stop
+  before statement-type inspection, describe, or execute; native and protocol
+  diagnostics remain appended when both fail.
+- Added a context-aware native exec test seam that is entered only after slot
+  allocation, generation begin, and watcher startup. The root and direct
+  cancellation tests now prove one slot cancellation call and watcher-ordered
+  close while each operation still owns its connection mutex.
+- Extended distributed participant recovery coverage: a canceled participant
+  performs a subsequent write with the exact expected persisted value, then
+  the same coordinator completes distributed prepare and commit without
+  poisoning either attachment.
+
+Fresh round-2 verification:
+
+```text
+LD_LIBRARY_PATH=/tmp/opencode \
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+go test -race . ./internal/nativegate \
+  -run 'Test(RootExecContextCancellationWhileOwningConnectionLock|DirectExecContextCancellationWhileOwningConnectionLock)$' \
+  -count=50 -timeout=180s                                      PASS
+
+LD_LIBRARY_PATH=/tmp/opencode \
+INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
+INTERBASE_LIB=/tmp/opencode make test-native                      PASS
+
+LD_LIBRARY_PATH=/tmp/opencode \
+CGO_CFLAGS=-I/tmp/opencode/interbase-parity-include \
+CGO_LDFLAGS='-L/tmp/opencode -Wl,-rpath,/tmp/opencode -lgds' \
+go test . -run 'Distributed' -count=1 -timeout=120s              PASS
+
+IMAGE=interbase-go-parity-test:local \
+INTERBASE_INCLUDE=/tmp/opencode/interbase-parity-include \
+./scripts/test-integration-docker.sh \
+  -run '^TestDistributedTransactionCommitsAcrossAttachments$' -v PASS
+```
