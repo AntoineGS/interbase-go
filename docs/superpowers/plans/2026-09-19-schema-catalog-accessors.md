@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- The spec's stated baseline is commit `fbcbfb7` on `main`; the current branch head is `d859a5c`, which adds only the spec and its revision. Branch from `main` as it stands.
+- The spec's stated baseline is commit `fbcbfb7` on `main`. Every commit since is documentation only — the spec, its revision, and this plan — and no production file differs from `fbcbfb7`. Branch from `main` as it stands.
 - The additions "are pure Go value methods on existing types. They issue no query, mutate nothing, and add no import beyond what `schema/ddl.go` already uses."
 - "`schema` remains read-only and free of any cgo dependency." The `schema` unit suite must keep building and passing with `CGO_ENABLED=0`.
 - Excluded: "Any change to a catalog query, to `Catalog` methods, or to existing DDL output." No existing signature, output, or error may change.
@@ -853,6 +853,14 @@ ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
 
 Declaring an external function records metadata only; no module is loaded and no UDF is invoked, exactly as for the declaration already on line 258.
 
+Distinguish two failure modes here, because they are easy to confuse and call
+for opposite responses. If the server *rejects this DDL*, `createSchemaObjects`
+fails and the whole pre-existing `TestSchemaExtendedCatalogFamiliesAndDDL` goes
+red rather than only the new assertions — that is a fixture problem, so fix the
+declaration. The "revisit the column choice, never add a +/-1" instruction in
+Step 3 applies only when the DDL is accepted and `CSTRING(80)` still renders
+with the wrong length.
+
 - [ ] **Step 2: Assert the trigger event**
 
 After the existing trigger DDL assertion block that ends at `integration/schema_test.go:370`, add:
@@ -873,13 +881,20 @@ After the existing external-function block that ends at `integration/schema_test
 	if returnType, err := function.ReturnType(); err != nil || returnType != "INTEGER" {
 		t.Fatalf("external function ReturnType = (%q, %v), want (\"INTEGER\", nil)", returnType, err)
 	}
+	checkedArgument := false
 	for _, argument := range function.Arguments {
 		if !argument.Position.Valid || argument.Position.Int64 != 0 {
 			continue
 		}
+		checkedArgument = true
 		if sqlType, err := argument.SQLType(); err != nil || sqlType != "INTEGER" {
 			t.Fatalf("external function argument 0 SQLType = (%q, %v), want (\"INTEGER\", nil)", sqlType, err)
 		}
+	}
+	// Without this the loop passes vacuously when the catalog places no
+	// argument at position 0, and the assertion above never runs.
+	if !checkedArgument {
+		t.Fatalf("external function arguments = %#v, want one at position 0", function.Arguments)
 	}
 
 	cstringFunction, err := catalog.Function(ctx, "GO_SCHEMA_EXT_CSTRING")
