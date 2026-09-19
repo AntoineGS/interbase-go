@@ -456,7 +456,11 @@ configure_requested_deadlines() {
       EFFECTIVE_REQUESTED_TEST_TIMEOUT="${minimum_go_timeout_seconds}s"
       REQUESTED_GO_TIMEOUT_SECONDS="${minimum_go_timeout_seconds}"
     fi
-    minimum_command_seconds=$((REQUESTED_GO_TIMEOUT_SECONDS + REQUESTED_COMMAND_GRACE_SECONDS))
+    if ((REQUESTED_GO_TIMEOUT_SECONDS == 0)); then
+      minimum_command_seconds=$((minimum_go_timeout_seconds + REQUESTED_COMMAND_GRACE_SECONDS))
+    else
+      minimum_command_seconds=$((REQUESTED_GO_TIMEOUT_SECONDS + REQUESTED_COMMAND_GRACE_SECONDS))
+    fi
     REQUESTED_COMMAND_DURATION="${minimum_command_seconds}s"
   fi
 

@@ -117,6 +117,25 @@ teardown() {
   [[ "$timeout_log" == *" 660s "*"/integration.test "* ]]
 }
 
+@test "uses workload budgets for timeout zero external deadlines" {
+  run "$RUNNER" --cancellation --cancellation-iterations=1 -timeout=0 -run '^TestLiveCancellationRaces$'
+  [ "$status" -eq 0 ]
+  [[ "$(<"$FAKE_TIMEOUT_LOG")" == *" 300s "*"/integration.test "* ]]
+
+  run "$RUNNER" --soak --soak-duration=120s -timeout=0 -run '^TestSoakConcurrentWorkload$'
+  [ "$status" -eq 0 ]
+  [[ "$(<"$FAKE_TIMEOUT_LOG")" == *" 240s "*"/integration.test "* ]]
+
+  : > "$FAKE_DOCKER_LOG"
+  run "$RUNNER" --soak --soak-duration=120s --cancellation --cancellation-iterations=4 -timeout=899s -run '^TestSoakConcurrentWorkload$'
+  [ "$status" -eq 2 ]
+  [ ! -s "$FAKE_DOCKER_LOG" ]
+
+  run "$RUNNER" --soak --soak-duration=120s --cancellation --cancellation-iterations=4 -timeout=0 -run '^TestSoakConcurrentWorkload$'
+  [ "$status" -eq 0 ]
+  [[ "$(<"$FAKE_TIMEOUT_LOG")" == *" 960s "*"/integration.test "* ]]
+}
+
 @test "passes performance opt-in only to the requested test command" {
   run "$RUNNER" --performance -run '^TestRead$'
 

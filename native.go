@@ -628,6 +628,7 @@ func (t *nativeTransaction) exec(ctx context.Context, query string, args []argum
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
 		return 0, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
+	nativeDSQLCompletionHook()
 	operation.finish()
 	return int64(affected), nil
 }
@@ -1143,6 +1144,7 @@ func (s *nativeStatement) exec(ctx context.Context, args []argument) (int64, err
 	var errorPointer *C.char
 	result := C.ib_statement_exec(s.ptr, bindings, operation.nativeCancelSlot(),
 		operation.nativeCancelGeneration(), &affected, &errorPointer)
+	nativeDSQLCompletionHook()
 	operation.finish()
 	if result != 0 {
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(errorPointer))
@@ -1521,6 +1523,7 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 		primaryErr, cleanupErr := splitNativeCleanupDiagnostic(takeNativeError(execError))
 		return 0, operation.wrapExecutionError(primaryErr, cleanupErr)
 	}
+	nativeDSQLCompletionHook()
 	operation.finish()
 	return int64(affected), nil
 }

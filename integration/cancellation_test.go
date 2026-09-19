@@ -283,6 +283,10 @@ func runCompletionWinningRace(t *testing.T, db, verifier *sql.DB) {
 	t.Helper()
 	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), cancellationResultLimit)
 	defer verifyCancel()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	removeHook := interbase.SetNativeDSQLCompletionTestHook(entered, release)
+	t.Cleanup(removeHook)
 	before := queryCancellationCount(t, verifyCtx, verifier,
 		"SELECT GEN_ID(GO_CANCEL_RACE_GENERATOR, 0) FROM RDB$DATABASE")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -292,10 +296,14 @@ func runCompletionWinningRace(t *testing.T, db, verifier *sql.DB) {
 		_, err := db.ExecContext(ctx, "EXECUTE PROCEDURE GO_CANCEL_RACE_COMPLETE")
 		result <- err
 	}()
-	// The non-transactional generator confirms that this DSQL operation entered
-	// native execution before the competing context cancellation is requested.
-	waitForCancellationRaceMarker(t, verifyCtx, verifier, before+1)
+	select {
+	case <-entered:
+	case <-time.After(cancellationResultLimit):
+		t.Fatal("completion-winning race did not reach the post-DSQL boundary")
+	}
 	cancel()
+	close(release)
+	removeHook()
 	select {
 	case err := <-result:
 		if err != nil {
