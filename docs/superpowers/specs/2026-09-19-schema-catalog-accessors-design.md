@@ -71,6 +71,40 @@ not join `RDB$CHARACTER_SETS` the way `extendedDomainQuery` does
 what the package already reads. It also carries no segment length and no
 dimensions column.
 
+### Live catalog measurement
+
+`RDB$FUNCTION_ARGUMENTS` was read through a read-only cursor on three
+production InterBase 15.1 databases, 357 function arguments in total, grouped by
+`RDB$FIELD_TYPE`:
+
+| Field type | Count |
+| --- | --- |
+| 40 (CSTRING) | 166 |
+| 8 (INTEGER) | 97 |
+| 35 (TIMESTAMP) | 51 |
+| 27 (DOUBLE) | 26 |
+| 261 (BLOB) | 16 |
+| 14 (CHAR) | 1 |
+| 37 (VARCHAR) | 0 |
+
+Three results govern the design below:
+
+- `RDB$CHARACTER_LENGTH` is populated for **zero** of the 357 rows, across every
+  field type and all three databases. It is not merely usually NULL; on these
+  catalogs it is never set for a function argument.
+- `RDB$FIELD_LENGTH` is populated throughout: 4 for integers, 8 for doubles and
+  timestamps, 0 for BLOBs, and 2 to 32000 for CSTRING arguments.
+- CSTRING is the dominant character type for arguments — 166 of 357, against one
+  CHAR and no VARCHAR.
+
+Observed CSTRING lengths include `F_LEFT` at 254, `F_BIGSTRINGREPLACE` at 32000,
+`F_BIGLRTRIM` at 1024, and `F_CRLF` at 3.
+
+The sample's limits are stated plainly: three databases from one organisation,
+all on InterBase 15.1, all heavy users of the standard public UDF libraries.
+This is evidence about the target workload, not a general claim about InterBase
+deployments.
+
 `Function.ReturnArgument` (`catalog_extended.go:124`) holds the *argument
 position* of the return value, and `Arguments` is ordered by
 `RDB$ARGUMENT_POSITION` (`catalog_extended.go:270`). The unit fixture's
@@ -168,28 +202,51 @@ The mapping is `Name`, `FieldType`, `FieldSubType`, `FieldScale`,
 `FieldLength`, `FieldPrecision`, `CharacterLength`, and `CharacterSetID`; the
 remaining `Domain` fields stay zero. No second type switch exists.
 
-Two consequences are stated rather than papered over: `RDB$FUNCTION_ARGUMENTS`
-carries no segment length in this projection, so a BLOB argument renders as
-`BLOB SUB_TYPE ...` without `SEGMENT SIZE`; and it carries no dimensions, so the
-array guard at `ddl.go:214-216` cannot fire for an argument.
+**BLOB arguments** (16 of the 357 measured) render through the delegated path as
+`BLOB`, or as `BLOB SUB_TYPE <name>` / `BLOB SUB_TYPE <n>` when `FieldSubType`
+is valid (`ddl.go:301-309`). The BLOB branch never reads a length, so the
+observed `RDB$FIELD_LENGTH` of 0 is harmless. Two omissions follow from the
+projection and are stated rather than papered over: `RDB$FUNCTION_ARGUMENTS`
+carries no segment length, so `SEGMENT SIZE` is never emitted (`ddl.go:310-312`
+cannot fire); and it carries no dimensions, so the array guard at
+`ddl.go:214-216` cannot fire either. A BLOB argument is subject to the same
+character-set refusal as CHAR and VARCHAR (`ddl.go:324`), so a text BLOB
+argument carrying a non-zero `CharacterSetID` returns `ErrUnsupportedDDL`.
 
 **CSTRING.** `sqlTypeParts` rejects code 40 by design (`ddl.go:315-316`), so
-`SQLType` handles it before delegating, and only it:
+`SQLType` handles it before delegating, and only it. CSTRING is the common case
+for UDF arguments in the measured workload — 166 of 357 — which is what
+justifies giving it a first-class branch, and with it the one code move this
+design specifies, instead of leaving the dominant argument type in the
+`ErrUnsupportedDDL` bucket.
 
-- the length is `CharacterLength` when valid and positive, otherwise
-  `FieldLength` when valid and positive, otherwise `ErrUnsupportedDDL`. This is
-  not a byte-for-character substitution of the kind the domain renderer refuses:
-  the InterBase `CSTRING(n)` grammar declares a byte length, and the character-set
-  guard below has already established that any rendered argument uses the default
-  single-byte character set;
-- the character-set guard is applied through the same helper as the delegated
+- The rendered length is `FieldLength` verbatim, never adjusted. `CharacterLength`
+  is not consulted: it is populated for none of the 357 measured arguments, and
+  even if it were, the InterBase `CSTRING(n)` grammar declares a byte length, so
+  `FieldLength` is the correct source rather than a fallback. A defensive
+  `CharacterLength` branch is deliberately *not* specified, because an unreachable
+  branch invites a test for a case that cannot fire.
+- `FieldLength` invalid or non-positive returns `ErrUnsupportedDDL`.
+- The character-set guard is applied through the same helper as the delegated
   path (below).
 
-The contract is that the rendered length equals the declared length. The live
-test named in *Testing Strategy* is the acceptance gate for that contract on the
-tested stack; if it fails, the fix is to change which catalog column the rule
-prefers and to update this section and the unit table, never to introduce a
-silent `±1` adjustment.
+The verbatim rule rests on the canonical declarations behind the observed
+values. `F_LEFT` at 254, `F_BIGSTRINGREPLACE` at 32000 and `F_BIGLRTRIM` at 1024
+are published UDF-library symbols whose declarations are `CSTRING(254)`,
+`CSTRING(32000)` and `CSTRING(1024)`; if `RDB$FIELD_LENGTH` included the NUL
+terminator they would read 255, 32001 and 1025, which would require declared
+lengths of 253, 31999 and 1023 — values no library declares. `F_CRLF` at 3 is
+consistent with either reading (a declared 3, or a declared 2 plus a terminator)
+and so discriminates nothing; it is not a counterexample. Three independent
+discriminating observations agree and none dissents, so the catalog stores the
+declared length unadjusted.
+
+That inference is drawn from known declarations rather than from a
+declare-then-read observation, which is exactly what the live acceptance test in
+*Testing Strategy* supplies. The contract remains that the rendered length
+equals the declared length; if the live test fails, the fix is to revisit which
+catalog column the rule reads and to update this section and the unit table,
+never to introduce a silent `±1` adjustment.
 
 **Character set.** The name is unavailable, as established above. The renderer
 therefore never emits a character-set suffix for an argument, and it refuses to
@@ -198,6 +255,21 @@ returning `ErrUnsupportedDDL` with feature text `character set name is
 unavailable`. That is the identical rule the domain renderer already applies
 when a name is missing (`ddl.go:331-333`), so a `CHAR`, `VARCHAR`, or `BLOB`
 argument reaches it through the delegated path with no new code at all.
+
+**CHAR and VARCHAR arguments.** A second consequence of the measurement must be
+stated because it is not a corner case of the design but its normal behavior:
+`sqlTypeParts` requires `CharacterLength` for codes 14 and 37 and rejects a NULL
+one (`ddl.go:287-293`), and `RDB$CHARACTER_LENGTH` is populated for none of the
+357 measured arguments. On these catalogs every CHAR and VARCHAR argument
+therefore returns `ErrUnsupportedDDL`, whatever its character set. The measured
+exposure is one argument in 357.
+
+Substituting `FieldLength` for those two codes would be provable *only* where
+the character-set guard has already established a single-byte encoding, and the
+guard treats a NULL `CharacterSetID` as default without evidence that a NULL id
+really means NONE for a function argument — a question this measurement did not
+ask. The refusal therefore stands, and the substitution is deferred behind a
+charset-id measurement rather than adopted on the strength of a byte count.
 
 To apply the same rule in the new `CSTRING` branch without a second copy, the
 guard at `ddl.go:325-333` is **moved** into
@@ -213,10 +285,13 @@ move, not a duplicate: one body, two call sites.
 
 Joining `RDB$CHARACTER_SETS` into `functionArgumentsQuery` and adding a
 `CharacterSetName` field would make the suffix renderable, and it remains the
-obvious strictly-additive follow-up. It is out of scope here because it changes
-an existing query, an existing struct, and the unit fixture for a case a plain
-`CSTRING` or `INTEGER` declaration does not reach, and the refusal above is
-correct until evidence shows that path is common.
+obvious strictly-additive follow-up. It stays deferred: the measurement shows
+the refusal reaches one CHAR argument and no VARCHAR argument out of 357, so the
+path is rare in the target workload, and the change would touch an existing
+query, an existing struct, and the unit fixture to serve it. The follow-up is
+named, not scheduled; reopening it wants either a workload where the refusal
+bites or the charset-id measurement that the CHAR/VARCHAR question above also
+needs.
 
 **Errors.** When the delegated `sqlTypeParts` call fails, `SQLType` re-targets
 the error rather than nesting it: if `errors.As` yields an
@@ -283,12 +358,18 @@ complete `Trigger`.
 
 `FunctionArgument.SQLType`, one table:
 
-- `INTEGER`; `NUMERIC(9, 2)` via subtype and scale; `VARCHAR(20)` with a valid
-  `CharacterLength`; `CSTRING(80)` from `FieldLength` with `CharacterLength`
-  NULL; `CSTRING(80)` from a valid `CharacterLength`; `BLOB SUB_TYPE TEXT`;
-- unsupported: NULL `FieldType`; unknown field type; `9` (QUAD); `VARCHAR` with
-  NULL `CharacterLength`; `VARCHAR` with `CharacterSetID = 4`; `CSTRING` with
-  `CharacterSetID = 4`; `CSTRING` with NULL and with zero `FieldLength`.
+- rendered: `INTEGER`; `NUMERIC(9, 2)` via subtype and scale; `CSTRING(80)` from
+  `FieldLength` with `CharacterLength` NULL, which is the shape every measured
+  CSTRING row has; `CSTRING(32000)` and `CSTRING(3)`, pinning the verbatim length
+  rule at the observed extremes; `BLOB` with no subtype and `BLOB SUB_TYPE TEXT`,
+  both with `FieldLength = 0` as measured;
+- unsupported: NULL `FieldType`; unknown field type; `9` (QUAD); `CSTRING` with
+  NULL and with zero `FieldLength`; `CSTRING`, `CHAR` and `BLOB` with
+  `CharacterSetID = 4`; and `CHAR` with NULL `CharacterLength`, which the
+  measurement shows is the real-world CHAR case rather than an invented one.
+
+No case renders a CSTRING from `CharacterLength`: that branch is not specified,
+so there is nothing to test.
 
 One case additionally asserts through `errors.As` that the returned
 `*UnsupportedDDLError` has `Object == "function argument"` and the argument's
@@ -349,5 +430,7 @@ database-level and multi-event forms, that `FunctionArgument.SQLType` and
 `Function.ReturnType` render external-argument declarations, that these render
 no character-set suffix because `RDB$FUNCTION_ARGUMENTS` supplies no
 character-set name and refuse to render an argument declared under a
-non-default character set, and that unsupported metadata continues to wrap
-`ErrUnsupportedDDL`.
+non-default character set, that `CSTRING` lengths come from
+`RDB$FIELD_LENGTH` unadjusted while `CHAR` and `VARCHAR` arguments are not
+renderable because the catalog supplies no character length for them, and that
+unsupported metadata continues to wrap `ErrUnsupportedDDL`.
