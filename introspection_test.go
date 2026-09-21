@@ -235,3 +235,99 @@ func TestConnPlanOnClosedConnectionReturnsErrBadConn(t *testing.T) {
 		t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
 	}
 }
+
+type notInterBaseTestConn struct{}
+
+func (notInterBaseTestConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("test connection does not prepare")
+}
+
+func (notInterBaseTestConn) Close() error { return nil }
+
+func (notInterBaseTestConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("test connection does not begin transactions")
+}
+
+func TestPooledDiagnosticsDecodesEveryFieldForEachDialect(t *testing.T) {
+	for _, dialect := range []byte{1, 3} {
+		connection := &conn{native: introspectionTestNative(dialect)}
+		db := openDatabaseSQLTestDB(t, connection)
+		pooled, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("dialect %d: DB.Conn() error = %v", dialect, err)
+		}
+		got, err := Diagnostics(context.Background(), pooled)
+		if err != nil {
+			t.Fatalf("dialect %d: Diagnostics() error = %v", dialect, err)
+		}
+		want := introspectionWantDiagnostics(int64(dialect))
+		if got != want {
+			t.Fatalf("dialect %d: Diagnostics() = %#v, want %#v", dialect, got, want)
+		}
+		if err := pooled.Close(); err != nil {
+			t.Fatalf("dialect %d: sql.Conn.Close() error = %v", dialect, err)
+		}
+	}
+}
+
+func TestPooledDiagnosticsMatchesAttachmentDiagnostics(t *testing.T) {
+	attachment := &Attachment{conn: &conn{native: introspectionTestNative(3)}}
+	fromAttachment, err := attachment.Diagnostics(context.Background())
+	if err != nil {
+		t.Fatalf("Attachment.Diagnostics() error = %v", err)
+	}
+	db := openDatabaseSQLTestDB(t, &conn{native: introspectionTestNative(3)})
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	defer pooled.Close()
+	fromPool, err := Diagnostics(context.Background(), pooled)
+	if err != nil {
+		t.Fatalf("Diagnostics() error = %v", err)
+	}
+	if fromAttachment != fromPool {
+		t.Fatalf("Attachment.Diagnostics() = %#v, pooled Diagnostics() = %#v; the shared implementation drifted",
+			fromAttachment, fromPool)
+	}
+}
+
+func TestPooledDiagnosticsOnClosedDriverConnectionReturnsErrBadConn(t *testing.T) {
+	infoCalls := 0
+	native := introspectionTestNative(3)
+	responder := introspectionInfoResponder(3)
+	native.databaseInfoOverride = func(code byte) ([]byte, error) {
+		infoCalls++
+		return responder(code)
+	}
+	connection := &conn{native: native}
+	db := openDatabaseSQLTestDB(t, connection)
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatalf("(*conn).Close() error = %v", err)
+	}
+	if _, err := Diagnostics(context.Background(), pooled); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Diagnostics() error = %v, want driver.ErrBadConn", err)
+	}
+	if infoCalls != 0 {
+		t.Fatalf("database info calls = %d, want 0", infoCalls)
+	}
+}
+
+func TestPooledDiagnosticsRejectsForeignAndNilConnections(t *testing.T) {
+	db := openDatabaseSQLTestDB(t, notInterBaseTestConn{})
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	defer pooled.Close()
+	if _, err := Diagnostics(context.Background(), pooled); !errors.Is(err, ErrNotInterBaseConn) {
+		t.Fatalf("Diagnostics() on a foreign driver connection error = %v, want ErrNotInterBaseConn", err)
+	}
+	if _, err := Diagnostics(context.Background(), nil); !errors.Is(err, ErrNotInterBaseConn) {
+		t.Fatalf("Diagnostics(nil) error = %v, want ErrNotInterBaseConn", err)
+	}
+}

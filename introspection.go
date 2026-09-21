@@ -2,10 +2,53 @@ package interbase
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
 )
+
+// Introspector is implemented by the driver connection passed to
+// (*sql.Conn).Raw. The value must not be retained beyond the callback.
+type Introspector interface {
+	Diagnostics(ctx context.Context) (DatabaseDiagnostics, error)
+	Plan(ctx context.Context, query string) (string, error)
+}
+
+var _ Introspector = (*conn)(nil)
+
+// ErrNotInterBaseConn reports a connection that does not belong to this driver.
+var ErrNotInterBaseConn = errors.New("interbase: connection is not an InterBase connection")
+
+// Diagnostics returns server, database, and linked client diagnostics for the
+// attachment behind a pooled database/sql connection, without opening a second
+// native attachment. SQLDialect is the dialect the server reports for this
+// attachment, not an echo of Config.Dialect.
+//
+// The driver error is returned unchanged. A connection that does not belong to
+// this driver, including a nil one, returns ErrNotInterBaseConn; a conn that
+// has already been closed returns sql.ErrConnDone from Raw.
+func Diagnostics(ctx context.Context, conn *sql.Conn) (DatabaseDiagnostics, error) {
+	if conn == nil {
+		return DatabaseDiagnostics{}, ErrNotInterBaseConn
+	}
+	var result DatabaseDiagnostics
+	if err := conn.Raw(func(driverConn any) error {
+		introspector, ok := driverConn.(Introspector)
+		if !ok {
+			return ErrNotInterBaseConn
+		}
+		diagnostics, err := introspector.Diagnostics(ctx)
+		if err != nil {
+			return err
+		}
+		result = diagnostics
+		return nil
+	}); err != nil {
+		return DatabaseDiagnostics{}, err
+	}
+	return result, nil
+}
 
 // Diagnostics returns server, database, and linked client diagnostics for the
 // attachment behind this connection. It is the shared implementation used by
