@@ -2,7 +2,10 @@ package interbase
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 )
 
@@ -111,5 +114,124 @@ func TestNativeStatementPlanReturnsOverrideError(t *testing.T) {
 	}
 	if _, err := statement.plan(); !errors.Is(err, planErr) {
 		t.Fatalf("(*nativeStatement).plan() error = %v, want the override error", err)
+	}
+}
+
+func TestConnPlanReturnsPlanAndClosesTheStatementExactlyOnce(t *testing.T) {
+	closeCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			planOverride:  func() (string, error) { return "PLAN (GO_COUNTRY NATURAL)", nil },
+			closeOverride: func() error { closeCalls++; return nil },
+			// The live suite is the real prepare-only proof, but it needs a
+			// server. This makes a regression fail fast in `make test`: if a
+			// later edit to (*conn).Plan ever reaches an execute path, this
+			// fires immediately instead of waiting for the Docker fixture.
+			execOverride: func([]argument) (int64, error) {
+				t.Fatal("(*conn).Plan executed the statement; it must only prepare")
+				return 0, nil
+			},
+		}, nil
+	}
+	connection := &conn{native: native}
+	plan, err := connection.Plan(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY")
+	if err != nil {
+		t.Fatalf("(*conn).Plan() error = %v", err)
+	}
+	if plan != "PLAN (GO_COUNTRY NATURAL)" {
+		t.Fatalf("(*conn).Plan() = %q, want the native plan", plan)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("statement close calls = %d, want 1", closeCalls)
+	}
+}
+
+func TestConnPlanClosesTheStatementAndJoinsBothFailures(t *testing.T) {
+	planErr := errors.New("injected plan failure")
+	closeErr := errors.New("injected close failure")
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			planOverride:  func() (string, error) { return "", planErr },
+			closeOverride: func() error { return closeErr },
+		}, nil
+	}
+	connection := &conn{native: native}
+	plan, err := connection.Plan(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY")
+	if plan != "" {
+		t.Fatalf("(*conn).Plan() = %q, want an empty plan on failure", plan)
+	}
+	if !errors.Is(err, planErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("(*conn).Plan() error = %v, want both the plan and close failures", err)
+	}
+}
+
+func TestConnPlanRejectsInvalidQueriesBeforeNativePrepare(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "NUL byte", query: "SELECT 1 FROM RDB$DATABASE\x00"},
+		{name: "oversized", query: strings.Repeat("a", math.MaxUint16+1)},
+		{name: "subscription session control", query: "SET SUBSCRIPTION MY_SUB ACTIVE"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prepareCalls := 0
+			native := introspectionTestNative(3)
+			native.prepareOverride = func(string) (*nativeStatement, error) {
+				prepareCalls++
+				return nil, errors.New("native prepare must not be reached")
+			}
+			connection := &conn{native: native}
+			if _, err := connection.Plan(context.Background(), test.query); err == nil {
+				t.Fatal("(*conn).Plan() accepted a query the pooled validator rejects")
+			}
+			if prepareCalls != 0 {
+				t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
+			}
+		})
+	}
+}
+
+func TestConnPlanInvalidatesTheConnectionWhenNativePrepareBreaksIt(t *testing.T) {
+	prepareErr := &NativeError{
+		Operation:  "prepare",
+		NativeCode: 335544721,
+		Message:    "connection lost",
+	}
+	broken := false
+	native := introspectionTestNative(3)
+	native.brokenOverride = func() bool { return broken }
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		broken = true
+		return nil, prepareErr
+	}
+	connection := &conn{native: native}
+	if _, err := connection.Plan(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY"); !errors.Is(err, prepareErr) {
+		t.Fatalf("(*conn).Plan() error = %v, want the native prepare failure", err)
+	}
+	if connection.IsValid() {
+		t.Fatal("(*conn).IsValid() is true after a native failure that broke the attachment")
+	}
+}
+
+func TestConnPlanOnClosedConnectionReturnsErrBadConn(t *testing.T) {
+	prepareCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		prepareCalls++
+		return nil, errors.New("native prepare must not be reached")
+	}
+	connection := &conn{native: native}
+	if err := connection.Close(); err != nil {
+		t.Fatalf("(*conn).Close() error = %v", err)
+	}
+	if _, err := connection.Plan(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY"); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("(*conn).Plan() error = %v, want driver.ErrBadConn", err)
+	}
+	if prepareCalls != 0 {
+		t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
 	}
 }
