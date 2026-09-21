@@ -151,6 +151,41 @@ func (c *conn) Diagnostics(ctx context.Context) (DatabaseDiagnostics, error) {
 	}, nil
 }
 
+// Plan prepares query on the attachment behind a pooled database/sql
+// connection and returns its server-generated plan. It never executes the
+// statement, for any statement type, and it opens no second native attachment.
+//
+// Native prepare uses the connection's active explicit transaction when one
+// was started with BeginTx on the same *sql.Conn and has not completed, and
+// otherwise uses a read-only transaction that begins and ends inside the
+// native prepare call. A valid DML statement may return an empty plan string,
+// and an empty plan never implies that the statement ran.
+//
+// The driver error is returned unchanged. A connection that does not belong to
+// this driver, including a nil one, returns ErrNotInterBaseConn; a conn that
+// has already been closed returns sql.ErrConnDone from Raw.
+func Plan(ctx context.Context, conn *sql.Conn, query string) (string, error) {
+	if conn == nil {
+		return "", ErrNotInterBaseConn
+	}
+	var result string
+	if err := conn.Raw(func(driverConn any) error {
+		introspector, ok := driverConn.(Introspector)
+		if !ok {
+			return ErrNotInterBaseConn
+		}
+		plan, err := introspector.Plan(ctx, query)
+		if err != nil {
+			return err
+		}
+		result = plan
+		return nil
+	}); err != nil {
+		return "", err
+	}
+	return result, nil
+}
+
 // Plan prepares query and returns its server-generated plan without executing
 // it, using the attachment behind this connection. The prepared statement is
 // never registered with the connection and is always closed before returning.

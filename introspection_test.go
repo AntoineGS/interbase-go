@@ -331,3 +331,125 @@ func TestPooledDiagnosticsRejectsForeignAndNilConnections(t *testing.T) {
 		t.Fatalf("Diagnostics(nil) error = %v, want ErrNotInterBaseConn", err)
 	}
 }
+
+func TestPooledPlanReturnsPlanAndClosesTheStatementExactlyOnce(t *testing.T) {
+	closeCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			planOverride:  func() (string, error) { return "PLAN (GO_COUNTRY NATURAL)", nil },
+			closeOverride: func() error { closeCalls++; return nil },
+		}, nil
+	}
+	db := openDatabaseSQLTestDB(t, &conn{native: native})
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	defer pooled.Close()
+	plan, err := Plan(context.Background(), pooled, "SELECT COUNTRY FROM GO_COUNTRY")
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	if plan != "PLAN (GO_COUNTRY NATURAL)" {
+		t.Fatalf("Plan() = %q, want the native plan", plan)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("statement close calls = %d, want 1", closeCalls)
+	}
+}
+
+func TestPooledPlanJoinsPlanAndCloseFailures(t *testing.T) {
+	planErr := errors.New("injected plan failure")
+	closeErr := errors.New("injected close failure")
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			planOverride:  func() (string, error) { return "", planErr },
+			closeOverride: func() error { return closeErr },
+		}, nil
+	}
+	db := openDatabaseSQLTestDB(t, &conn{native: native})
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	defer pooled.Close()
+	if _, err := Plan(context.Background(), pooled, "SELECT COUNTRY FROM GO_COUNTRY"); err == nil {
+		t.Fatal("Plan() succeeded despite a plan and close failure")
+	} else if !errors.Is(err, planErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("Plan() error = %v, want both the plan and close failures", err)
+	}
+}
+
+func TestPooledPlanRejectsInvalidQueriesBeforeNativePrepare(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{name: "NUL byte", query: "SELECT 1 FROM RDB$DATABASE\x00"},
+		{name: "oversized", query: strings.Repeat("a", math.MaxUint16+1)},
+		{name: "subscription session control", query: "SET SUBSCRIPTION MY_SUB ACTIVE"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prepareCalls := 0
+			native := introspectionTestNative(3)
+			native.prepareOverride = func(string) (*nativeStatement, error) {
+				prepareCalls++
+				return nil, errors.New("native prepare must not be reached")
+			}
+			db := openDatabaseSQLTestDB(t, &conn{native: native})
+			pooled, err := db.Conn(context.Background())
+			if err != nil {
+				t.Fatalf("DB.Conn() error = %v", err)
+			}
+			defer pooled.Close()
+			if _, err := Plan(context.Background(), pooled, test.query); err == nil {
+				t.Fatal("Plan() accepted a query the pooled validator rejects")
+			}
+			if prepareCalls != 0 {
+				t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
+			}
+		})
+	}
+}
+
+func TestPooledPlanOnClosedDriverConnectionReturnsErrBadConn(t *testing.T) {
+	prepareCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		prepareCalls++
+		return nil, errors.New("native prepare must not be reached")
+	}
+	connection := &conn{native: native}
+	db := openDatabaseSQLTestDB(t, connection)
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	if err := connection.Close(); err != nil {
+		t.Fatalf("(*conn).Close() error = %v", err)
+	}
+	if _, err := Plan(context.Background(), pooled, "SELECT COUNTRY FROM GO_COUNTRY"); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Plan() error = %v, want driver.ErrBadConn", err)
+	}
+	if prepareCalls != 0 {
+		t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
+	}
+}
+
+func TestPooledPlanRejectsForeignAndNilConnections(t *testing.T) {
+	db := openDatabaseSQLTestDB(t, notInterBaseTestConn{})
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	defer pooled.Close()
+	if _, err := Plan(context.Background(), pooled, "SELECT 1 FROM RDB$DATABASE"); !errors.Is(err, ErrNotInterBaseConn) {
+		t.Fatalf("Plan() on a foreign driver connection error = %v, want ErrNotInterBaseConn", err)
+	}
+	if _, err := Plan(context.Background(), nil, "SELECT 1 FROM RDB$DATABASE"); !errors.Is(err, ErrNotInterBaseConn) {
+		t.Fatalf("Plan(nil) error = %v, want ErrNotInterBaseConn", err)
+	}
+}
