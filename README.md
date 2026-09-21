@@ -140,23 +140,30 @@ if err != nil {
 }
 defer pooled.Close()
 
+// Imports used below: fmt.
 diagnostics, err := interbase.Diagnostics(ctx, pooled)
 if err != nil {
     return err
 }
 // diagnostics.SQLDialect is the dialect the server reports for this
 // attachment, not an echo of Config.Dialect.
+fmt.Println("dialect:", diagnostics.SQLDialect)
 
 plan, err := interbase.Plan(ctx, pooled, "SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?")
 if err != nil {
     return err
 }
+fmt.Println("plan:", plan)
 ```
 
 Both helpers run on the attachment the pool already owns. They wrap
 `(*sql.Conn).Raw` and assert the exported `Introspector` interface; a
-connection that does not belong to this driver returns `ErrNotInterBaseConn`.
-The `Introspector` value handed to a `Raw` callback must not be retained beyond
+connection that does not belong to this driver, including a nil `*sql.Conn`,
+returns `ErrNotInterBaseConn`. If the pooled connection's native attachment is
+already closed or broken, `Diagnostics` and `Plan` instead return
+`driver.ErrBadConn` from `Raw`; `database/sql` then closes the `*sql.Conn`, so
+a caller that simply returns the error already lets the pool discard it. The
+`Introspector` value handed to a `Raw` callback must not be retained beyond
 that callback.
 
 ### Explicit direct API
@@ -373,8 +380,8 @@ attachment cleanup closes any remaining native BLOB handles. The standard
 - Best-effort context cancellation for DSQL prepare, execute, and fetch calls:
   `database/sql` `PrepareContext`, direct and prepared `ExecContext`,
   `QueryContext`/`QueryRowContext` and `Rows.Next`, plus direct
-  `Transaction.Query`, `Transaction.Exec`, `Transaction.Plan`, and
-  `Cursor.Next`. The executing native result remains authoritative; the
+  `Transaction.Query`, `Transaction.Exec`, `Transaction.Plan`, `Cursor.Next`,
+  and pooled `Plan`. The executing native result remains authoritative; the
   cancellation request never replaces a result that already completed.
 - Explicit transactions with standard read-committed, repeatable-read/snapshot,
   and serializable isolation, read-only transactions, connector-level wait and
