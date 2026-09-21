@@ -626,3 +626,66 @@ func TestPooledPlanBrokenAttachmentLeavesThePool(t *testing.T) {
 		t.Fatalf("broken connection prepare calls = %d, want 1; it served a later request", minted[0].prepares)
 	}
 }
+
+func TestPooledPlanCancellationReleasesTheConnection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	primary := &NativeError{
+		Operation:  "prepare",
+		NativeCode: nativeCancelledCode,
+		Message:    "isc_cancelled",
+	}
+	slot := &fakeCancelSlot{
+		cancelStarted:    make(chan struct{}),
+		cancelAttempted:  true,
+		cancelOverlapped: true,
+	}
+	native := introspectionTestNative(3)
+	native.cancelSlotOverride = slot
+	native.prepareContextOverride = func(_ string, _ *nativeCancelOperation) (*nativeStatement, error) {
+		close(entered)
+		<-ctx.Done()
+		waitForTestSignal(t, slot.cancelStarted, "pooled Plan cancellation did not overlap the native call")
+		return nil, primary
+	}
+	connection := &conn{native: native}
+	db := openDatabaseSQLTestDB(t, connection)
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	defer pooled.Close()
+
+	result := make(chan error, 1)
+	go func() {
+		_, planErr := Plan(ctx, pooled, "SELECT COUNTRY FROM GO_COUNTRY")
+		result <- planErr
+	}()
+	waitForTestSignal(t, entered, "pooled Plan did not enter the native prepare override")
+	cancel()
+	waitForTestSignal(t, slot.cancelStarted, "pooled Plan cancellation did not run")
+
+	planErr := <-result
+	if !errors.Is(planErr, context.Canceled) {
+		t.Fatalf("Plan() error = %v, want the originating context", planErr)
+	}
+	var gotNative *NativeError
+	if !errors.As(planErr, &gotNative) || gotNative.NativeCode != nativeCancelledCode {
+		t.Fatalf("Plan() error = %v, want native cancellation diagnostics", planErr)
+	}
+	if errors.Is(planErr, driver.ErrBadConn) {
+		t.Fatal("pooled Plan cancellation was classified as driver.ErrBadConn")
+	}
+
+	// A completing call on the same *conn proves c.mu was released. The fixed
+	// test connector hands back the same driver connection, so this really is
+	// the connection the canceled Plan used.
+	got, err := Diagnostics(context.Background(), pooled)
+	if err != nil {
+		t.Fatalf("Diagnostics() after a canceled Plan error = %v", err)
+	}
+	if want := introspectionWantDiagnostics(3); got != want {
+		t.Fatalf("Diagnostics() = %#v, want %#v", got, want)
+	}
+}
