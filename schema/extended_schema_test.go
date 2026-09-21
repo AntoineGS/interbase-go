@@ -758,3 +758,84 @@ func TestCharacterSetClauseSharesOneGuardBody(t *testing.T) {
 		t.Fatalf("unsupported error = %#v, want caller-supplied object, name, and unavailable-name feature", unsupported)
 	}
 }
+
+func TestTriggerEventExportsDecodedCatalogEvent(t *testing.T) {
+	rendered := []struct {
+		name        string
+		triggerType int64
+		want        string
+	}{
+		{name: "before insert", triggerType: 1, want: "BEFORE INSERT"},
+		{name: "after insert", triggerType: 2, want: "AFTER INSERT"},
+		{name: "multi event", triggerType: 17, want: "BEFORE INSERT OR UPDATE"},
+		{name: "database connect", triggerType: 1 << 13, want: "ON CONNECT"},
+		{name: "transaction rollback", triggerType: (1 << 13) + 4, want: "ON TRANSACTION ROLLBACK"},
+	}
+	for _, test := range rendered {
+		t.Run(test.name, func(t *testing.T) {
+			trigger := Trigger{Name: "EVENT_TRIGGER", TriggerType: sql.NullInt64{Int64: test.triggerType, Valid: true}}
+			got, err := trigger.Event()
+			if err != nil || got != test.want {
+				t.Fatalf("Event = (%q, %v), want (%q, nil)", got, err, test.want)
+			}
+		})
+	}
+
+	unsupported := []struct {
+		name    string
+		trigger Trigger
+	}{
+		{name: "null trigger type", trigger: Trigger{Name: "EVENT_TRIGGER"}},
+		{name: "no operation", trigger: Trigger{Name: "EVENT_TRIGGER", TriggerType: sql.NullInt64{Int64: 0, Valid: true}}},
+		{name: "reserved bits", trigger: Trigger{Name: "EVENT_TRIGGER", TriggerType: sql.NullInt64{Int64: 1 << 7, Valid: true}}},
+		{name: "negative code", trigger: Trigger{Name: "EVENT_TRIGGER", TriggerType: sql.NullInt64{Int64: -1, Valid: true}}},
+		{name: "reserved mask two", trigger: Trigger{Name: "EVENT_TRIGGER", TriggerType: sql.NullInt64{Int64: 2 << 13, Valid: true}}},
+		{name: "reserved mask three", trigger: Trigger{Name: "EVENT_TRIGGER", TriggerType: sql.NullInt64{Int64: 3 << 13, Valid: true}}},
+	}
+	for _, test := range unsupported {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := test.trigger.Event(); !errors.Is(err, ErrUnsupportedDDL) {
+				t.Fatalf("Event error = %v, want ErrUnsupportedDDL", err)
+			}
+		})
+	}
+
+	// Drift guard: GenerateDDL and Event must keep decoding through the same
+	// body, so every single-event string Event returns has to appear verbatim
+	// in the generated statement.
+	for _, test := range rendered[:2] {
+		t.Run("ddl agrees on "+test.name, func(t *testing.T) {
+			trigger := Trigger{
+				Name:         "EVENT_TRIGGER",
+				RelationName: sql.NullString{String: "GO_CHILD", Valid: true},
+				TriggerType:  sql.NullInt64{Int64: test.triggerType, Valid: true},
+				Sequence:     sql.NullInt64{Int64: 0, Valid: true},
+				Source:       sql.NullString{String: "AS BEGIN END", Valid: true},
+			}
+			event, err := trigger.Event()
+			if err != nil {
+				t.Fatalf("Event returned error: %v", err)
+			}
+			ddl, err := trigger.GenerateDDL()
+			if err != nil {
+				t.Fatalf("GenerateDDL returned error: %v", err)
+			}
+			if !strings.Contains(ddl, event) {
+				t.Fatalf("GenerateDDL = %q, want it to contain Event result %q", ddl, event)
+			}
+		})
+	}
+
+	db := openFixtureDB(t)
+	defer db.Close()
+	triggers, err := New(db).Triggers(context.Background(), "GO_CHILD_BI")
+	if err != nil {
+		t.Fatalf("Triggers returned error: %v", err)
+	}
+	if len(triggers) != 1 {
+		t.Fatalf("triggers = %#v, want exactly one scanned trigger", triggers)
+	}
+	if got, err := triggers[0].Event(); err != nil || got != "BEFORE INSERT" {
+		t.Fatalf("scanned trigger Event = (%q, %v), want (\"BEFORE INSERT\", nil)", got, err)
+	}
+}

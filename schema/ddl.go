@@ -922,6 +922,22 @@ func triggerEvent(triggerType int64) (string, error) {
 	return prefix + " " + strings.Join(parts[1:], " OR "), nil
 }
 
+// Event returns the decoded trigger event, for example "BEFORE INSERT",
+// "BEFORE INSERT OR UPDATE", or "ON CONNECT" for a database trigger. Unlike
+// GenerateDDL it accepts a multi-event code: the event is real catalog
+// metadata even where InterBase trigger DDL cannot express it. Callers that
+// need the individual operations can split the result on " OR ".
+func (t Trigger) Event() (string, error) {
+	if !t.TriggerType.Valid {
+		return "", unsupportedDDL("trigger", t.Name, "trigger type is NULL")
+	}
+	event, err := triggerEvent(t.TriggerType.Int64)
+	if err != nil {
+		return "", unsupportedDDL("trigger", t.Name, err.Error())
+	}
+	return event, nil
+}
+
 // GenerateDDL returns an executable CREATE TRIGGER statement with the exact
 // catalog source preserved.
 func (t Trigger) GenerateDDL() (string, error) {
