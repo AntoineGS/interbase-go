@@ -1236,6 +1236,49 @@ func (p Privilege) GenerateDDL() (string, error) {
 	return builder.String(), nil
 }
 
+// SQLType renders the SQL declaration of an external function argument, for
+// example "INTEGER" or "CSTRING(80)". Every type other than CSTRING is
+// rendered by the same renderer that serves domains, so the two cannot drift.
+// No character-set suffix is ever emitted: RDB$FUNCTION_ARGUMENTS supplies no
+// character-set name, so an argument declared under a non-default character
+// set returns an error wrapping ErrUnsupportedDDL rather than a declaration
+// with the clause silently dropped.
+func (a FunctionArgument) SQLType() (string, error) {
+	if a.FieldType.Valid && a.FieldType.Int64 == fieldTypeCString {
+		// CSTRING declares a byte length, and RDB$CHARACTER_LENGTH is not
+		// populated for function arguments; RDB$FIELD_LENGTH is used verbatim.
+		if !a.FieldLength.Valid || a.FieldLength.Int64 <= 0 {
+			return "", unsupportedDDL("function argument", a.Name, "CSTRING length is unavailable")
+		}
+		// The name is always invalid here: RDB$FUNCTION_ARGUMENTS supplies no
+		// character-set name, so this call can only return "" or the refusal.
+		if _, err := characterSetClause("function argument", a.Name, sql.NullString{}, a.CharacterSetID); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("CSTRING(%d)", a.FieldLength.Int64), nil
+	}
+
+	domain := Domain{
+		Name:            a.Name,
+		FieldType:       a.FieldType,
+		FieldSubType:    a.FieldSubType,
+		FieldScale:      a.FieldScale,
+		FieldLength:     a.FieldLength,
+		FieldPrecision:  a.FieldPrecision,
+		CharacterLength: a.CharacterLength,
+		CharacterSetID:  a.CharacterSetID,
+	}
+	parts, err := domain.sqlTypeParts()
+	if err != nil {
+		var unsupported *UnsupportedDDLError
+		if errors.As(err, &unsupported) {
+			return "", unsupportedDDL("function argument", a.Name, unsupported.Feature)
+		}
+		return "", err
+	}
+	return parts.render(true), nil
+}
+
 // GenerateDDL is intentionally unsupported: external function declarations
 // can contain platform-specific calling conventions that this read-only
 // metadata projection does not fully capture.

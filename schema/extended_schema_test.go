@@ -839,3 +839,191 @@ func TestTriggerEventExportsDecodedCatalogEvent(t *testing.T) {
 		t.Fatalf("scanned trigger Event = (%q, %v), want (\"BEFORE INSERT\", nil)", got, err)
 	}
 }
+
+func TestFunctionArgumentSQLTypeRendersExternalDeclarations(t *testing.T) {
+	rendered := []struct {
+		name     string
+		argument FunctionArgument
+		want     string
+	}{
+		{
+			name: "integer",
+			argument: FunctionArgument{
+				Name:           "F_INT_0",
+				FieldType:      sql.NullInt64{Int64: fieldTypeInteger, Valid: true},
+				FieldSubType:   sql.NullInt64{Int64: 0, Valid: true},
+				FieldScale:     sql.NullInt64{Int64: 0, Valid: true},
+				FieldLength:    sql.NullInt64{Int64: 4, Valid: true},
+				FieldPrecision: sql.NullInt64{Int64: 10, Valid: true},
+			},
+			want: "INTEGER",
+		},
+		{
+			name: "numeric from subtype and scale",
+			argument: FunctionArgument{
+				Name:           "F_NUM_0",
+				FieldType:      sql.NullInt64{Int64: fieldTypeInteger, Valid: true},
+				FieldSubType:   sql.NullInt64{Int64: 1, Valid: true},
+				FieldScale:     sql.NullInt64{Int64: -2, Valid: true},
+				FieldPrecision: sql.NullInt64{Int64: 9, Valid: true},
+			},
+			want: "NUMERIC(9, 2)",
+		},
+		{
+			// The shape every measured CSTRING row has: RDB$CHARACTER_LENGTH
+			// NULL, RDB$FIELD_LENGTH carrying the declared length verbatim.
+			name: "cstring from field length",
+			argument: FunctionArgument{
+				Name:        "F_LEFT_1",
+				FieldType:   sql.NullInt64{Int64: fieldTypeCString, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 80, Valid: true},
+			},
+			want: "CSTRING(80)",
+		},
+		{
+			name: "cstring at the observed maximum",
+			argument: FunctionArgument{
+				Name:        "F_BIGSTRINGREPLACE_1",
+				FieldType:   sql.NullInt64{Int64: fieldTypeCString, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 32000, Valid: true},
+			},
+			want: "CSTRING(32000)",
+		},
+		{
+			name: "cstring at the observed minimum",
+			argument: FunctionArgument{
+				Name:        "F_CRLF_0",
+				FieldType:   sql.NullInt64{Int64: fieldTypeCString, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 3, Valid: true},
+			},
+			want: "CSTRING(3)",
+		},
+		{
+			// BLOB arguments carry RDB$FIELD_LENGTH 0; the BLOB branch reads
+			// no length, so that is harmless.
+			name: "blob without subtype",
+			argument: FunctionArgument{
+				Name:        "F_BLOB_0",
+				FieldType:   sql.NullInt64{Int64: fieldTypeBlob, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 0, Valid: true},
+			},
+			want: "BLOB",
+		},
+		{
+			name: "text blob",
+			argument: FunctionArgument{
+				Name:         "F_BLOB_1",
+				FieldType:    sql.NullInt64{Int64: fieldTypeBlob, Valid: true},
+				FieldSubType: sql.NullInt64{Int64: 1, Valid: true},
+				FieldLength:  sql.NullInt64{Int64: 0, Valid: true},
+			},
+			want: "BLOB SUB_TYPE TEXT",
+		},
+	}
+	for _, test := range rendered {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.argument.SQLType()
+			if err != nil || got != test.want {
+				t.Fatalf("SQLType = (%q, %v), want (%q, nil)", got, err, test.want)
+			}
+		})
+	}
+
+	unsupported := []struct {
+		name     string
+		argument FunctionArgument
+	}{
+		{
+			name:     "null field type",
+			argument: FunctionArgument{Name: "F_NULL_0"},
+		},
+		{
+			name:     "unknown field type",
+			argument: FunctionArgument{Name: "F_UNKNOWN_0", FieldType: sql.NullInt64{Int64: 99, Valid: true}},
+		},
+		{
+			name:     "quad internal type",
+			argument: FunctionArgument{Name: "F_QUAD_0", FieldType: sql.NullInt64{Int64: 9, Valid: true}},
+		},
+		{
+			name:     "cstring with null length",
+			argument: FunctionArgument{Name: "F_CSTR_0", FieldType: sql.NullInt64{Int64: fieldTypeCString, Valid: true}},
+		},
+		{
+			name: "cstring with zero length",
+			argument: FunctionArgument{
+				Name:        "F_CSTR_1",
+				FieldType:   sql.NullInt64{Int64: fieldTypeCString, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 0, Valid: true},
+			},
+		},
+		{
+			name: "cstring under a non-default character set",
+			argument: FunctionArgument{
+				Name:           "F_CSTR_2",
+				FieldType:      sql.NullInt64{Int64: fieldTypeCString, Valid: true},
+				FieldLength:    sql.NullInt64{Int64: 80, Valid: true},
+				CharacterSetID: sql.NullInt64{Int64: 4, Valid: true},
+			},
+		},
+		{
+			name: "char under a non-default character set",
+			argument: FunctionArgument{
+				Name:            "F_CHAR_0",
+				FieldType:       sql.NullInt64{Int64: fieldTypeChar, Valid: true},
+				FieldLength:     sql.NullInt64{Int64: 40, Valid: true},
+				CharacterLength: sql.NullInt64{Int64: 10, Valid: true},
+				CharacterSetID:  sql.NullInt64{Int64: 4, Valid: true},
+			},
+		},
+		{
+			name: "blob under a non-default character set",
+			argument: FunctionArgument{
+				Name:           "F_BLOB_2",
+				FieldType:      sql.NullInt64{Int64: fieldTypeBlob, Valid: true},
+				FieldLength:    sql.NullInt64{Int64: 0, Valid: true},
+				CharacterSetID: sql.NullInt64{Int64: 4, Valid: true},
+			},
+		},
+		{
+			// The real-world CHAR case: RDB$CHARACTER_LENGTH is NULL for every
+			// measured function argument, so CHAR and VARCHAR arguments are
+			// expected to refuse. Do not substitute FieldLength here.
+			name: "char without a character length",
+			argument: FunctionArgument{
+				Name:        "F_CHAR_1",
+				FieldType:   sql.NullInt64{Int64: fieldTypeChar, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 40, Valid: true},
+			},
+		},
+		{
+			name: "varchar without a character length",
+			argument: FunctionArgument{
+				Name:        "F_VARCHAR_0",
+				FieldType:   sql.NullInt64{Int64: fieldTypeVarchar, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 40, Valid: true},
+			},
+		},
+	}
+	for _, test := range unsupported {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := test.argument.SQLType(); !errors.Is(err, ErrUnsupportedDDL) {
+				t.Fatalf("SQLType error = %v, want ErrUnsupportedDDL", err)
+			}
+		})
+	}
+
+	// The delegated renderer must not leak the synthetic domain into the
+	// caller's error.
+	_, err := FunctionArgument{Name: "F_NULL_0"}.SQLType()
+	var relabelled *UnsupportedDDLError
+	if !errors.As(err, &relabelled) {
+		t.Fatalf("delegated error = %v, want *UnsupportedDDLError", err)
+	}
+	if relabelled.Object != "function argument" || relabelled.Name != "F_NULL_0" {
+		t.Fatalf("delegated error = %#v, want the function argument object and name", relabelled)
+	}
+	if relabelled.Feature != "field type is NULL" {
+		t.Fatalf("delegated error feature = %q, want the underlying renderer reason", relabelled.Feature)
+	}
+}
