@@ -256,6 +256,9 @@ BEGIN
   IF (NEW.ID IS NULL) THEN NEW.ID = GEN_ID(GO_SCHEMA_EXT_SEQUENCE, 1);
 END`,
 		`DECLARE EXTERNAL FUNCTION GO_SCHEMA_EXT_FUNCTION INTEGER RETURNS INTEGER BY VALUE ENTRY_POINT 'go_schema_ext_function' MODULE_NAME 'go_schema_ext_library'`,
+		`DECLARE EXTERNAL FUNCTION GO_SCHEMA_EXT_CSTRING CSTRING(80)
+RETURNS CSTRING(80) FREE_IT
+ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
 		`CREATE ROLE GO_SCHEMA_EXT_ROLE`,
 		`GRANT SELECT ON GO_SCHEMA_EXT_CHILD TO GO_SCHEMA_EXT_ROLE`,
 	)
@@ -368,6 +371,9 @@ END`,
 		!strings.Contains(triggerDDL, "GEN_ID(GO_SCHEMA_EXT_SEQUENCE, 1)") {
 		t.Fatalf("trigger DDL = %q, want event, position, and exact source", triggerDDL)
 	}
+	if event, err := trigger.Event(); err != nil || event != "BEFORE INSERT" {
+		t.Fatalf("trigger Event = (%q, %v), want (\"BEFORE INSERT\", nil)", event, err)
+	}
 
 	procedure, err := catalog.Procedure(ctx, "GO_SCHEMA_EXT_PROC")
 	if err != nil {
@@ -421,6 +427,43 @@ END`,
 	}
 	if _, err := function.GenerateDDL(); !errors.Is(err, catalogschema.ErrUnsupportedDDL) {
 		t.Fatalf("external function DDL error = %v, want ErrUnsupportedDDL", err)
+	}
+	if returnType, err := function.ReturnType(); err != nil || returnType != "INTEGER" {
+		t.Fatalf("external function ReturnType = (%q, %v), want (\"INTEGER\", nil)", returnType, err)
+	}
+	checkedArgument := false
+	for _, argument := range function.Arguments {
+		if !argument.Position.Valid || argument.Position.Int64 != 0 {
+			continue
+		}
+		checkedArgument = true
+		if sqlType, err := argument.SQLType(); err != nil || sqlType != "INTEGER" {
+			t.Fatalf("external function argument 0 SQLType = (%q, %v), want (\"INTEGER\", nil)", sqlType, err)
+		}
+	}
+	// Without this the loop passes vacuously when the catalog places no
+	// argument at position 0, and the assertion above never runs.
+	if !checkedArgument {
+		t.Fatalf("external function arguments = %#v, want one at position 0", function.Arguments)
+	}
+
+	cstringFunction, err := catalog.Function(ctx, "GO_SCHEMA_EXT_CSTRING")
+	if err != nil {
+		t.Fatalf("CSTRING external function lookup: %v", err)
+	}
+	if cstringFunction == nil || len(cstringFunction.Arguments) == 0 {
+		t.Fatalf("CSTRING external function = %#v, want declared argument metadata", cstringFunction)
+	}
+	// The declared length is CSTRING(80). A mismatch here means the rule reads
+	// the wrong catalog column; fix the column choice, never add a +/-1.
+	if returnType, err := cstringFunction.ReturnType(); err != nil || returnType != "CSTRING(80)" {
+		t.Fatalf("CSTRING ReturnType = (%q, %v), want (\"CSTRING(80)\", nil)", returnType, err)
+	}
+	for _, argument := range cstringFunction.Arguments {
+		sqlType, err := argument.SQLType()
+		if err != nil || sqlType != "CSTRING(80)" {
+			t.Fatalf("CSTRING argument %d SQLType = (%q, %v), want (\"CSTRING(80)\", nil)", argument.Position.Int64, sqlType, err)
+		}
 	}
 
 	shadows, err := catalog.Shadows(ctx)

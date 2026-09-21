@@ -56,6 +56,20 @@ These methods use the official `RDB$...` catalogs, bind all name filters, and
 fully consume each result before loading child metadata. External functions are
 only inspected; no UDF is ever loaded or called by this package.
 
+`Trigger.Event` decodes `RDB$TRIGGERS.RDB$TRIGGER_TYPE` into its readable
+form, including database-level events such as `ON CONNECT` and multi-event
+DML forms such as `BEFORE INSERT OR UPDATE`, which remain valid metadata even
+where InterBase trigger DDL cannot express them. `FunctionArgument.SQLType`
+and `Function.ReturnType` render external-argument declarations;
+`Function.ReturnType` treats `RDB$RETURN_ARGUMENT` as an argument position,
+not as an index. Neither emits a character-set suffix, because
+`RDB$FUNCTION_ARGUMENTS` supplies no character-set name, and both refuse an
+argument declared under a non-default character set rather than dropping the
+clause. `CSTRING` lengths come from `RDB$FIELD_LENGTH` unadjusted, while
+`CHAR` and `VARCHAR` arguments are not renderable because the catalog supplies
+no character length for them. Unsupported metadata continues to return an
+error wrapping `ErrUnsupportedDDL`.
+
 ## DDL generation
 
 Objects implementing `DDLer` expose `GenerateDDL()` for domains, tables/views,
