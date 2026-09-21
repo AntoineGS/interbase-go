@@ -90,3 +90,26 @@ func TestAttachmentDiagnosticsAndConnDiagnosticsAgree(t *testing.T) {
 			fromAttachment, fromConn)
 	}
 }
+
+func TestNativeStatementPlanUsesOverrideWithoutNativePointer(t *testing.T) {
+	statement := &nativeStatement{
+		planOverride: func() (string, error) { return "PLAN (GO_COUNTRY INDEX (PK_GO_COUNTRY))", nil },
+	}
+	plan, err := statement.plan()
+	if err != nil {
+		t.Fatalf("(*nativeStatement).plan() error = %v", err)
+	}
+	if plan != "PLAN (GO_COUNTRY INDEX (PK_GO_COUNTRY))" {
+		t.Fatalf("(*nativeStatement).plan() = %q, want the override value", plan)
+	}
+}
+
+func TestNativeStatementPlanReturnsOverrideError(t *testing.T) {
+	planErr := errors.New("injected plan failure")
+	statement := &nativeStatement{
+		planOverride: func() (string, error) { return "", planErr },
+	}
+	if _, err := statement.plan(); !errors.Is(err, planErr) {
+		t.Fatalf("(*nativeStatement).plan() error = %v, want the override error", err)
+	}
+}

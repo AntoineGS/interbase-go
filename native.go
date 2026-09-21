@@ -769,6 +769,7 @@ type nativeStatement struct {
 	writeOutcomeStateOverride func() nativeWriteOutcomeState
 	closeOverride             func() error
 	numInputOverride          func() int
+	planOverride              func() (string, error)
 }
 
 func (s *nativeStatement) writeOutcomeState() nativeWriteOutcomeState {
@@ -1464,6 +1465,9 @@ func (s *nativeStatement) close() error {
 func (s *nativeStatement) plan() (string, error) {
 	release := nativegate.Global.Enter()
 	defer release()
+	if s != nil && s.planOverride != nil {
+		return s.planOverride()
+	}
 	if s == nil || s.ptr == nil {
 		return "", errors.New("native statement is unavailable")
 	}
