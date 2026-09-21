@@ -734,3 +734,27 @@ func domainNames(domains []Domain) []string {
 	}
 	return names
 }
+
+func TestCharacterSetClauseSharesOneGuardBody(t *testing.T) {
+	quoted, err := characterSetClause("domain", "D", sql.NullString{String: `WEIRD"SET`, Valid: true}, sql.NullInt64{Int64: 4, Valid: true})
+	if err != nil || quoted != `"WEIRD""SET"` {
+		t.Fatalf("named character set = (%q, %v), want quoted name", quoted, err)
+	}
+
+	if quoted, err := characterSetClause("domain", "D", sql.NullString{String: "   ", Valid: true}, sql.NullInt64{}); err != nil || quoted != "" {
+		t.Fatalf("blank name with no id = (%q, %v), want empty clause", quoted, err)
+	}
+
+	if quoted, err := characterSetClause("domain", "D", sql.NullString{}, sql.NullInt64{Int64: 0, Valid: true}); err != nil || quoted != "" {
+		t.Fatalf("zero character set id = (%q, %v), want empty clause", quoted, err)
+	}
+
+	_, err = characterSetClause("function argument", "F_0", sql.NullString{}, sql.NullInt64{Int64: 4, Valid: true})
+	var unsupported *UnsupportedDDLError
+	if !errors.As(err, &unsupported) {
+		t.Fatalf("missing name with non-zero id error = %v, want *UnsupportedDDLError", err)
+	}
+	if unsupported.Object != "function argument" || unsupported.Name != "F_0" || unsupported.Feature != "character set name is unavailable" {
+		t.Fatalf("unsupported error = %#v, want caller-supplied object, name, and unavailable-name feature", unsupported)
+	}
+}

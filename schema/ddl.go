@@ -322,15 +322,11 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 
 	parts := sqlTypeParts{base: result}
 	if fieldType == fieldTypeChar || fieldType == fieldTypeVarchar || fieldType == fieldTypeBlob {
-		if d.CharacterSetName.Valid && strings.TrimSpace(d.CharacterSetName.String) != "" {
-			charset, err := quoteRequiredIdentifier(strings.TrimRight(d.CharacterSetName.String, " "), "character set")
-			if err != nil {
-				return sqlTypeParts{}, err
-			}
-			parts.charset = charset
-		} else if d.CharacterSetID.Valid && d.CharacterSetID.Int64 != 0 {
-			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "character set name is unavailable")
+		charset, err := characterSetClause("domain", d.Name, d.CharacterSetName, d.CharacterSetID)
+		if err != nil {
+			return sqlTypeParts{}, err
 		}
+		parts.charset = charset
 	}
 	if (fieldType == fieldTypeChar || fieldType == fieldTypeVarchar || fieldType == fieldTypeBlob) && d.CollationID.Valid && d.CollationID.Int64 != 0 {
 		if !d.CollationName.Valid || strings.TrimSpace(d.CollationName.String) == "" {
@@ -343,6 +339,20 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 		parts.collation = collation
 	}
 	return parts, nil
+}
+
+func characterSetClause(object, name string, setName sql.NullString, setID sql.NullInt64) (string, error) {
+	if setName.Valid && strings.TrimSpace(setName.String) != "" {
+		charset, err := quoteRequiredIdentifier(strings.TrimRight(setName.String, " "), "character set")
+		if err != nil {
+			return "", err
+		}
+		return charset, nil
+	}
+	if setID.Valid && setID.Int64 != 0 {
+		return "", unsupportedDDL(object, name, "character set name is unavailable")
+	}
+	return "", nil
 }
 
 // DataType is an alias for SQLType.
