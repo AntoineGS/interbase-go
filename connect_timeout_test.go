@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -37,6 +38,47 @@ func openDatabaseSQLTestDB(t *testing.T, connection driver.Conn) *sql.DB {
 		}
 	})
 	return db
+}
+
+// databaseSQLTestFactoryConnector mints a fresh driver.Conn per Connect call,
+// unlike databaseSQLTestConnector, which returns one fixed connection. Tests
+// that must observe the pool discarding a connection need a distinguishable
+// replacement.
+type databaseSQLTestFactoryConnector struct {
+	mu      sync.Mutex
+	factory func() driver.Conn
+	minted  []driver.Conn
+}
+
+func (c *databaseSQLTestFactoryConnector) Connect(context.Context) (driver.Conn, error) {
+	connection := c.factory()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.minted = append(c.minted, connection)
+	return connection, nil
+}
+
+func (*databaseSQLTestFactoryConnector) Driver() driver.Driver {
+	return databaseSQLTestDriver{}
+}
+
+func (c *databaseSQLTestFactoryConnector) mintedConnections() []driver.Conn {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]driver.Conn(nil), c.minted...)
+}
+
+func openDatabaseSQLTestFactoryDB(t *testing.T, factory func() driver.Conn) (*sql.DB,
+	*databaseSQLTestFactoryConnector) {
+	t.Helper()
+	connector := &databaseSQLTestFactoryConnector{factory: factory}
+	db := sql.OpenDB(connector)
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("closing database/sql test DB: %v", err)
+		}
+	})
+	return db, connector
 }
 
 func TestConfigConnectTimeoutRoundsUpToWholeNativeSeconds(t *testing.T) {

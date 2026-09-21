@@ -6,6 +6,8 @@ import (
 	"errors"
 	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -451,5 +453,176 @@ func TestPooledPlanRejectsForeignAndNilConnections(t *testing.T) {
 	}
 	if _, err := Plan(context.Background(), nil, "SELECT 1 FROM RDB$DATABASE"); !errors.Is(err, ErrNotInterBaseConn) {
 		t.Fatalf("Plan(nil) error = %v, want ErrNotInterBaseConn", err)
+	}
+}
+
+// introspectionMintedConn records how often the fake attachment behind one
+// minted driver connection was actually asked for information.
+type introspectionMintedConn struct {
+	connection *conn
+	infoCalls  int
+	prepares   int
+}
+
+func TestPooledDiagnosticsBrokenAttachmentLeavesThePool(t *testing.T) {
+	var mu sync.Mutex
+	var minted []*introspectionMintedConn
+	db, connector := openDatabaseSQLTestFactoryDB(t, func() driver.Conn {
+		mu.Lock()
+		defer mu.Unlock()
+		entry := &introspectionMintedConn{}
+		failing := len(minted) == 0
+		broken := &atomic.Bool{}
+		responder := introspectionInfoResponder(3)
+		native := &nativeConnection{
+			brokenOverride: broken.Load,
+			databaseInfoOverride: func(code byte) ([]byte, error) {
+				mu.Lock()
+				entry.infoCalls++
+				mu.Unlock()
+				if failing {
+					broken.Store(true)
+					return nil, &NativeError{
+						Operation:  "database diagnostics",
+						NativeCode: 335544721,
+						Message:    "connection lost",
+					}
+				}
+				return responder(code)
+			},
+			clientVersionOverride: func() (string, error) { return "client-v1", nil },
+			closeOverride:         func() error { return nil },
+		}
+		entry.connection = &conn{native: native}
+		minted = append(minted, entry)
+		return entry.connection
+	})
+
+	first, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("first DB.Conn() error = %v", err)
+	}
+	if _, err := Diagnostics(context.Background(), first); err == nil {
+		t.Fatal("Diagnostics() succeeded on a broken attachment")
+	}
+	mu.Lock()
+	brokenConn := minted[0].connection
+	mu.Unlock()
+	if brokenConn.IsValid() {
+		t.Fatal("(*conn).IsValid() is true after a native failure that broke the attachment")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first sql.Conn.Close() error = %v", err)
+	}
+
+	second, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("second DB.Conn() error = %v", err)
+	}
+	defer second.Close()
+	got, err := Diagnostics(context.Background(), second)
+	if err != nil {
+		t.Fatalf("Diagnostics() on the replacement connection error = %v", err)
+	}
+	if want := introspectionWantDiagnostics(3); got != want {
+		t.Fatalf("Diagnostics() = %#v, want %#v", got, want)
+	}
+
+	// Asserted as "at least two" rather than exactly two: database/sql mints
+	// spare connections only when connRequests is non-empty, which these
+	// sequential tests never produce, but a strict equality on pool internals
+	// is the kind of assertion that flakes rarely and costs an afternoon. The
+	// identity check and the infoCalls count below carry the actual proof.
+	if connections := connector.mintedConnections(); len(connections) < 2 {
+		t.Fatalf("minted driver connections = %d, want at least 2", len(connections))
+	} else if connections[0] == connections[1] {
+		t.Fatal("the replacement connection is the discarded one")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if minted[0].infoCalls != 1 {
+		t.Fatalf("broken connection database info calls = %d, want 1; it served a later request",
+			minted[0].infoCalls)
+	}
+	if minted[1].infoCalls == 0 {
+		t.Fatal("the replacement connection never served the second Diagnostics call")
+	}
+}
+
+func TestPooledPlanBrokenAttachmentLeavesThePool(t *testing.T) {
+	var mu sync.Mutex
+	var minted []*introspectionMintedConn
+	db, connector := openDatabaseSQLTestFactoryDB(t, func() driver.Conn {
+		mu.Lock()
+		defer mu.Unlock()
+		entry := &introspectionMintedConn{}
+		failing := len(minted) == 0
+		broken := &atomic.Bool{}
+		native := introspectionTestNative(3)
+		native.brokenOverride = broken.Load
+		native.prepareOverride = func(string) (*nativeStatement, error) {
+			mu.Lock()
+			entry.prepares++
+			mu.Unlock()
+			if failing {
+				broken.Store(true)
+				return nil, &NativeError{
+					Operation:  "prepare",
+					NativeCode: 335544721,
+					Message:    "connection lost",
+				}
+			}
+			return &nativeStatement{
+				planOverride:  func() (string, error) { return "PLAN (GO_COUNTRY NATURAL)", nil },
+				closeOverride: func() error { return nil },
+			}, nil
+		}
+		entry.connection = &conn{native: native}
+		minted = append(minted, entry)
+		return entry.connection
+	})
+
+	first, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("first DB.Conn() error = %v", err)
+	}
+	if _, err := Plan(context.Background(), first, "SELECT COUNTRY FROM GO_COUNTRY"); err == nil {
+		t.Fatal("Plan() succeeded on a broken attachment")
+	} else if errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("Plan() error = %v, want the native failure rather than a manufactured driver.ErrBadConn", err)
+	}
+	mu.Lock()
+	brokenConn := minted[0].connection
+	mu.Unlock()
+	if brokenConn.IsValid() {
+		t.Fatal("(*conn).IsValid() is true after a native failure that broke the attachment")
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("first sql.Conn.Close() error = %v", err)
+	}
+
+	second, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("second DB.Conn() error = %v", err)
+	}
+	defer second.Close()
+	plan, err := Plan(context.Background(), second, "SELECT COUNTRY FROM GO_COUNTRY")
+	if err != nil {
+		t.Fatalf("Plan() on the replacement connection error = %v", err)
+	}
+	if plan != "PLAN (GO_COUNTRY NATURAL)" {
+		t.Fatalf("Plan() = %q, want the native plan", plan)
+	}
+	// "At least two" for the same reason as the Diagnostics test above: the
+	// identity check and the prepares count are what prove eviction.
+	if connections := connector.mintedConnections(); len(connections) < 2 {
+		t.Fatalf("minted driver connections = %d, want at least 2", len(connections))
+	} else if connections[0] == connections[1] {
+		t.Fatal("the replacement connection is the discarded one")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if minted[0].prepares != 1 {
+		t.Fatalf("broken connection prepare calls = %d, want 1; it served a later request", minted[0].prepares)
 	}
 }
