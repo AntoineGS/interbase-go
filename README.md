@@ -129,6 +129,36 @@ are redacted from returned errors.
 `database/sql.TxOptions` selects read-only access and the standard
 read-committed, repeatable-read/snapshot, or serializable isolation level.
 
+Pooled connections can reach two introspection capabilities without opening a
+second native attachment. Borrow a connection with `db.Conn`, then call the
+package helpers:
+
+```go
+pooled, err := db.Conn(ctx)
+if err != nil {
+    return err
+}
+defer pooled.Close()
+
+diagnostics, err := interbase.Diagnostics(ctx, pooled)
+if err != nil {
+    return err
+}
+// diagnostics.SQLDialect is the dialect the server reports for this
+// attachment, not an echo of Config.Dialect.
+
+plan, err := interbase.Plan(ctx, pooled, "SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?")
+if err != nil {
+    return err
+}
+```
+
+Both helpers run on the attachment the pool already owns. They wrap
+`(*sql.Conn).Raw` and assert the exported `Introspector` interface; a
+connection that does not belong to this driver returns `ErrNotInterBaseConn`.
+The `Introspector` value handed to a `Raw` callback must not be retained beyond
+that callback.
+
 ### Explicit direct API
 
 Use `Open` when the application needs an explicitly owned attachment and the
@@ -332,6 +362,14 @@ attachment cleanup closes any remaining native BLOB handles. The standard
 - `ExecContext` for DML/DDL, with DML affected-row counts and implicit commit.
   `LastInsertId` is unsupported.
 - Reusable server-side prepared statements via `PrepareContext`.
+- Pooled introspection on a connection borrowed with `db.Conn`:
+  `Diagnostics` reports the server, database, and linked client facts for the
+  attachment the pool already owns, and `Plan` returns a server-generated plan.
+  Pooled `Plan` prepares only: it uses the connection's explicit transaction
+  when `BeginTx` started one on the same `*sql.Conn` and has not completed it,
+  and otherwise uses a read-only transaction that begins and ends inside the
+  native prepare call. It never executes the statement, for any statement type,
+  and it neither begins nor completes a caller-owned transaction.
 - Best-effort context cancellation for DSQL prepare, execute, and fetch calls:
   `database/sql` `PrepareContext`, direct and prepared `ExecContext`,
   `QueryContext`/`QueryRowContext` and `Rows.Next`, plus direct
@@ -430,6 +468,12 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 - No named parameters. Raw/custom TPBs and lock timeouts are not exposed;
   distributed transaction failure-injection and live limbo recovery require a
   server fixture with an available Services Manager.
+- Pooled `Plan` uses the connection-level prepare, which does not allow array
+  output columns. A `SELECT` whose output includes an array column therefore
+  fails output-type validation instead of returning a plan, exactly as
+  `(*sql.DB).PrepareContext` already does with the same query. The direct
+  `Transaction.Plan` is array-capable. Separately, a valid DML statement may
+  return an empty plan string, and an empty plan never means the statement ran.
 - Mixed-character-set casts may require an explicit source-charset cast on
   the parameter. For a UTF8 attachment, declare `CAST(? AS VARCHAR(40)
   CHARACTER SET UTF8)` before converting to WIN1250 and back. The original
