@@ -1279,6 +1279,22 @@ func (a FunctionArgument) SQLType() (string, error) {
 	return parts.render(true), nil
 }
 
+// ReturnType renders the SQL declaration of the function's return value.
+// RDB$RETURN_ARGUMENT is an argument position, not an index into Arguments:
+// when it is N > 0 the return value is argument N, which is simultaneously an
+// input. Catalog positions are unique per function, so the first match wins.
+func (f Function) ReturnType() (string, error) {
+	if !f.ReturnArgument.Valid {
+		return "", unsupportedDDL("external function", f.Name, "return argument position is NULL")
+	}
+	for _, argument := range f.Arguments {
+		if argument.Position.Valid && argument.Position.Int64 == f.ReturnArgument.Int64 {
+			return argument.SQLType()
+		}
+	}
+	return "", unsupportedDDL("external function", f.Name, fmt.Sprintf("no argument at return position %d", f.ReturnArgument.Int64))
+}
+
 // GenerateDDL is intentionally unsupported: external function declarations
 // can contain platform-specific calling conventions that this read-only
 // metadata projection does not fully capture.

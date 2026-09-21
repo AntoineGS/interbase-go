@@ -1027,3 +1027,108 @@ func TestFunctionArgumentSQLTypeRendersExternalDeclarations(t *testing.T) {
 		t.Fatalf("delegated error feature = %q, want the underlying renderer reason", relabelled.Feature)
 	}
 }
+
+func TestFunctionReturnTypeResolvesByArgumentPosition(t *testing.T) {
+	denseReturn := Function{
+		Name:           "GO_DENSE",
+		ReturnArgument: sql.NullInt64{Int64: 0, Valid: true},
+		Arguments: []FunctionArgument{{
+			Name:           "GO_DENSE_0",
+			Position:       sql.NullInt64{Int64: 0, Valid: true},
+			FieldType:      sql.NullInt64{Int64: fieldTypeInteger, Valid: true},
+			FieldSubType:   sql.NullInt64{Int64: 0, Valid: true},
+			FieldScale:     sql.NullInt64{Int64: 0, Valid: true},
+			FieldLength:    sql.NullInt64{Int64: 4, Valid: true},
+			FieldPrecision: sql.NullInt64{Int64: 10, Valid: true},
+		}},
+	}
+	if got, err := denseReturn.ReturnType(); err != nil || got != "INTEGER" {
+		t.Fatalf("position-0 ReturnType = (%q, %v), want (\"INTEGER\", nil)", got, err)
+	}
+
+	// RDB$RETURN_ARGUMENT is a position, not a slice index. Positions here are
+	// 1 and 3, so indexing Arguments by ReturnArgument would panic or resolve
+	// the wrong row; argument 3 is simultaneously an input and the return.
+	sparseReturn := Function{
+		Name:           "GO_SPARSE",
+		ReturnArgument: sql.NullInt64{Int64: 3, Valid: true},
+		Arguments: []FunctionArgument{
+			{
+				Name:           "GO_SPARSE_1",
+				Position:       sql.NullInt64{Int64: 1, Valid: true},
+				FieldType:      sql.NullInt64{Int64: fieldTypeInteger, Valid: true},
+				FieldSubType:   sql.NullInt64{Int64: 0, Valid: true},
+				FieldScale:     sql.NullInt64{Int64: 0, Valid: true},
+				FieldLength:    sql.NullInt64{Int64: 4, Valid: true},
+				FieldPrecision: sql.NullInt64{Int64: 10, Valid: true},
+			},
+			{
+				Name:        "GO_SPARSE_3",
+				Position:    sql.NullInt64{Int64: 3, Valid: true},
+				FieldType:   sql.NullInt64{Int64: fieldTypeCString, Valid: true},
+				FieldLength: sql.NullInt64{Int64: 80, Valid: true},
+			},
+		},
+	}
+	if got, err := sparseReturn.ReturnType(); err != nil || got != "CSTRING(80)" {
+		t.Fatalf("positional ReturnType = (%q, %v), want (\"CSTRING(80)\", nil)", got, err)
+	}
+
+	unsupported := []struct {
+		name     string
+		function Function
+	}{
+		{
+			name:     "null return argument",
+			function: Function{Name: "GO_NULL_RETURN", Arguments: denseReturn.Arguments},
+		},
+		{
+			name: "return position absent",
+			function: Function{
+				Name:           "GO_MISSING_RETURN",
+				ReturnArgument: sql.NullInt64{Int64: 5, Valid: true},
+				Arguments:      denseReturn.Arguments,
+			},
+		},
+	}
+	for _, test := range unsupported {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := test.function.ReturnType(); !errors.Is(err, ErrUnsupportedDDL) {
+				t.Fatalf("ReturnType error = %v, want ErrUnsupportedDDL", err)
+			}
+		})
+	}
+
+	db := openFixtureDB(t)
+	defer db.Close()
+	catalog := New(db)
+	ctx := context.Background()
+
+	scanned, err := catalog.Functions(ctx, "GO_EXTERNAL")
+	if err != nil {
+		t.Fatalf("Functions returned error: %v", err)
+	}
+	if len(scanned) != 1 || len(scanned[0].Arguments) != 1 {
+		t.Fatalf("scanned function = %#v, want one function with one argument", scanned)
+	}
+	if got, err := scanned[0].Arguments[0].SQLType(); err != nil || got != "INTEGER" {
+		t.Fatalf("scanned argument SQLType = (%q, %v), want (\"INTEGER\", nil)", got, err)
+	}
+	if got, err := scanned[0].ReturnType(); err != nil || got != "INTEGER" {
+		t.Fatalf("scanned ReturnType = (%q, %v), want (\"INTEGER\", nil)", got, err)
+	}
+
+	text, err := catalog.Functions(ctx, "GO_EXTERNAL_TEXT")
+	if err != nil {
+		t.Fatalf("Functions returned error: %v", err)
+	}
+	if len(text) != 1 || len(text[0].Arguments) != 1 {
+		t.Fatalf("scanned CSTRING function = %#v, want one function with one argument", text)
+	}
+	if got, err := text[0].Arguments[0].SQLType(); err != nil || got != "CSTRING(80)" {
+		t.Fatalf("scanned CSTRING argument SQLType = (%q, %v), want (\"CSTRING(80)\", nil)", got, err)
+	}
+	if got, err := text[0].ReturnType(); err != nil || got != "CSTRING(80)" {
+		t.Fatalf("scanned CSTRING ReturnType = (%q, %v), want (\"CSTRING(80)\", nil)", got, err)
+	}
+}

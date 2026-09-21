@@ -1590,11 +1590,20 @@ func fixtureDependencies() []fixtureDependency {
 }
 
 func fixtureFunctions() []fixtureFunction {
-	return []fixtureFunction{{
-		name:      "GO_EXTERNAL",
-		values:    []driver.Value{"GO_EXTERNAL      ", int64(0), nil, "go_udf.so       ", "go_external     ", int64(0), int64(0)},
-		arguments: [][]driver.Value{{"GO_EXTERNAL      ", int64(0), int64(0), int64(4), int64(0), int64(8), int64(0), nil, int64(10), nil}},
-	}}
+	return []fixtureFunction{
+		{
+			name:      "GO_EXTERNAL",
+			values:    []driver.Value{"GO_EXTERNAL      ", int64(0), nil, "go_udf.so       ", "go_external     ", int64(0), int64(0)},
+			arguments: [][]driver.Value{{"GO_EXTERNAL      ", int64(0), int64(0), int64(4), int64(0), int64(8), int64(0), nil, int64(10), nil}},
+		},
+		{
+			// A CSTRING(80) return argument with RDB$CHARACTER_LENGTH NULL and
+			// RDB$FIELD_LENGTH 80, matching every measured catalog row.
+			name:      "GO_EXTERNAL_TEXT",
+			values:    []driver.Value{"GO_EXTERNAL_TEXT ", int64(0), nil, "go_udf.so       ", "go_external_text", int64(0), int64(0)},
+			arguments: [][]driver.Value{{"GO_EXTERNAL_TEXT ", int64(0), int64(1), int64(80), int64(0), int64(40), nil, nil, nil, nil}},
+		},
+	}
 }
 
 func fixtureDatabaseFiles(shadowNumber int64) [][]driver.Value {
