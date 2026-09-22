@@ -33,8 +33,10 @@ used sequentially, reach the same `*conn`.
 
 `(*conn).IsValid` (`interbase.go:1346`) is what keeps a broken attachment out of
 the pool; `database/sql` calls it through `putConn`/`validateConnection` when the
-borrowed connection is released. `invalidateLocked` (`interbase.go:1352`) is what
-makes `IsValid` report false.
+borrowed connection is released. `IsValid` reports false if the connection is
+closed, `c.native` is nil, or the native attachment reports `broken()`.
+`invalidateLocked` (`interbase.go:1352`) closes the connection and clears
+`c.native`, but is not required for a broken attachment to fail validation.
 
 ### Corrections to the original proposal
 
@@ -253,9 +255,13 @@ already has.
   including the early-error paths.
 - The `Introspector` value is valid only inside the `Raw` callback. The helpers
   do not store it, and the documentation states that callers must not either.
-- A native failure that sets `broken()` triggers `invalidateLocked`, which closes
-  rows and statements, clears `c.native`, and makes `IsValid` false; the pool
-  then discards the connection when the `*sql.Conn` is released or closed.
+- A native failure that sets `broken()` makes `IsValid` false, so the pool
+  discards the connection when it is returned via `(*sql.Conn).Close`.
+  `Plan` additionally calls `invalidateLocked` on its broken-attachment error
+  paths, closing rows and statements and clearing `c.native`. `Diagnostics`
+  does not call `invalidateLocked`; eviction relies on `IsValid` observing the
+  broken native attachment. Neither path needs to replace the operation error
+  with `driver.ErrBadConn` to achieve this eviction.
 - `Plan` leaves no transaction state behind. It neither begins nor completes a
   caller-owned `database/sql` transaction, and the implicit transaction it may
   cause is created and completed inside the native prepare call.
