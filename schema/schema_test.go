@@ -790,6 +790,7 @@ type fixtureOptions struct {
 	closeErrorFor            string
 	closeError               error
 	cancelOnCloseFor         string
+	identifierWidthMode      string
 }
 
 type fixtureCall struct {
@@ -958,6 +959,26 @@ func applyFixtureOptions(kind string, values [][]driver.Value, options fixtureOp
 		values = append([][]driver.Value(nil), values...)
 		values[0] = append([]driver.Value(nil), values[0]...)
 	}
+	if options.identifierWidthMode == "unsupported" && kind == "identifier_width_bootstrap" {
+		cloneFirstRow()
+		values[0][0] = int64(32767)
+	}
+	if kind == "identifier_widths" && (options.identifierWidthMode == "zero" || options.identifierWidthMode == "null") {
+		for row := range values {
+			relation, relationOK := values[row][0].(string)
+			field, fieldOK := values[row][1].(string)
+			if relationOK && fieldOK && strings.TrimRight(relation, " ") == "RDB$RELATION_CONSTRAINTS" && strings.TrimRight(field, " ") == "RDB$CONSTRAINT_NAME" {
+				values = append([][]driver.Value(nil), values...)
+				values[row] = append([]driver.Value(nil), values[row]...)
+				if options.identifierWidthMode == "zero" {
+					values[row][2] = int64(0)
+				} else {
+					values[row][2] = nil
+				}
+				break
+			}
+		}
+	}
 	if options.columnNullabilityMode != "" && kind == "columns" {
 		cloneFirstRow()
 		switch options.columnNullabilityMode {
@@ -1026,6 +1047,10 @@ func fixtureErrorFor(kind, configuredKind string, configured error) error {
 func fixtureQueryKind(query string) string {
 	upper := strings.ToUpper(query)
 	switch {
+	case strings.Contains(upper, "FROM RDB$RELATION_FIELDS RF") && strings.Contains(upper, "CAST(RF.RDB$RELATION_NAME"):
+		return "identifier_widths"
+	case strings.Contains(upper, "FROM RDB$RELATION_FIELDS RF") && strings.Contains(upper, "SELECT F.RDB$FIELD_LENGTH"):
+		return "identifier_width_bootstrap"
 	case strings.Contains(upper, "FROM RDB$FIELDS"):
 		return "domains"
 	case strings.Contains(upper, "FROM RDB$GENERATORS"):
@@ -1068,6 +1093,13 @@ func fixtureQueryKind(query string) string {
 }
 
 func fixtureResult(kind, query string, args []driver.NamedValue) ([]string, [][]driver.Value, error) {
+	if kind == "identifier_width_bootstrap" {
+		return fixtureIdentifierWidthBootstrapResult(query, args)
+	}
+	if kind == "identifier_widths" {
+		return fixtureIdentifierWidthsResult(query, args)
+	}
+
 	filter, err := fixtureFilter(args)
 	if err != nil {
 		return nil, nil, err
@@ -1284,6 +1316,57 @@ func fixtureResult(kind, query string, args []driver.NamedValue) ([]string, [][]
 	default:
 		return nil, nil, errors.New("fixture: unexpected query")
 	}
+}
+
+func fixtureIdentifierWidthBootstrapResult(query string, args []driver.NamedValue) ([]string, [][]driver.Value, error) {
+	wantQuery := normalizeFixtureSQL(`
+SELECT f.RDB$FIELD_LENGTH
+FROM RDB$RELATION_FIELDS rf
+JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE
+WHERE rf.RDB$RELATION_NAME = ?
+  AND rf.RDB$FIELD_NAME = ?`)
+	if got := normalizeFixtureSQL(query); got != wantQuery {
+		return nil, nil, errors.New("fixture: unexpected identifier width bootstrap query shape: " + query)
+	}
+	if len(args) != 2 {
+		return nil, nil, errors.New("fixture: identifier width bootstrap requires two bound filters")
+	}
+	relation, relationOK := args[0].Value.(string)
+	field, fieldOK := args[1].Value.(string)
+	if !relationOK || !fieldOK {
+		return nil, nil, errors.New("fixture: identifier width bootstrap filters are not strings")
+	}
+	switch {
+	case relation == "RDB$RELATIONS" && field == "RDB$RELATION_NAME":
+		return []string{"FIELD_LENGTH"}, [][]driver.Value{{int64(67)}}, nil
+	case relation == "RDB$RELATION_FIELDS" && field == "RDB$FIELD_NAME":
+		return []string{"FIELD_LENGTH"}, [][]driver.Value{{int64(31)}}, nil
+	default:
+		return nil, nil, errors.New("fixture: unexpected identifier width bootstrap filter")
+	}
+}
+
+func fixtureIdentifierWidthsResult(query string, args []driver.NamedValue) ([]string, [][]driver.Value, error) {
+	if strings.Contains(strings.ToUpper(query), "VARCHAR(32767)") {
+		return nil, nil, errors.New("fixture: database rejected VARCHAR width 32767")
+	}
+	if len(args) != 0 {
+		return nil, nil, errors.New("fixture: identifier widths query does not accept arguments")
+	}
+	wantQuery := normalizeFixtureSQL(`
+SELECT CAST(rf.RDB$RELATION_NAME AS VARCHAR(67)),
+       CAST(rf.RDB$FIELD_NAME AS VARCHAR(31)),
+       f.RDB$FIELD_LENGTH
+FROM RDB$RELATION_FIELDS rf
+JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME`)
+	if got := normalizeFixtureSQL(query); got != wantQuery {
+		return nil, nil, errors.New("fixture: unexpected identifier widths query shape: " + query)
+	}
+	return []string{"RELATION_NAME", "FIELD_NAME", "FIELD_LENGTH"}, [][]driver.Value{
+		{"RDB$RELATIONS      ", "RDB$RELATION_NAME     ", int64(67)},
+		{"RDB$RELATION_FIELDS      ", "RDB$FIELD_NAME      ", int64(31)},
+		{"RDB$RELATION_CONSTRAINTS      ", "RDB$CONSTRAINT_NAME     ", int64(31)},
+	}, nil
 }
 
 func fixtureFilter(args []driver.NamedValue) (string, error) {

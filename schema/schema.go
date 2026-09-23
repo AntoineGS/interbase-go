@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Queryer is the part of database/sql needed by Catalog.
@@ -34,7 +35,9 @@ const (
 // Catalog reads the bounded set of InterBase catalog objects supported by this
 // package.
 type Catalog struct {
-	queryer Queryer
+	queryer              Queryer
+	identifierWidthMu    sync.Mutex
+	identifierWidthCache map[identifierField]int
 }
 
 // New returns a catalog backed by queryer. A nil queryer is accepted so the
