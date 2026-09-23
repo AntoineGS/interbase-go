@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"interbase-go"
 )
 
 type expectedColumnMetadata struct {
@@ -144,6 +146,42 @@ FROM GO_DATA WHERE ID = ?`)
 	requireColumnMetadata(t, columns, want)
 	if !rows.Next() {
 		t.Fatalf("prepared metadata query returned no row: %v", rows.Err())
+	}
+	finishReadRows(t, rows)
+}
+
+func TestCharColumnMetadataUsesCatalogWidth(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 1, `
+CREATE TABLE CHAR_METADATA_TEST (
+	FIXED_VALUE CHAR(5) CHARACTER SET UTF8
+);
+INSERT INTO CHAR_METADATA_TEST (FIXED_VALUE) VALUES ('A');
+`)
+	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "UTF8", 1,
+		interbase.TransactionOptions{})
+	rows, err := db.QueryContext(readContext(t), `SELECT FIXED_VALUE FROM CHAR_METADATA_TEST`)
+	if err != nil {
+		t.Fatalf("query disposable CHAR metadata fixture: %v", err)
+	}
+	columns, err := rows.ColumnTypes()
+	if err != nil {
+		t.Fatalf("CHAR fixture ColumnTypes: %v", err)
+	}
+	if len(columns) != 1 {
+		t.Fatalf("CHAR fixture columns = %d, want 1", len(columns))
+	}
+	if length, ok := columns[0].Length(); length != 5 || !ok {
+		t.Fatalf("CHAR fixture declared length = (%d, %t), want (5, true)", length, ok)
+	}
+	if !rows.Next() {
+		t.Fatalf("CHAR fixture returned no row: %v", rows.Err())
+	}
+	var value string
+	if err := rows.Scan(&value); err != nil {
+		t.Fatalf("scan disposable CHAR value: %v", err)
+	}
+	if value != "A    " {
+		t.Errorf("CHAR(5) value = %q, want declared-width padding %q", value, "A    ")
 	}
 	finishReadRows(t, rows)
 }

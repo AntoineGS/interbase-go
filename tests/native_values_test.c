@@ -337,6 +337,103 @@ static void test_attributed_fixed_text_width_evidence(void)
 	ib_free_sqlda(cursor.output);
 }
 
+static void test_fixed_text_multibyte_conversion_and_invalid_width(void)
+{
+	static const char utf8_value[] = {
+		(char) 0xc3, (char) 0xa9, ' ', ' ', ' ', ' ',
+		'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X',
+		'X', 'X', 'X', 'X'
+	};
+	static const char win1252_value[] = {
+		(char) 0xe9, ' ', ' ', ' ', ' ', ' ', 'X', 'X', 'X', 'X',
+		'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X'
+	};
+	ib_connection connection;
+	ib_cursor cursor;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "multibyte output SQLDA allocation failed");
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = IB_CHARSET_UTF8;
+	cursor.output->sqlvar[0].sqllen = sizeof(utf8_value);
+	cursor.metadata = (ib_column_metadata *) calloc(1U, sizeof(*cursor.metadata));
+	require_condition(cursor.metadata != NULL, "multibyte metadata allocation failed");
+	cursor.metadata[0].length = 5;
+	cursor.metadata[0].has_length = 1;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"multibyte output allocation failed");
+	memcpy(cursor.output->sqlvar[0].sqldata, utf8_value, sizeof(utf8_value));
+	cursor.fetched = 1;
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"known-width multibyte UTF8 CHAR decode failed");
+	require_condition(view.length == 6U &&
+		memcmp(view.bytes, "\xc3\xa9    ", 6U) == 0,
+		"known-width UTF8 CHAR did not retain one two-byte character and four pads");
+	free(cursor.metadata);
+	ib_free_sqlda(cursor.output);
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_WIN1252;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "legacy output SQLDA allocation failed");
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = 3; /* UNICODE_FSS source column. */
+	cursor.output->sqlvar[0].sqllen = sizeof(win1252_value);
+	cursor.metadata = (ib_column_metadata *) calloc(1U, sizeof(*cursor.metadata));
+	require_condition(cursor.metadata != NULL, "legacy metadata allocation failed");
+	cursor.metadata[0].length = 5;
+	cursor.metadata[0].has_length = 1;
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"legacy output allocation failed");
+	memcpy(cursor.output->sqlvar[0].sqldata, win1252_value, sizeof(win1252_value));
+	cursor.fetched = 1;
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"legacy attachment CHAR conversion failed");
+	require_condition(view.length == 6U &&
+		memcmp(view.bytes, "\xc3\xa9    ", 6U) == 0,
+		"legacy attachment conversion did not apply the character width after UTF8 conversion");
+	free(cursor.converted_value);
+	free(cursor.metadata);
+	ib_free_sqlda(cursor.output);
+
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "invalid-width SQLDA allocation failed");
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = IB_CHARSET_UTF8;
+	cursor.output->sqlvar[0].sqllen = 4;
+	cursor.metadata = (ib_column_metadata *) calloc(1U, sizeof(*cursor.metadata));
+	require_condition(cursor.metadata != NULL, "invalid-width metadata allocation failed");
+	cursor.metadata[0].length = 5;
+	cursor.metadata[0].has_length = 1;
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"invalid-width output allocation failed");
+	memcpy(cursor.output->sqlvar[0].sqldata, "AB  ", 4U);
+	cursor.fetched = 1;
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"impossible declared CHAR width was not safely treated as unknown");
+	require_condition(view.length == 4U && memcmp(view.bytes, "AB  ", 4U) == 0,
+		"impossible declared CHAR width read beyond sqllen or dropped buffer bytes");
+	free(cursor.metadata);
+	ib_free_sqlda(cursor.output);
+}
+
 static void test_fixed_text_output_is_space_initialized(void)
 {
 	ib_cursor cursor;
@@ -1435,6 +1532,7 @@ int main(void)
 	test_utf8_fixed_text_and_scaled_float_decoding();
 	test_unattributed_utf8_text_preserves_literal_spaces();
 	test_attributed_fixed_text_width_evidence();
+	test_fixed_text_multibyte_conversion_and_invalid_width();
 	test_fixed_text_output_is_space_initialized();
 	test_octets_bind_and_decode_as_bytes();
 	test_exact_scaled_integer_binding();
