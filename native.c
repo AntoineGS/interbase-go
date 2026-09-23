@@ -9267,7 +9267,10 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 			view->length = character_count == 0U ? converted_length : source_length;
 		} else {
 			view->bytes = variable->sqldata;
-			if (character_count != 0U &&
+			if (text_charset == 1 && character_count != 0U) {
+				/* OCTETS widths count bytes; arbitrary byte sequences are valid. */
+				source_length = character_count;
+			} else if (character_count != 0U &&
 				ib_utf8_checked_prefix_length(variable->sqldata, source_length,
 					character_count, &source_length, error) != 0) {
 				return -1;

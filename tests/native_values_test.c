@@ -531,7 +531,7 @@ static void test_fixed_text_output_is_space_initialized(void)
 
 static void test_octets_bind_and_decode_as_bytes(void)
 {
-	static const char payload[] = { 0, 1, 127, (char) 0x80, (char) 0xff };
+	static const char payload[] = { (char) 0x80, (char) 0xff, 127, ' ', ' ' };
 	ib_connection connection;
 	ib_cursor cursor;
 	ib_bindings *bindings;
@@ -583,6 +583,10 @@ static void test_octets_bind_and_decode_as_bytes(void)
 	cursor.output->sqlvar[1].sqltype = SQL_VARYING | 1;
 	cursor.output->sqlvar[1].sqlsubtype = 1;
 	cursor.output->sqlvar[1].sqllen = sizeof(payload);
+	cursor.metadata = (ib_column_metadata *) calloc(2U, sizeof(*cursor.metadata));
+	require_condition(cursor.metadata != NULL, "OCTETS metadata allocation failed");
+	cursor.metadata[0].length = 3;
+	cursor.metadata[0].has_length = 1;
 	error = NULL;
 	require_success(ib_allocate_output(&cursor, &error), error,
 		"OCTETS output storage allocation failed");
@@ -595,15 +599,23 @@ static void test_octets_bind_and_decode_as_bytes(void)
 	error = NULL;
 	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
 		"OCTETS fixed decode failed");
+	require_condition(view.kind == IB_VALUE_BYTES && view.length == 3U &&
+		memcmp(view.bytes, payload, 3U) == 0,
+		"known-width OCTETS fixed value was not capped and returned as unchanged bytes");
+	cursor.metadata[0].has_length = 0;
+	error = NULL;
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+		"unknown-width OCTETS fixed decode failed");
 	require_condition(view.kind == IB_VALUE_BYTES && view.length == sizeof(payload) &&
 		memcmp(view.bytes, payload, sizeof(payload)) == 0,
-		"OCTETS fixed value was not returned as unchanged bytes");
+		"unknown-width OCTETS fixed value did not retain its full buffer");
 	error = NULL;
 	require_success(ib_cursor_column(&cursor, 1, &view, &error), error,
 		"OCTETS varying decode failed");
 	require_condition(view.kind == IB_VALUE_BYTES && view.length == sizeof(payload) &&
 		memcmp(view.bytes, payload, sizeof(payload)) == 0,
 		"OCTETS varying value was not returned as unchanged bytes");
+	free(cursor.metadata);
 	ib_free_sqlda(cursor.output);
 }
 
