@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -39,10 +40,18 @@ AS BEGIN RESULT = 1; SUSPEND; END`); err != nil {
 
 	strictDB := openCatalogTextDB(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "")
 	var strictSource string
-	if err := strictDB.QueryRowContext(ctx,
+	strictErr := strictDB.QueryRowContext(ctx,
 		"SELECT RDB$PROCEDURE_SOURCE FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME = ?",
-		"GO_LEGACY_SOURCE").Scan(&strictSource); err == nil {
+		"GO_LEGACY_SOURCE").Scan(&strictSource)
+	if strictErr == nil {
 		t.Fatalf("strict catalog source read unexpectedly succeeded with %q", strictSource)
+	}
+	var conversionErr *interbase.Error
+	if !errors.As(strictErr, &conversionErr) {
+		t.Fatalf("strict catalog source error type = %T, want InterBase transliteration error SQLCODE -314", strictErr)
+	}
+	if conversionErr.SQLCode != -314 {
+		t.Fatalf("strict catalog source SQLCODE = %d (operation %q), want transliteration SQLCODE -314", conversionErr.SQLCode, conversionErr.Operation)
 	}
 	legacyDB := openCatalogTextDB(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "WIN1250")
 	legacyDB.SetMaxOpenConns(2)
@@ -66,6 +75,12 @@ AS BEGIN RESULT = 1; SUSPEND; END`); err != nil {
 	if err != nil {
 		t.Fatalf("prepare catalog source query: %v", err)
 	}
+	statementClosed := false
+	defer func() {
+		if !statementClosed {
+			_ = statement.Close()
+		}
+	}()
 	var preparedSource string
 	if err := statement.QueryRowContext(ctx, "GO_LEGACY_SOURCE").Scan(&preparedSource); err != nil {
 		t.Fatalf("prepared catalog source read: %v", err)
@@ -76,33 +91,54 @@ AS BEGIN RESULT = 1; SUSPEND; END`); err != nil {
 	if err := statement.Close(); err != nil {
 		t.Fatalf("close prepared catalog query: %v", err)
 	}
+	statementClosed = true
 
 	tx, err := legacyDB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		t.Fatalf("begin read-only transaction: %v", err)
 	}
+	txFinished := false
+	defer func() {
+		if !txFinished {
+			_ = tx.Rollback()
+		}
+	}()
 	assertCatalogSource("read-only transaction", tx, query, "GO_LEGACY_SOURCE")
 	if err := tx.Rollback(); err != nil {
 		t.Fatalf("rollback read-only transaction: %v", err)
 	}
+	txFinished = true
 
 	first, err := legacyDB.Conn(ctx)
 	if err != nil {
 		t.Fatalf("acquire first pooled connection: %v", err)
 	}
+	firstClosed := false
+	defer func() {
+		if !firstClosed {
+			_ = first.Close()
+		}
+	}()
 	second, err := legacyDB.Conn(ctx)
 	if err != nil {
-		_ = first.Close()
 		t.Fatalf("acquire second pooled connection while first is held: %v", err)
 	}
+	secondClosed := false
+	defer func() {
+		if !secondClosed {
+			_ = second.Close()
+		}
+	}()
 	assertCatalogSource("first held pooled connection", first, query, "GO_LEGACY_SOURCE")
 	assertCatalogSource("second held pooled connection", second, query, "GO_LEGACY_SOURCE")
 	if err := second.Close(); err != nil {
 		t.Fatalf("release second pooled connection: %v", err)
 	}
+	secondClosed = true
 	if err := first.Close(); err != nil {
 		t.Fatalf("release first pooled connection: %v", err)
 	}
+	firstClosed = true
 
 	// These projections exercise the server SQLDA's source metadata under a
 	// table alias, an additional catalog join, and a result-column alias. The
@@ -170,8 +206,8 @@ AS BEGIN RESULT = 1; SUSPEND; END`); err != nil {
 		"GO_LEGACY_DISTINGUISH").Scan(&win1252Source); err != nil {
 		t.Fatalf("WIN1252 distinction read: %v", err)
 	}
-	if !strings.Contains(win1252Source, "¥") || strings.Contains(win1252Source, "ť") {
-		t.Fatalf("WIN1252 A5 decoding = %q, want yen sign and not WIN1250 t-caron", win1252Source)
+	if !strings.Contains(win1252Source, "¥") || strings.Contains(win1252Source, "Ą") {
+		t.Fatalf("WIN1252 A5 decoding = %q, want yen sign and not WIN1250 A-ogonek", win1252Source)
 	}
 }
 
