@@ -53,9 +53,9 @@ func TestRelationDescribeCatalog(t *testing.T) {
 	}
 	for _, want := range []string{
 		"CREATE TABLE \"IMPORT_ORDER_PAYMENT\"",
-		"normalized legacy scaled DOUBLE catalog type",
-		"NUMERIC(15, 2)",
+		"scaled DOUBLE metadata has no numeric subtype",
 		"type=27, scale=-2, subtype=0, precision=NULL",
+		`"RECORDED_AMOUNT" NUMERIC(15, 2)`,
 		"unknown field type 999",
 		"type=999, scale=NULL, subtype=NULL, precision=NULL",
 		"constraints unknown",
@@ -63,6 +63,10 @@ func TestRelationDescribeCatalog(t *testing.T) {
 		if !strings.Contains(got.Body, want) {
 			t.Errorf("description body does not contain %q:\n%s", want, got.Body)
 		}
+	}
+	legacyDescription := descriptionLineForColumn(t, got.Body, `"AMOUNT"`)
+	if strings.Contains(legacyDescription, " NUMERIC(15, 2)") || !strings.Contains(legacyDescription, "type unknown") {
+		t.Errorf("Dialect 3 fallback asserted a Dialect 1 canonical type instead of local uncertainty: %s", legacyDescription)
 	}
 	unknownDescription := got.Body[got.Columns[2].Span.End:]
 	if strings.Contains(unknownDescription, "--   Type label: ") {
@@ -85,6 +89,62 @@ func TestRelationDescribeCatalog(t *testing.T) {
 	relation.ConstraintsLoaded = true
 	if _, err := relation.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) {
 		t.Errorf("legacy relation GenerateDDL error = %v, want ErrUnsupportedDDL", err)
+	}
+}
+
+func TestRelationDescribeCatalogFallbackPreservesNamedLegacyDomain(t *testing.T) {
+	domain := &Domain{Name: "CUSTOM_AMOUNT", SystemFlag: sql.NullInt64{Int64: 0, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeDouble, Valid: true}, FieldScale: sql.NullInt64{Int64: -2, Valid: true}}
+	relation := Relation{Name: "GO_NAMED_NUMERIC", Columns: []Column{{Name: "C", FieldSource: sql.NullString{String: domain.Name, Valid: true}, Domain: domain, DefaultSource: sql.NullString{Valid: true}}}}
+	got, err := relation.DescribeCatalogWithOptions(DDLOptions{Dialect: Dialect1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := got.Body[got.Columns[0].Span.Start:]
+	if !strings.Contains(line, `C CUSTOM_AMOUNT`) {
+		t.Fatalf("fallback lost named domain identity: %s", line)
+	}
+	if strings.Contains(line, "NUMERIC(15, 2)") {
+		t.Fatalf("fallback replaced named domain with storage type: %s", line)
+	}
+	if !strings.Contains(line, "default unknown") {
+		t.Fatalf("invalid local default lacks an unknown-facet note: %s", line)
+	}
+}
+
+func TestRelationDescribeCatalogLegacyNumericFallbackIsDialectScoped(t *testing.T) {
+	domain := &Domain{Name: "RDB$LEGACY", SystemFlag: sql.NullInt64{Int64: 1, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeDouble, Valid: true}, FieldScale: sql.NullInt64{Int64: -2, Valid: true}, FieldSubType: sql.NullInt64{Int64: 0, Valid: true}}
+	relation := Relation{Name: "GO_LEGACY_FALLBACK", Columns: []Column{{Name: "C", Domain: domain, DefaultSource: sql.NullString{Valid: true}}}}
+	for _, test := range []struct {
+		name          string
+		options       DDLOptions
+		wantCanonical bool
+	}{
+		{name: "dialect 1", options: DDLOptions{Dialect: Dialect1}, wantCanonical: true},
+		{name: "no options defaults to dialect 3", wantCanonical: false},
+		{name: "explicit dialect 3", options: DDLOptions{Dialect: Dialect3}, wantCanonical: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var got CatalogDescription
+			var err error
+			if test.name == "no options defaults to dialect 3" {
+				got, err = relation.DescribeCatalog()
+			} else {
+				got, err = relation.DescribeCatalogWithOptions(test.options)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			line := descriptionLineForColumn(t, got.Body, `"C"`)
+			if test.wantCanonical {
+				if !strings.Contains(line, "NUMERIC(15, 2) /* normalized legacy scaled DOUBLE") {
+					t.Fatalf("Dialect 1 did not show canonical legacy type: %s", line)
+				}
+			} else {
+				if strings.Contains(line, "NUMERIC(15, 2)") || !strings.Contains(line, "type unknown") || !strings.Contains(line, "type=27, scale=-2, subtype=0, precision=NULL") {
+					t.Fatalf("Dialect 3 must retain local unknown type plus raw tuple, got: %s", line)
+				}
+			}
+		})
 	}
 }
 

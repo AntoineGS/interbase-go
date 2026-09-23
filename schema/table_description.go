@@ -214,15 +214,15 @@ func descriptionColumnFallback(column Column, notNull *Constraint, renderer ddlR
 	}
 	definition.WriteString(name)
 	if column.Domain != nil {
-		if isLegacyScaledDouble(*column.Domain) {
-			fmt.Fprintf(&definition, " NUMERIC(15, %d) /* normalized legacy scaled DOUBLE catalog type; %s */", -column.Domain.FieldScale.Int64, rawCatalogTypeMetadata(column.Domain))
-		} else if userDomainReference(column.Domain) && column.FieldSource.Valid && strings.TrimSpace(column.FieldSource.String) != "" {
+		if userDomainReference(column.Domain) && column.FieldSource.Valid && strings.TrimSpace(column.FieldSource.String) != "" {
 			domainName, nameErr := renderer.identifier(strings.TrimRight(column.Domain.Name, " "), "column domain")
 			if nameErr == nil {
 				appendDDLClause(&definition, domainName)
 			} else {
 				definition.WriteString(" /* type unknown: " + descriptionComment(nameErr.Error()) + " */")
 			}
+		} else if renderer.dialect == Dialect1 && isLegacyScaledDouble(*column.Domain) {
+			fmt.Fprintf(&definition, " NUMERIC(15, %d) /* normalized legacy scaled DOUBLE catalog type; %s */", -column.Domain.FieldScale.Int64, rawCatalogTypeMetadata(column.Domain))
 		} else if label, typeErr := column.Domain.SQLTypeWithOptions(DDLOptions{Dialect: renderer.dialect}); typeErr == nil {
 			appendDDLClause(&definition, label)
 		} else {
