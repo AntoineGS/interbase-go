@@ -348,6 +348,9 @@ static void test_fixed_text_multibyte_conversion_and_invalid_width(void)
 		(char) 0xe9, ' ', ' ', ' ', ' ', ' ', 'X', 'X', 'X', 'X',
 		'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X'
 	};
+	static const char inconsistent_utf8_value[] = {
+		(char) 0xc3, (char) 0xa9, (char) 0xe4, (char) 0xb8, (char) 0xad
+	};
 	ib_connection connection;
 	ib_cursor cursor;
 	ib_value_view view;
@@ -378,6 +381,79 @@ static void test_fixed_text_multibyte_conversion_and_invalid_width(void)
 		"known-width UTF8 CHAR did not retain one two-byte character and four pads");
 	free(cursor.metadata);
 	ib_free_sqlda(cursor.output);
+
+	/* A byte-fitting width may still exceed the complete decoded characters. */
+	memset(&connection, 0, sizeof(connection));
+	connection.charset = IB_CHARSET_UTF8;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.output = ib_alloc_sqlda(1);
+	require_condition(cursor.output != NULL, "inconsistent-width SQLDA allocation failed");
+	cursor.output->sqld = 1;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = IB_CHARSET_UTF8;
+	cursor.output->sqlvar[0].sqllen = sizeof(inconsistent_utf8_value);
+	cursor.metadata = (ib_column_metadata *) calloc(1U, sizeof(*cursor.metadata));
+	require_condition(cursor.metadata != NULL, "inconsistent-width metadata allocation failed");
+	cursor.metadata[0].length = 4;
+	cursor.metadata[0].has_length = 1;
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"inconsistent-width output allocation failed");
+	memcpy(cursor.output->sqlvar[0].sqldata, inconsistent_utf8_value,
+		sizeof(inconsistent_utf8_value));
+	cursor.fetched = 1;
+	require_condition(ib_cursor_column(&cursor, 0, &view, &error) != 0 && error != NULL,
+		"CHAR width exceeding complete UTF8 characters was silently truncated");
+	free(error);
+	free(cursor.metadata);
+	ib_free_sqlda(cursor.output);
+
+	/* SQLDA sqllen is a short, so fixed CHAR cannot reach the 32 KiB iconv chunk. */
+	{
+		const size_t ascii_count = 32764U;
+		const size_t source_length = ascii_count + 3U;
+		char *source = (char *) malloc(source_length);
+		require_condition(source != NULL, "chunk-boundary source allocation failed");
+		memset(source, 'A', ascii_count);
+		source[ascii_count] = (char) 0xd6; /* GB2312 中. */
+		source[ascii_count + 1U] = (char) 0xd0;
+		source[ascii_count + 2U] = ' ';
+		memset(&connection, 0, sizeof(connection));
+		connection.charset = 57; /* GB_2312 attachment charset. */
+		memset(&cursor, 0, sizeof(cursor));
+		cursor.connection = &connection;
+		cursor.output = ib_alloc_sqlda(1);
+		require_condition(cursor.output != NULL, "GB2312 output SQLDA allocation failed");
+		cursor.output->sqld = 1;
+		cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+		cursor.output->sqlvar[0].sqlsubtype = 3; /* UNICODE_FSS source column. */
+		cursor.output->sqlvar[0].sqllen = (short) source_length;
+		cursor.metadata = (ib_column_metadata *) calloc(1U, sizeof(*cursor.metadata));
+		require_condition(cursor.metadata != NULL, "GB2312 metadata allocation failed");
+		cursor.metadata[0].length = (int) ascii_count + 1;
+		cursor.metadata[0].has_length = 1;
+		error = NULL;
+		require_success(ib_allocate_output(&cursor, &error), error,
+			"GB2312 output allocation failed");
+		memcpy(cursor.output->sqlvar[0].sqldata, source, source_length);
+		cursor.fetched = 1;
+		require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+			"GB2312 multibyte-source conversion failed");
+		require_condition(view.length == ascii_count + 3U &&
+			memcmp(view.bytes, source, ascii_count) == 0 &&
+			memcmp(view.bytes + ascii_count, "\xe4\xb8\xad", 3U) == 0,
+			"GB2312 conversion or character-boundary prefix lost the multibyte character");
+		require_success(ib_cursor_column(&cursor, 0, &view, &error), error,
+			"repeated GB2312 conversion failed");
+		require_condition(view.length == ascii_count + 3U &&
+			memcmp(view.bytes + ascii_count, "\xe4\xb8\xad", 3U) == 0,
+			"repeated conversion did not preserve the bounded character prefix");
+		free(cursor.converted_value);
+		free(cursor.metadata);
+		ib_free_sqlda(cursor.output);
+		free(source);
+	}
 
 	memset(&connection, 0, sizeof(connection));
 	connection.charset = IB_CHARSET_WIN1252;

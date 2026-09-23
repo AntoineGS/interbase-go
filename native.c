@@ -8648,6 +8648,65 @@ static size_t ib_utf8_prefix_length(const char *data, size_t length,
 	return offset;
 }
 
+static int ib_utf8_checked_prefix_length(const char *data, size_t length,
+	size_t character_count, size_t *prefix_length, char **error)
+{
+	size_t offset;
+	size_t count;
+
+	if (data == NULL || prefix_length == NULL) {
+		return ib_fail(error, "UTF8 character prefix storage is unavailable");
+	}
+	offset = 0U;
+	for (count = 0U; count < character_count; count++) {
+		unsigned char first;
+		size_t width;
+		uint32_t codepoint;
+		size_t continuation;
+
+		if (offset >= length) {
+			return ib_fail(error,
+				"declared CHAR width exceeds complete decoded characters");
+		}
+		first = (unsigned char) data[offset];
+		if (first < 0x80U) {
+			width = 1U;
+			codepoint = first;
+		} else if (first >= 0xc2U && first <= 0xdfU) {
+			width = 2U;
+			codepoint = (uint32_t) (first & 0x1fU);
+		} else if (first >= 0xe0U && first <= 0xefU) {
+			width = 3U;
+			codepoint = (uint32_t) (first & 0x0fU);
+		} else if (first >= 0xf0U && first <= 0xf4U) {
+			width = 4U;
+			codepoint = (uint32_t) (first & 0x07U);
+		} else {
+			return ib_fail(error, "invalid UTF8 character in fixed CHAR value");
+		}
+		if (width > length - offset) {
+			return ib_fail(error,
+				"declared CHAR width exceeds complete decoded characters");
+		}
+		for (continuation = 1U; continuation < width; continuation++) {
+			unsigned char byte = (unsigned char) data[offset + continuation];
+			if ((byte & 0xc0U) != 0x80U) {
+				return ib_fail(error, "invalid UTF8 character in fixed CHAR value");
+			}
+			codepoint = (codepoint << 6) | (uint32_t) (byte & 0x3fU);
+		}
+		if ((width == 3U && codepoint < 0x800U) ||
+			(width == 4U && codepoint < 0x10000U) ||
+			(codepoint >= 0xd800U && codepoint <= 0xdfffU) ||
+			codepoint > 0x10ffffU) {
+			return ib_fail(error, "invalid UTF8 character in fixed CHAR value");
+		}
+		offset += width;
+	}
+	*prefix_length = offset;
+	return 0;
+}
+
 static size_t ib_text_character_count_for_charset(size_t length, short charset)
 {
 	switch (charset) {
@@ -8694,23 +8753,6 @@ static size_t ib_fixed_text_character_count(const ib_cursor *cursor,
 	}
 	/* Invalid evidence is unknown; never let it cap the fixed buffer. */
 	return 0U;
-}
-
-static size_t ib_utf8_text_length(const ib_cursor *cursor, const XSQLVAR *variable,
-	size_t index)
-{
-	size_t length;
-	size_t character_count;
-
-	if (variable == NULL || variable->sqllen < 0 || variable->sqldata == NULL) {
-		return 0U;
-	}
-	length = (size_t) variable->sqllen;
-	character_count = ib_fixed_text_character_count(cursor, variable, index);
-	if (character_count == 0U) {
-		return length;
-	}
-	return ib_utf8_prefix_length(variable->sqldata, length, character_count);
 }
 
 static size_t ib_array_character_count(const ISC_ARRAY_DESC_V2 *descriptor,
@@ -9204,9 +9246,6 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 	case SQL_TEXT:
 		source_length = (size_t) variable->sqllen;
 		character_count = ib_fixed_text_character_count(cursor, variable, index);
-		if (connection_charset == IB_CHARSET_UTF8) {
-			source_length = ib_utf8_text_length(cursor, variable, index);
-		}
 		if (connection_charset != 0 && connection_charset != IB_CHARSET_UTF8 &&
 			text_charset != 1) {
 			/* Convert every descriptor byte before applying a known character width;
@@ -9217,15 +9256,22 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 			if (converted == NULL) {
 				return -1;
 			}
-			if (character_count != 0U) {
-				converted_length = ib_utf8_prefix_length(converted, converted_length,
-					character_count);
+			if (character_count != 0U &&
+				ib_utf8_checked_prefix_length(converted, converted_length,
+					character_count, &source_length, error) != 0) {
+				free(converted);
+				return -1;
 			}
 			((ib_cursor *) cursor)->converted_value = converted;
 			view->bytes = converted;
-			view->length = converted_length;
+			view->length = character_count == 0U ? converted_length : source_length;
 		} else {
 			view->bytes = variable->sqldata;
+			if (character_count != 0U &&
+				ib_utf8_checked_prefix_length(variable->sqldata, source_length,
+					character_count, &source_length, error) != 0) {
+				return -1;
+			}
 			view->length = source_length;
 		}
 		view->kind = text_charset == 1 ? IB_VALUE_BYTES : IB_VALUE_STRING;
