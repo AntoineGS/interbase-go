@@ -56,6 +56,47 @@ func TestIntrospectionPlanReturnsSelectPlan(t *testing.T) {
 	}
 }
 
+func TestIntrospectionDescribeInputsReportsTypesWithoutExecutingDML(t *testing.T) {
+	db := newDatabaseWithDialect(t, 3)
+	ctx := readContext(t)
+	pooled, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("DB.Conn(): %v", err)
+	}
+	defer pooled.Close()
+
+	descriptors, err := interbase.DescribeInputs(ctx, pooled,
+		"SELECT ID FROM GO_COUNTRY WHERE ID = ? AND COUNTRY = ?")
+	if err != nil {
+		t.Fatalf("pooled DescribeInputs(): %v", err)
+	}
+	if len(descriptors) != 2 || descriptors[0].Kind != "INTEGER" || descriptors[1].Kind != "VARCHAR" {
+		t.Fatalf("input descriptors = %+v, want INTEGER then VARCHAR", descriptors)
+	}
+
+	const probeID = 9199
+	var before int64
+	if err := pooled.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM GO_WRITE WHERE ID = ?", probeID).Scan(&before); err != nil {
+		t.Fatalf("count probe rows before DML prepare: %v", err)
+	}
+	if before != 0 {
+		t.Fatalf("probe rows before DML prepare = %d, want 0", before)
+	}
+	if _, err := interbase.DescribeInputs(ctx, pooled,
+		"INSERT INTO GO_WRITE (ID, WRITE_VALUE, LABEL) VALUES (9199, 91, 'describe only')"); err != nil {
+		t.Fatalf("DescribeInputs() for read-only DML prepare: %v", err)
+	}
+	var after int64
+	if err := pooled.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM GO_WRITE WHERE ID = ?", probeID).Scan(&after); err != nil {
+		t.Fatalf("count probe rows after DML prepare: %v", err)
+	}
+	if after != before {
+		t.Fatalf("probe rows after DML prepare = %d, want unchanged count %d", after, before)
+	}
+}
+
 // TestIntrospectionPlanForDMLDoesNotExecuteImplicitly establishes only that the
 // read-only default path is safe. With no explicit transaction the native
 // prepare transaction is read-only, so a hypothetical execute would be refused

@@ -102,6 +102,8 @@ struct ib_statement;
 struct ib_statement *ib_statement_prepare(ib_connection *, const char *, size_t,
 	ib_cancel_slot *, uint64_t, char **);
 int ib_statement_num_input(const struct ib_statement *);
+int ib_statement_input_metadata(const struct ib_statement *, size_t,
+	ib_input_metadata *, char **);
 int ib_statement_exec(struct ib_statement *, const ib_bindings *, ib_cancel_slot *,
 	uint64_t, int64_t *, char **);
 ib_cursor *ib_statement_query(struct ib_statement *, const ib_bindings *, ib_cancel_slot *,
@@ -171,6 +173,7 @@ static int describe_user_charset_identifier;
 static int describe_user_column_alias;
 static int describe_procedure_decimal;
 static int describe_procedure_source;
+static int describe_input_metadata_case;
 static int complete_during_prepare;
 static int user_execute2_calls;
 static int64_t last_execute_value;
@@ -698,6 +701,7 @@ static void reset_mocks(void)
 	describe_user_column_alias = 0;
 	describe_procedure_decimal = 0;
 	describe_procedure_source = 0;
+	describe_input_metadata_case = 0;
 	complete_during_prepare = 0;
 	fail_next_native_mutex_lock = 0;
 	fail_next_native_cond_wait = 0;
@@ -1088,6 +1092,11 @@ ISC_STATUS ISC_EXPORT test_dsql_describe_bind(ISC_STATUS *status,
 		input->sqlvar[index].sqlsubtype = 0;
 		input->sqlvar[index].sqlprecision = 0;
 		input->sqlvar[index].sqllen = (short) sizeof(ISC_INT64);
+		if (describe_input_metadata_case) {
+			input->sqlvar[index].sqlscale = -2;
+			input->sqlvar[index].sqlsubtype = 1;
+			input->sqlvar[index].sqlprecision = 18;
+		}
 	}
 	return status_result(status, 0);
 }
@@ -1832,6 +1841,44 @@ static void test_prepare_once_execute_repeated(void)
 		"prepared statement close failed");
 	ib_error_free(error);
 	check(free_statement_calls == 1, "prepared handle was not freed exactly once");
+	free(connection);
+}
+
+static void test_prepared_input_metadata_accessor(void)
+{
+	ib_connection *connection;
+	struct ib_statement *statement;
+	ib_input_metadata metadata = {0};
+	char *error = NULL;
+
+	reset_mocks();
+	describe_input_metadata_case = 1;
+	connection = new_connection();
+	statement = prepare_statement(connection, isc_info_sql_stmt_insert);
+	check(statement != NULL, "input metadata test statement did not prepare");
+	if (statement == NULL) {
+		free(connection);
+		return;
+	}
+	check(ib_statement_input_metadata(statement, 0U, &metadata, &error) == 0 &&
+		error == NULL, "prepared input metadata accessor failed");
+	check(metadata.sql_type == SQL_INT64 && metadata.sql_subtype == 1 &&
+		metadata.sql_scale == -2 && metadata.sql_precision == 18 &&
+		metadata.nullable == 1,
+		"prepared input metadata accessor did not copy normalized SQLDA fields");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_statement_input_metadata(statement, 1U, &metadata, &error) != 0 &&
+		error != NULL, "prepared input metadata accessor accepted an out-of-range index");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_statement_input_metadata(NULL, 0U, &metadata, &error) != 0 &&
+		error != NULL, "prepared input metadata accessor accepted a null statement");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"input metadata test statement did not close");
+	ib_error_free(error);
 	free(connection);
 }
 
@@ -3633,6 +3680,7 @@ int main(void)
 	test_procedure_transition_drop_failure_retires_connection();
 	test_catalog_drop_failure_stops_user_execution();
 	test_prepare_once_execute_repeated();
+	test_prepared_input_metadata_accessor();
 	test_failed_implicit_execution_keeps_handle();
 	test_prepare_failure_releases_handle_and_transaction();
 	test_failed_prepare_rollback_marks_connection_broken();

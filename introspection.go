@@ -15,7 +15,22 @@ type Introspector interface {
 	Plan(ctx context.Context, query string) (string, error)
 }
 
+// InputDescriptor is one positional input parameter description returned by
+// the server for a prepared statement.
+type InputDescriptor struct {
+	Kind                      string
+	Subtype, Scale, Precision int
+	Nullable                  bool
+}
+
+// InputDescriber is an optional interface implemented by driver connections
+// that can describe prepared input parameters.
+type InputDescriber interface {
+	DescribeInputs(ctx context.Context, query string) ([]InputDescriptor, error)
+}
+
 var _ Introspector = (*conn)(nil)
+var _ InputDescriber = (*conn)(nil)
 
 // ErrNotInterBaseConn reports a connection that does not belong to this driver.
 var ErrNotInterBaseConn = errors.New("interbase: connection is not an InterBase connection")
@@ -186,6 +201,35 @@ func Plan(ctx context.Context, conn *sql.Conn, query string) (string, error) {
 	return result, nil
 }
 
+// DescribeInputs describes the positional input parameters for query using the
+// attachment behind a pooled database/sql connection. It never executes the
+// statement or opens another native attachment.
+//
+// The driver error is returned unchanged. A connection that does not belong to
+// this driver, including a nil one, returns ErrNotInterBaseConn; a conn that
+// has already been closed returns sql.ErrConnDone from Raw.
+func DescribeInputs(ctx context.Context, conn *sql.Conn, query string) ([]InputDescriptor, error) {
+	if conn == nil {
+		return nil, ErrNotInterBaseConn
+	}
+	var result []InputDescriptor
+	if err := conn.Raw(func(driverConn any) error {
+		describer, ok := driverConn.(InputDescriber)
+		if !ok {
+			return ErrNotInterBaseConn
+		}
+		descriptors, err := describer.DescribeInputs(ctx, query)
+		if err != nil {
+			return err
+		}
+		result = descriptors
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // Plan prepares query and returns its server-generated plan without executing
 // it, using the attachment behind this connection. The prepared statement is
 // never registered with the connection and is always closed before returning.
@@ -216,42 +260,93 @@ func (c *conn) Plan(ctx context.Context, query string) (string, error) {
 	if err := contextError(ctx); err != nil {
 		return "", err
 	}
+	var plan string
+	if err := c.inspectPreparedStatementLocked(ctx, query, "plan", func(statement *nativeStatement) error {
+		var err error
+		plan, err = statement.plan()
+		return err
+	}); err != nil {
+		return "", err
+	}
+	return plan, nil
+}
+
+// DescribeInputs prepares query and copies its positional input SQLDA fields
+// before closing the statement. It never executes the statement or registers it
+// with the connection.
+func (c *conn) DescribeInputs(ctx context.Context, query string) ([]InputDescriptor, error) {
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	if err := validateDatabaseSQLQuery(query); err != nil {
+		return nil, err
+	}
+	c.lockDirect()
+	defer c.mu.Unlock()
+	// Distributed attachments are only used through explicit Attachment
+	// participants, but retain Plan's guard on this shared connection method.
+	if c.distributed != nil {
+		return nil, ErrDistributedParticipantManaged
+	}
+	if c.closed || c.native == nil || c.native.broken() {
+		return nil, driver.ErrBadConn
+	}
+	if err := contextError(ctx); err != nil {
+		return nil, err
+	}
+	var descriptors []InputDescriptor
+	if err := c.inspectPreparedStatementLocked(ctx, query, "describe inputs", func(statement *nativeStatement) error {
+		var err error
+		descriptors, err = statement.inputDescriptors()
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	return descriptors, nil
+}
+
+// inspectPreparedStatementLocked shares Plan's prepare, cancellation, error
+// classification, invalidation, and close lifecycle with input description.
+// The caller holds c.mu for the duration of this helper.
+func (c *conn) inspectPreparedStatementLocked(ctx context.Context, query, operation string,
+	inspect func(*nativeStatement) error) error {
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer releaseNative()
 	statement, err := c.native.prepare(ctx, query)
 	if err != nil {
 		releaseNative()
+		prepareOperation := "prepare " + operation
 		evidence := nativeCancellationEvidenceOf(err)
 		parts := splitNativeExecutionError(err)
-		operationErr := c.sanitizeError("prepare plan", parts.primary)
+		operationErr := c.sanitizeError(prepareOperation, parts.primary)
 		cleanupErr := c.sanitizeError("", parts.cleanup)
-		operationErr = classifyNativeOutcome("prepare plan", false,
+		operationErr = classifyNativeOutcome(prepareOperation, false,
 			contextCancellation(ctx), operationErr, cleanupErr, evidence)
 		operationErr = joinNativeRequestDiagnostic(operationErr,
 			c.sanitizeError("", parts.request))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
-		return "", operationErr
+		return operationErr
 	}
 	if err := contextError(ctx); err != nil {
-		return "", errors.Join(err, statement.close())
+		return errors.Join(err, statement.close())
 	}
-	plan, planErr := statement.plan()
+	inspectErr := inspect(statement)
 	closeErr := statement.close()
 	releaseNative()
-	if planErr != nil || closeErr != nil {
-		operationErr := c.sanitizeError("plan", errors.Join(planErr, closeErr))
+	if inspectErr != nil || closeErr != nil {
+		operationErr := c.sanitizeError(operation, errors.Join(inspectErr, closeErr))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
-		return "", operationErr
+		return operationErr
 	}
 	if err := contextError(ctx); err != nil {
-		return "", err
+		return err
 	}
-	return plan, nil
+	return nil
 }

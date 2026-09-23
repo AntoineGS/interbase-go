@@ -2,9 +2,11 @@ package interbase
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"math"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -119,6 +121,72 @@ func TestNativeStatementPlanReturnsOverrideError(t *testing.T) {
 	}
 }
 
+func TestNativeStatementInputDescriptorsCopiesSQLDAMetadataInOrder(t *testing.T) {
+	inputs := []nativeInputMetadata{
+		{sqlType: 496, sqlSubtype: 1, sqlScale: -2, sqlPrecision: 18, nullable: true},
+		{sqlType: 448, sqlSubtype: 3, sqlScale: 0, sqlPrecision: 0},
+	}
+	statement := &nativeStatement{
+		numInputOverride: func() int { return len(inputs) },
+		inputMetadataOverride: func(index int) (nativeInputMetadata, error) {
+			return inputs[index], nil
+		},
+	}
+
+	got, err := statement.inputDescriptors()
+	if err != nil {
+		t.Fatalf("(*nativeStatement).inputDescriptors() error = %v", err)
+	}
+	want := []InputDescriptor{
+		{Kind: "INTEGER", Subtype: 1, Scale: -2, Precision: 18, Nullable: true},
+		{Kind: "VARCHAR", Subtype: 3},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("(*nativeStatement).inputDescriptors() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNativeStatementInputDescriptorsNormalizesEverySQLType(t *testing.T) {
+	tests := []struct {
+		name     string
+		typeCode int
+		want     string
+	}{
+		{name: "CHAR", typeCode: 452, want: "CHAR"},
+		{name: "VARCHAR", typeCode: 448, want: "VARCHAR"},
+		{name: "SMALLINT", typeCode: 500, want: "SMALLINT"},
+		{name: "INTEGER", typeCode: 496, want: "INTEGER"},
+		{name: "BIGINT", typeCode: 580, want: "BIGINT"},
+		{name: "FLOAT", typeCode: 482, want: "FLOAT"},
+		{name: "DOUBLE", typeCode: 480, want: "DOUBLE PRECISION"},
+		{name: "D_FLOAT", typeCode: 530, want: "DOUBLE PRECISION"},
+		{name: "DATE", typeCode: 570, want: "DATE"},
+		{name: "TIME", typeCode: 560, want: "TIME"},
+		{name: "TIMESTAMP", typeCode: 510, want: "TIMESTAMP"},
+		{name: "BOOLEAN", typeCode: 590, want: "BOOLEAN"},
+		{name: "BLOB", typeCode: 520, want: "BLOB"},
+		{name: "ARRAY", typeCode: 540, want: "ARRAY"},
+		{name: "unknown", typeCode: -1, want: "UNKNOWN"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			statement := &nativeStatement{
+				numInputOverride: func() int { return 1 },
+				inputMetadataOverride: func(int) (nativeInputMetadata, error) {
+					return nativeInputMetadata{sqlType: test.typeCode}, nil
+				},
+			}
+			got, err := statement.inputDescriptors()
+			if err != nil {
+				t.Fatalf("(*nativeStatement).inputDescriptors() error = %v", err)
+			}
+			if len(got) != 1 || got[0].Kind != test.want {
+				t.Fatalf("descriptor = %+v, want Kind %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestConnPlanReturnsPlanAndClosesTheStatementExactlyOnce(t *testing.T) {
 	closeCalls := 0
 	native := introspectionTestNative(3)
@@ -146,6 +214,202 @@ func TestConnPlanReturnsPlanAndClosesTheStatementExactlyOnce(t *testing.T) {
 	}
 	if closeCalls != 1 {
 		t.Fatalf("statement close calls = %d, want 1", closeCalls)
+	}
+}
+
+func TestConnDescribeInputsReturnsDescriptorsAndClosesTheStatementExactlyOnce(t *testing.T) {
+	closeCalls := 0
+	inputs := []nativeInputMetadata{
+		{sqlType: 496, sqlSubtype: 1, sqlScale: -2, sqlPrecision: 18, nullable: true},
+		{sqlType: 448, sqlSubtype: 0, nullable: false},
+	}
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			numInputOverride: func() int { return len(inputs) },
+			inputMetadataOverride: func(index int) (nativeInputMetadata, error) {
+				return inputs[index], nil
+			},
+			closeOverride: func() error { closeCalls++; return nil },
+			execOverride: func([]argument) (int64, error) {
+				t.Fatal("(*conn).DescribeInputs executed the statement; it must only prepare")
+				return 0, nil
+			},
+		}, nil
+	}
+	connection := &conn{native: native}
+	got, err := connection.DescribeInputs(context.Background(), "SELECT ID FROM GO_COUNTRY WHERE ID = ? AND COUNTRY = ?")
+	if err != nil {
+		t.Fatalf("(*conn).DescribeInputs() error = %v", err)
+	}
+	want := []InputDescriptor{
+		{Kind: "INTEGER", Subtype: 1, Scale: -2, Precision: 18, Nullable: true},
+		{Kind: "VARCHAR"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("(*conn).DescribeInputs() = %#v, want %#v", got, want)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("statement close calls = %d, want 1", closeCalls)
+	}
+}
+
+func TestConnDescribeInputsWithNoInputsReturnsAnEmptySliceAndCloses(t *testing.T) {
+	closeCalls := 0
+	prepareCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		prepareCalls++
+		return &nativeStatement{
+			numInputOverride: func() int { return 0 },
+			inputMetadataOverride: func(int) (nativeInputMetadata, error) {
+				t.Fatal("input metadata accessor called for a statement with no inputs")
+				return nativeInputMetadata{}, nil
+			},
+			closeOverride: func() error { closeCalls++; return nil },
+		}, nil
+	}
+	connection := &conn{native: native}
+	got, err := connection.DescribeInputs(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY")
+	if err != nil {
+		t.Fatalf("(*conn).DescribeInputs() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("(*conn).DescribeInputs() = %+v, want no input descriptors", got)
+	}
+	if prepareCalls != 1 || closeCalls != 1 {
+		t.Fatalf("prepare/close calls = %d/%d, want 1/1", prepareCalls, closeCalls)
+	}
+}
+
+func TestConnDescribeInputsJoinsDescriptorAndCloseFailures(t *testing.T) {
+	describeErr := errors.New("injected input descriptor failure")
+	closeErr := errors.New("injected close failure")
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			numInputOverride: func() int { return 1 },
+			inputMetadataOverride: func(int) (nativeInputMetadata, error) {
+				return nativeInputMetadata{}, describeErr
+			},
+			closeOverride: func() error { return closeErr },
+		}, nil
+	}
+	connection := &conn{native: native}
+	if _, err := connection.DescribeInputs(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?"); !errors.Is(err, describeErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("(*conn).DescribeInputs() error = %v, want descriptor and close failures", err)
+	}
+}
+
+func TestConnDescribeInputsRejectsClosedConnectionBeforePreparing(t *testing.T) {
+	prepareCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		prepareCalls++
+		return nil, errors.New("native prepare must not be reached")
+	}
+	connection := &conn{native: native}
+	if err := connection.Close(); err != nil {
+		t.Fatalf("(*conn).Close() error = %v", err)
+	}
+	if _, err := connection.DescribeInputs(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY"); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("(*conn).DescribeInputs() error = %v, want driver.ErrBadConn", err)
+	}
+	if prepareCalls != 0 {
+		t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
+	}
+}
+
+func TestConnDescribeInputsHonorsCanceledContextBeforePreparing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prepareCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		prepareCalls++
+		return nil, errors.New("native prepare must not be reached")
+	}
+	connection := &conn{native: native}
+	if _, err := connection.DescribeInputs(ctx, "SELECT COUNTRY FROM GO_COUNTRY"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("(*conn).DescribeInputs() error = %v, want context.Canceled", err)
+	}
+	if prepareCalls != 0 {
+		t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
+	}
+}
+
+func TestConnDescribeInputsRejectsBrokenConnectionBeforePreparing(t *testing.T) {
+	prepareCalls := 0
+	native := introspectionTestNative(3)
+	native.brokenOverride = func() bool { return true }
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		prepareCalls++
+		return nil, errors.New("native prepare must not be reached")
+	}
+	connection := &conn{native: native}
+	if _, err := connection.DescribeInputs(context.Background(), "SELECT COUNTRY FROM GO_COUNTRY"); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("(*conn).DescribeInputs() error = %v, want driver.ErrBadConn", err)
+	}
+	if prepareCalls != 0 {
+		t.Fatalf("native prepare calls = %d, want 0", prepareCalls)
+	}
+}
+
+func TestPooledDescribeInputsReturnsDescriptorsAndClosesTheStatement(t *testing.T) {
+	closeCalls := 0
+	native := introspectionTestNative(3)
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			numInputOverride: func() int { return 1 },
+			inputMetadataOverride: func(int) (nativeInputMetadata, error) {
+				return nativeInputMetadata{sqlType: 500, nullable: true}, nil
+			},
+			closeOverride: func() error { closeCalls++; return nil },
+		}, nil
+	}
+	db := openDatabaseSQLTestDB(t, &conn{native: native})
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	defer pooled.Close()
+	got, err := DescribeInputs(context.Background(), pooled, "SELECT COUNTRY FROM GO_COUNTRY WHERE ID = ?")
+	if err != nil {
+		t.Fatalf("DescribeInputs() error = %v", err)
+	}
+	want := []InputDescriptor{{Kind: "SMALLINT", Nullable: true}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("DescribeInputs() = %#v, want %#v", got, want)
+	}
+	if closeCalls != 1 {
+		t.Fatalf("statement close calls = %d, want 1", closeCalls)
+	}
+}
+
+func TestPooledDescribeInputsRejectsClosedForeignAndNilConnections(t *testing.T) {
+	db := openDatabaseSQLTestDB(t, &conn{native: introspectionTestNative(3)})
+	pooled, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("DB.Conn() error = %v", err)
+	}
+	if err := pooled.Close(); err != nil {
+		t.Fatalf("sql.Conn.Close() error = %v", err)
+	}
+	if _, err := DescribeInputs(context.Background(), pooled, "SELECT COUNTRY FROM GO_COUNTRY"); !errors.Is(err, sql.ErrConnDone) {
+		t.Fatalf("DescribeInputs() on closed connection error = %v, want sql.ErrConnDone", err)
+	}
+
+	foreignDB := openDatabaseSQLTestDB(t, notInterBaseTestConn{})
+	foreign, err := foreignDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("foreign DB.Conn() error = %v", err)
+	}
+	defer foreign.Close()
+	if _, err := DescribeInputs(context.Background(), foreign, "SELECT 1 FROM RDB$DATABASE"); !errors.Is(err, ErrNotInterBaseConn) {
+		t.Fatalf("DescribeInputs() on foreign connection error = %v, want ErrNotInterBaseConn", err)
+	}
+	if _, err := DescribeInputs(context.Background(), nil, "SELECT 1 FROM RDB$DATABASE"); !errors.Is(err, ErrNotInterBaseConn) {
+		t.Fatalf("DescribeInputs(nil) error = %v, want ErrNotInterBaseConn", err)
 	}
 }
 

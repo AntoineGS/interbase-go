@@ -4,6 +4,7 @@ package interbase
 #cgo linux,amd64 CFLAGS: -I/opt/interbase/include
 #cgo linux,amd64 LDFLAGS: -L/opt/interbase/lib -Wl,-rpath,/opt/interbase/lib -lgds
 #include <stdlib.h>
+#include <ibase.h>
 #include "native.h"
 */
 import "C"
@@ -769,7 +770,16 @@ type nativeStatement struct {
 	writeOutcomeStateOverride func() nativeWriteOutcomeState
 	closeOverride             func() error
 	numInputOverride          func() int
+	inputMetadataOverride     func(int) (nativeInputMetadata, error)
 	planOverride              func() (string, error)
+}
+
+type nativeInputMetadata struct {
+	sqlType      int
+	sqlSubtype   int
+	sqlScale     int
+	sqlPrecision int
+	nullable     bool
 }
 
 func (s *nativeStatement) writeOutcomeState() nativeWriteOutcomeState {
@@ -1186,6 +1196,85 @@ func (s *nativeStatement) numInput() int {
 		return 0
 	}
 	return int(C.ib_statement_num_input(s.ptr))
+}
+
+func (s *nativeStatement) inputDescriptors() ([]InputDescriptor, error) {
+	release := nativegate.Global.Enter()
+	defer release()
+	if s == nil || (s.ptr == nil &&
+		(s.numInputOverride == nil || s.inputMetadataOverride == nil)) {
+		return nil, errors.New("interbase: native statement is unavailable")
+	}
+	numInput := s.numInput()
+	if numInput < 0 {
+		return nil, errors.New("interbase: native statement has an invalid input count")
+	}
+	descriptors := make([]InputDescriptor, numInput)
+	for index := range descriptors {
+		var metadata nativeInputMetadata
+		if s.inputMetadataOverride != nil {
+			var err error
+			metadata, err = s.inputMetadataOverride(index)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			var nativeMetadata C.ib_input_metadata
+			var errorPointer *C.char
+			if result := C.ib_statement_input_metadata(s.ptr, C.size_t(index),
+				&nativeMetadata, &errorPointer); result != 0 {
+				return nil, takeNativeError(errorPointer)
+			}
+			metadata = nativeInputMetadata{
+				sqlType:      int(nativeMetadata.sql_type),
+				sqlSubtype:   int(nativeMetadata.sql_subtype),
+				sqlScale:     int(nativeMetadata.sql_scale),
+				sqlPrecision: int(nativeMetadata.sql_precision),
+				nullable:     nativeMetadata.nullable != 0,
+			}
+		}
+		descriptors[index] = InputDescriptor{
+			Kind:      inputDescriptorKind(metadata.sqlType),
+			Subtype:   metadata.sqlSubtype,
+			Scale:     metadata.sqlScale,
+			Precision: metadata.sqlPrecision,
+			Nullable:  metadata.nullable,
+		}
+	}
+	return descriptors, nil
+}
+
+func inputDescriptorKind(sqlType int) string {
+	switch sqlType {
+	case int(C.SQL_TEXT):
+		return "CHAR"
+	case int(C.SQL_VARYING):
+		return "VARCHAR"
+	case int(C.SQL_SHORT):
+		return "SMALLINT"
+	case int(C.SQL_LONG):
+		return "INTEGER"
+	case int(C.SQL_INT64):
+		return "BIGINT"
+	case int(C.SQL_FLOAT):
+		return "FLOAT"
+	case int(C.SQL_DOUBLE), int(C.SQL_D_FLOAT):
+		return "DOUBLE PRECISION"
+	case int(C.SQL_TYPE_DATE):
+		return "DATE"
+	case int(C.SQL_TYPE_TIME):
+		return "TIME"
+	case int(C.SQL_TIMESTAMP):
+		return "TIMESTAMP"
+	case int(C.SQL_BOOLEAN):
+		return "BOOLEAN"
+	case int(C.SQL_BLOB):
+		return "BLOB"
+	case int(C.SQL_ARRAY):
+		return "ARRAY"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 func (s *nativeStatement) exec(ctx context.Context, args []argument) (int64, error) {
