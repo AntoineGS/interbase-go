@@ -19,6 +19,9 @@ func TestCatalogIdentifierProjectionsUseCatalogByteWidths(t *testing.T) {
 	if got := widths[identifierField{relation: "RDB$RELATIONS", field: "RDB$RELATION_NAME"}]; got != 67 {
 		t.Fatalf("relation-name width = %d, want 67 bytes", got)
 	}
+	if got := widths[identifierField{relation: "RDB$RELATION_FIELDS", field: "RDB$RELATION_NAME"}]; got != 31 {
+		t.Fatalf("relation-field relation-name width = %d, want 31 bytes", got)
+	}
 	if got := widths[identifierField{relation: "RDB$RELATION_FIELDS", field: "RDB$FIELD_NAME"}]; got != 31 {
 		t.Fatalf("field-name width = %d, want 31 bytes", got)
 	}
@@ -68,8 +71,60 @@ func TestCatalogIdentifierProjectionsUseCatalogByteWidths(t *testing.T) {
 	if _, err := catalog.identifierWidths(context.Background()); err != nil {
 		t.Fatalf("cached identifierWidths returned error: %v", err)
 	}
-	if calls := state.callsSnapshot(); len(calls) != 3 {
+	calls := state.callsSnapshot()
+	if len(calls) != 3 {
 		t.Fatalf("identifier width query count after cached read = %d, want 3", len(calls))
+	}
+	var bootstrappedRelationFieldWidth bool
+	var projectedRelationFieldWidth bool
+	for _, call := range calls {
+		if fixtureQueryKind(call.query) == "identifier_width_bootstrap" && len(call.args) == 2 &&
+			call.args[0].Value == "RDB$RELATION_FIELDS" && call.args[1].Value == "RDB$RELATION_NAME" {
+			bootstrappedRelationFieldWidth = true
+		}
+		if fixtureQueryKind(call.query) == "identifier_widths" && strings.Contains(normalizeFixtureSQL(call.query), "CAST(RF.RDB$RELATION_NAME AS VARCHAR(31))") {
+			projectedRelationFieldWidth = true
+		}
+	}
+	if !bootstrappedRelationFieldWidth {
+		t.Fatal("identifier width bootstrap did not use RDB$RELATION_FIELDS.RDB$RELATION_NAME")
+	}
+	if !projectedRelationFieldWidth {
+		t.Fatal("identifier widths query did not project RDB$RELATION_FIELDS.RDB$RELATION_NAME at its 31-byte width")
+	}
+}
+
+func TestRelationColumnsProjectRelationNameWithSourceWidth(t *testing.T) {
+	db := openFixtureDB(t)
+	defer db.Close()
+
+	query, err := New(db).relationColumnsQuery(context.Background())
+	if err != nil {
+		t.Fatalf("relationColumnsQuery returned error: %v", err)
+	}
+	if want := "CAST(RF.RDB$RELATION_NAME AS VARCHAR(31)) AS RDB$RELATION_NAME"; !strings.Contains(normalizeFixtureSQL(query), want) {
+		t.Fatalf("relation-column relation-name projection = %q, want %q", query, want)
+	}
+}
+
+func TestCatalogIdentifierWidthsReturnsIsolatedCopy(t *testing.T) {
+	db := openFixtureDB(t)
+	defer db.Close()
+	catalog := New(db)
+
+	widths, err := catalog.identifierWidths(context.Background())
+	if err != nil {
+		t.Fatalf("identifierWidths returned error: %v", err)
+	}
+	key := identifierField{relation: "RDB$RELATIONS", field: "RDB$RELATION_NAME"}
+	widths[key] = 1
+
+	got, err := catalog.identifierWidths(context.Background())
+	if err != nil {
+		t.Fatalf("cached identifierWidths returned error: %v", err)
+	}
+	if got[key] != 67 {
+		t.Fatalf("cached relation-name width after caller mutation = %d, want 67", got[key])
 	}
 }
 

@@ -26,6 +26,14 @@ func catalogIdentifier(ref string, width int) (string, error) {
 	return fmt.Sprintf("CAST(%s AS VARCHAR(%d))", ref, width), nil
 }
 
+func cloneIdentifierWidths(widths map[identifierField]int) map[identifierField]int {
+	clone := make(map[identifierField]int, len(widths))
+	for field, width := range widths {
+		clone[field] = width
+	}
+	return clone
+}
+
 func (c *Catalog) identifierWidths(ctx context.Context) (map[identifierField]int, error) {
 	if err := contextErr(ctx); err != nil {
 		return nil, err
@@ -40,10 +48,10 @@ func (c *Catalog) identifierWidths(ctx context.Context) (map[identifierField]int
 		return nil, err
 	}
 	if c.identifierWidthCache != nil {
-		return c.identifierWidthCache, nil
+		return cloneIdentifierWidths(c.identifierWidthCache), nil
 	}
 
-	relationNameWidth, err := c.identifierFieldWidth(ctx, "RDB$RELATIONS", "RDB$RELATION_NAME")
+	relationNameWidth, err := c.identifierFieldWidth(ctx, "RDB$RELATION_FIELDS", "RDB$RELATION_NAME")
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +80,7 @@ JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME`, relationProjection
 		return nil, err
 	}
 	c.identifierWidthCache = widths
-	return c.identifierWidthCache, nil
+	return cloneIdentifierWidths(c.identifierWidthCache), nil
 }
 
 func (c *Catalog) identifierFieldWidth(ctx context.Context, relation, field string) (int, error) {

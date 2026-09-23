@@ -248,7 +248,7 @@ func TestCatalogProjectionAndOrderingContracts(t *testing.T) {
 	columnUpper := strings.ToUpper(columnQuery)
 	for _, projection := range []string{
 		"CAST(RF.RDB$FIELD_NAME AS VARCHAR(31)) AS RDB$FIELD_NAME",
-		"CAST(RF.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(RF.RDB$RELATION_NAME AS VARCHAR(31)) AS RDB$RELATION_NAME",
 		"CAST(RF.RDB$FIELD_SOURCE AS VARCHAR(31)) AS RDB$FIELD_SOURCE",
 		"CAST(RF.RDB$SECURITY_CLASS AS VARCHAR(31)) AS RDB$SECURITY_CLASS",
 		"CAST(RF.RDB$BASE_FIELD AS VARCHAR(31)) AS RDB$BASE_FIELD",
@@ -1484,6 +1484,8 @@ WHERE rf.RDB$RELATION_NAME = ?
 	switch {
 	case relation == "RDB$RELATIONS" && field == "RDB$RELATION_NAME":
 		return []string{"FIELD_LENGTH"}, [][]driver.Value{{int64(67)}}, nil
+	case relation == "RDB$RELATION_FIELDS" && field == "RDB$RELATION_NAME":
+		return []string{"FIELD_LENGTH"}, [][]driver.Value{{int64(31)}}, nil
 	case relation == "RDB$RELATION_FIELDS" && field == "RDB$FIELD_NAME":
 		return []string{"FIELD_LENGTH"}, [][]driver.Value{{int64(31)}}, nil
 	default:
@@ -1499,7 +1501,7 @@ func fixtureIdentifierWidthsResult(query string, args []driver.NamedValue) ([]st
 		return nil, nil, errors.New("fixture: identifier widths query does not accept arguments")
 	}
 	wantQuery := normalizeFixtureSQL(`
-SELECT CAST(rf.RDB$RELATION_NAME AS VARCHAR(67)),
+SELECT CAST(rf.RDB$RELATION_NAME AS VARCHAR(31)),
        CAST(rf.RDB$FIELD_NAME AS VARCHAR(31)),
        f.RDB$FIELD_LENGTH
 FROM RDB$RELATION_FIELDS rf
@@ -1512,6 +1514,7 @@ JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME`)
 		{"RDB$RELATIONS      ", "RDB$SECURITY_CLASS    ", int64(31)},
 		{"RDB$RELATIONS      ", "RDB$OWNER_NAME        ", int64(31)},
 		{"RDB$RELATIONS      ", "RDB$DEFAULT_CLASS     ", int64(31)},
+		{"RDB$RELATION_FIELDS      ", "RDB$RELATION_NAME     ", int64(31)},
 		{"RDB$RELATION_FIELDS      ", "RDB$FIELD_NAME      ", int64(31)},
 		{"RDB$RELATION_FIELDS      ", "RDB$FIELD_SOURCE     ", int64(31)},
 		{"RDB$RELATION_FIELDS      ", "RDB$SECURITY_CLASS    ", int64(31)},

@@ -95,10 +95,10 @@ func TestExtendedCatalogFullNames(t *testing.T) {
 		"CAST(I.RDB$INDEX_NAME AS VARCHAR(67)) AS RDB$INDEX_NAME",
 		"CAST(I.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
 		"CAST(I.RDB$FOREIGN_KEY AS VARCHAR(67)) AS RDB$FOREIGN_KEY",
-		"CAST(RC.RDB$CONSTRAINT_NAME AS VARCHAR(67)) AS RDB$CONSTRAINT_NAME",
+		"CAST(RC.RDB$CONSTRAINT_NAME AS VARCHAR(31)) AS RDB$CONSTRAINT_NAME",
 		"CAST(S.RDB$INDEX_NAME AS VARCHAR(67)) AS RDB$INDEX_NAME",
 		"CAST(S.RDB$FIELD_NAME AS VARCHAR(67)) AS RDB$FIELD_NAME",
-		"CAST(C.RDB$CONSTRAINT_NAME AS VARCHAR(67)) AS RDB$CONSTRAINT_NAME",
+		"CAST(C.RDB$CONSTRAINT_NAME AS VARCHAR(31)) AS RDB$CONSTRAINT_NAME",
 		"CAST(C.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
 		"CAST(C.RDB$INDEX_NAME AS VARCHAR(67)) AS RDB$INDEX_NAME",
 		"CAST(K.RDB$TRIGGER_NAME AS VARCHAR(67)) AS RDB$TRIGGER_NAME",
@@ -352,7 +352,11 @@ func extendedIdentifierWidthRows() [][]driver.Value {
 	}
 	rows := make([][]driver.Value, 0, len(fields))
 	for _, field := range fields {
-		rows = append(rows, []driver.Value{field.relation, field.field, int64(67)})
+		width := int64(67)
+		if field.relation == "RDB$RELATION_CONSTRAINTS" && field.field == "RDB$CONSTRAINT_NAME" {
+			width = 31
+		}
+		rows = append(rows, []driver.Value{field.relation, field.field, width})
 	}
 	return rows
 }

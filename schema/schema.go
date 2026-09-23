@@ -284,7 +284,7 @@ func (c *Catalog) relationColumnsQuery(ctx context.Context) (string, error) {
 	projections := make([]string, 0, 10)
 	for _, spec := range []struct{ relation, field, ref, alias string }{
 		{"RDB$RELATION_FIELDS", "RDB$FIELD_NAME", "rf.RDB$FIELD_NAME", "RDB$FIELD_NAME"},
-		{"RDB$RELATIONS", "RDB$RELATION_NAME", "rf.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+		{"RDB$RELATION_FIELDS", "RDB$RELATION_NAME", "rf.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
 		{"RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE", "rf.RDB$FIELD_SOURCE", "RDB$FIELD_SOURCE"},
 		{"RDB$RELATION_FIELDS", "RDB$SECURITY_CLASS", "rf.RDB$SECURITY_CLASS", "RDB$SECURITY_CLASS"},
 		{"RDB$RELATION_FIELDS", "RDB$BASE_FIELD", "rf.RDB$BASE_FIELD", "RDB$BASE_FIELD"},
