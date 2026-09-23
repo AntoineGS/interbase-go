@@ -156,7 +156,7 @@ func TestRelationDescribeCatalogUsesOptionsAndKeepsSQLShapedKnownFacets(t *testi
 	if got.Body[got.Columns[0].Span.Start:got.Columns[0].Span.End] != "AMOUNT" {
 		t.Fatalf("Dialect 1 column span=%q", got.Body[got.Columns[0].Span.Start:got.Columns[0].Span.End])
 	}
-	for _, fragment := range []string{"CREATE TABLE TABLE_NAME", "AMOUNT NUMERIC(15, 2)", "DEFAULT  1.25", "NOT NULL", "normalized legacy scaled DOUBLE", "constraints unknown"} {
+	for _, fragment := range []string{"CREATE TABLE TABLE_NAME", "AMOUNT NUMERIC(15, 2)", "DEFAULT  1.25", "NOT NULL", "legacy scaled DOUBLE", "constraints unknown"} {
 		if !strings.Contains(got.Body, fragment) {
 			t.Errorf("description missing %q:\n%s", fragment, got.Body)
 		}
@@ -167,5 +167,45 @@ func TestRelationDescribeCatalogUsesOptionsAndKeepsSQLShapedKnownFacets(t *testi
 	relation.ConstraintsLoaded = false
 	if _, err := relation.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
 		t.Fatalf("incomplete table executable DDL error=%v; strict completeness must remain", err)
+	}
+}
+
+func TestRelationDescribeCatalogKeepsNamedDomainsChecksOverridesAndRelationKinds(t *testing.T) {
+	domain := &Domain{Name: "GO_TEXT_DOMAIN", SystemFlag: sql.NullInt64{Int64: 0, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeVarchar, Valid: true}, CharacterLength: sql.NullInt64{Int64: 20, Valid: true}, CharacterSetName: sql.NullString{String: "UTF8", Valid: true}, CollationID: sql.NullInt64{Int64: 1, Valid: true}, CollationName: sql.NullString{String: "UTF8", Valid: true}, DefaultSource: sql.NullString{String: "DEFAULT 'domain default'", Valid: true}, ValidationSource: sql.NullString{String: "CHECK (VALUE <> '')", Valid: true}}
+	relation := Relation{Name: "GO_TEMP_TABLE", Kind: RelationTable, RelationType: sql.NullString{String: "GLOBAL_TEMPORARY_PRESERVE_ROWS", Valid: true}, ConstraintsLoaded: true, Columns: []Column{
+		{Name: "TEXT_VALUE", FieldSource: sql.NullString{String: "GO_TEXT_DOMAIN", Valid: true}, Domain: domain, DefaultSource: sql.NullString{String: "DEFAULT 'column default'", Valid: true}, CollationID: sql.NullInt64{Int64: 2, Valid: true}, CollationName: sql.NullString{String: "UNICODE_CI", Valid: true}},
+		{Name: "INHERITED_VALUE", FieldSource: sql.NullString{String: "GO_TEXT_DOMAIN", Valid: true}, Domain: domain},
+	}, Constraints: []Constraint{{Name: "GO_TEMP_VALUE_NN", ConstraintType: string(ConstraintNotNull), ColumnName: sql.NullString{String: "TEXT_VALUE", Valid: true}}}}
+	got, err := relation.DescribeCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"CREATE GLOBAL TEMPORARY TABLE", `"TEXT_VALUE" "GO_TEXT_DOMAIN"`, "DEFAULT 'column default'", "CONSTRAINT \"GO_TEMP_VALUE_NN\" NOT NULL", "COLLATE \"UNICODE_CI\"", "CHECK (VALUE <> '')", `"INHERITED_VALUE" "GO_TEXT_DOMAIN" CHECK (VALUE <> '')`, "/* inherited domain DEFAULT 'domain default' */", "ON COMMIT PRESERVE ROWS"} {
+		if !strings.Contains(got.Body, fragment) {
+			t.Errorf("description missing known facet %q:\n%s", fragment, got.Body)
+		}
+	}
+	if strings.Contains(got.Body, `"TEXT_VALUE" "GO_TEXT_DOMAIN" DEFAULT 'column default' /* inherited domain`) {
+		t.Errorf("column default did not override the referenced domain default:\n%s", got.Body)
+	}
+
+	external := Relation{Name: "GO_EXTERNAL_TABLE", Kind: RelationTable, RelationType: sql.NullString{String: "EXTERNAL", Valid: true}, ExternalFile: sql.NullString{String: "orders.dat", Valid: true}, Columns: []Column{{Name: "ID", Domain: &Domain{FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}, ExternalLength: sql.NullInt64{Int64: 0, Valid: true}, ExternalScale: sql.NullInt64{Int64: 0, Valid: true}, ExternalType: sql.NullInt64{Int64: 0, Valid: true}}}}}
+	externalDescription, err := external.DescribeCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"EXTERNAL FILE 'orders.dat'", `"ID" INTEGER`} {
+		if !strings.Contains(externalDescription.Body, fragment) {
+			t.Errorf("external description missing %q:\n%s", fragment, externalDescription.Body)
+		}
+	}
+
+	view := Relation{Name: "GO_VIEW", Kind: RelationView, ViewSource: sql.NullString{String: "SELECT 1 AS VALUE FROM RDB$DATABASE", Valid: true}, Columns: []Column{{Name: "VALUE"}}}
+	viewDescription, err := view.DescribeCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(viewDescription.Body, "CREATE VIEW \"GO_VIEW\"") || !strings.HasSuffix(viewDescription.Body, view.ViewSource.String) {
+		t.Fatalf("view description lost relation kind/source:\n%s", viewDescription.Body)
 	}
 }

@@ -1028,12 +1028,49 @@ func TestDialect1CanonicalScaledDoubleDDLAndDialect3Compatibility(t *testing.T) 
 	legacy.FieldScale = sql.NullInt64{Int64: -2, Valid: true}
 	legacy.FieldSubType = sql.NullInt64{Int64: 1, Valid: true}
 	legacy.FieldPrecision = sql.NullInt64{Int64: 16, Valid: true}
-	if _, err := legacy.SQLTypeWithOptions(DDLOptions{Dialect: 1}); !errors.Is(err, ErrUnsupportedDDL) {
-		t.Fatalf("precision 16 SQLType error = %v, want unsupported", err)
+	if got, err := legacy.SQLTypeWithOptions(DDLOptions{Dialect: 1}); err != nil || got != "NUMERIC(16, 2)" {
+		t.Fatalf("Dialect 1 precision 16 SQLType=(%q,%v), want valid recorded precision", got, err)
 	}
 	plainDouble := Domain{Name: "PLAIN_DOUBLE", FieldType: sql.NullInt64{Int64: fieldTypeDouble, Valid: true}, FieldScale: sql.NullInt64{Int64: 0, Valid: true}}
 	if got, err := plainDouble.SQLTypeWithOptions(DDLOptions{Dialect: 1}); err != nil || got != "DOUBLE PRECISION" {
 		t.Fatalf("plain DOUBLE = (%q, %v), want unchanged DOUBLE PRECISION", got, err)
+	}
+}
+
+func TestNumericScaleRangesRemainValidThroughPrecisionEighteen(t *testing.T) {
+	domain := Domain{
+		FieldType:      sql.NullInt64{Int64: fieldTypeBigint, Valid: true},
+		FieldSubType:   sql.NullInt64{Int64: 1, Valid: true},
+		FieldPrecision: sql.NullInt64{Int64: 18, Valid: true},
+		FieldScale:     sql.NullInt64{Int64: -18, Valid: true},
+	}
+	got, err := domain.SQLTypeWithOptions(DDLOptions{Dialect: Dialect3})
+	if err != nil || got != "NUMERIC(18, 18)" {
+		t.Fatalf("D3 max-scale type=(%q,%v), want NUMERIC(18, 18)", got, err)
+	}
+	domain.FieldScale = sql.NullInt64{Int64: -1 << 63, Valid: true}
+	if _, err := domain.SQLTypeWithOptions(DDLOptions{Dialect: Dialect3}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("min-int scale error=%v, want graceful unsupported error", err)
+	}
+	domain.FieldType = sql.NullInt64{Int64: fieldTypeBigint, Valid: true}
+	domain.FieldPrecision = sql.NullInt64{Int64: 18, Valid: true}
+	domain.FieldScale = sql.NullInt64{Int64: -2, Valid: true}
+	if _, err := domain.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) || !strings.Contains(err.Error(), "storage") {
+		t.Fatalf("Dialect 1 exact-int precision above nine error=%v, want explicit storage mismatch", err)
+	}
+	domain.FieldSubType = sql.NullInt64{}
+	if _, err := domain.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) || !strings.Contains(err.Error(), "storage") {
+		t.Fatalf("Dialect 1 inferred BIGINT storage error=%v, want explicit storage mismatch", err)
+	}
+	for _, test := range []struct{ fieldType, precision int64 }{
+		{fieldTypeSmallint, 5}, {fieldTypeInteger, 4}, {fieldTypeDouble, 9},
+	} {
+		domain.FieldType = sql.NullInt64{Int64: test.fieldType, Valid: true}
+		domain.FieldSubType = sql.NullInt64{Int64: 1, Valid: true}
+		domain.FieldPrecision = sql.NullInt64{Int64: test.precision, Valid: true}
+		if _, err := domain.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) || !strings.Contains(err.Error(), "storage") {
+			t.Errorf("Dialect 1 type=%d precision=%d error=%v, want explicit storage mismatch", test.fieldType, test.precision, err)
+		}
 	}
 }
 
@@ -1043,9 +1080,9 @@ func TestDialect1RenderingAppliesIdentifierPolicyWithoutRewritingSource(t *testi
 	if err != nil || got != "CREATE DOMAIN GOOD_DOMAIN1 AS INTEGER DEFAULT 'a\"b'" {
 		t.Fatalf("Dialect 1 DDL = (%q, %v), want identifier unquoted and source preserved", got, err)
 	}
-	domain.Name = "éName"
-	if _, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 1}); err == nil {
-		t.Fatal("Dialect 1 accepted an identifier it cannot represent")
+	domain.Name = strings.Repeat("A", 40)
+	if got, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 1}); err != nil || !strings.Contains(got, domain.Name) {
+		t.Fatalf("Dialect 1 rejected catalog-width identifier: ddl=(%q,%v)", got, err)
 	}
 	domain.Name = "LOWERCASE"
 	if _, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 1}); err != nil {
@@ -1080,23 +1117,51 @@ func TestDialect1TableNamesConstraintsAndLegacyInlineProvenance(t *testing.T) {
 	}
 }
 
-func TestDialect1ReferencesUseRendererAndOpaqueSourceIsExplicitlyUnsupported(t *testing.T) {
+func TestDialect1ReferencesUseRendererAndSameDialectSourcesRemainVerbatim(t *testing.T) {
 	domain := Domain{Name: "GOOD_DOMAIN", FieldType: sql.NullInt64{Int64: fieldTypeVarchar, Valid: true}, CharacterLength: sql.NullInt64{Int64: 20, Valid: true}, CharacterSetName: sql.NullString{String: "UTF8", Valid: true}, CollationID: sql.NullInt64{Int64: 1, Valid: true}, CollationName: sql.NullString{String: "UTF8", Valid: true}}
 	ddl, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1})
 	if err != nil || ddl != "CREATE DOMAIN GOOD_DOMAIN AS VARCHAR(20) CHARACTER SET UTF8 COLLATE UTF8" {
 		t.Fatalf("Dialect 1 charset/collation DDL = (%q, %v)", ddl, err)
 	}
-	date := Domain{FieldType: sql.NullInt64{Int64: fieldTypeDate, Valid: true}}
-	if _, err := date.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
-		t.Fatalf("Dialect 1 DATE error = %v, want semantic refusal", err)
+	dateOnly := Domain{FieldType: sql.NullInt64{Int64: fieldTypeDate, Valid: true}}
+	if _, err := dateOnly.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("Dialect 1 DATE-only error = %v, want semantic refusal", err)
+	}
+	legacyDate := Domain{FieldType: sql.NullInt64{Int64: fieldTypeTimestamp, Valid: true}}
+	if got, err := legacyDate.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); err != nil || got != "DATE" {
+		t.Fatalf("Dialect 1 legacy DATE type=(%q,%v), want DATE preserving timestamp semantics", got, err)
+	}
+	timeOnly := Domain{FieldType: sql.NullInt64{Int64: fieldTypeTime, Valid: true}}
+	if _, err := timeOnly.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("Dialect 1 TIME error=%v, want semantic refusal", err)
 	}
 	view := Relation{Name: "VIEW_NAME", Kind: RelationView, ViewSource: sql.NullString{String: "SELECT 1", Valid: true}, Columns: []Column{{Name: "VALUE"}}}
-	if _, err := view.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
-		t.Fatalf("Dialect 1 opaque view error = %v, want explicit unsupported", err)
+	if ddl, err := view.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); err != nil || !strings.HasSuffix(ddl, view.ViewSource.String) {
+		t.Fatalf("Dialect 1 same-source view DDL=(%q,%v), want unchanged view source", ddl, err)
 	}
 	index := Index{Name: "COMPUTED_INDEX", RelationName: "TABLE_NAME", UniqueFlag: sql.NullInt64{Int64: 0, Valid: true}, IndexType: sql.NullInt64{Int64: 0, Valid: true}, Expression: sql.NullString{String: "COMPUTED BY VALUE + 1", Valid: true}}
-	if _, err := index.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
-		t.Fatalf("Dialect 1 opaque expression index error = %v, want explicit unsupported", err)
+	if ddl, err := index.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); err != nil || !strings.Contains(ddl, index.Expression.String) {
+		t.Fatalf("Dialect 1 same-source expression index DDL=(%q,%v)", ddl, err)
+	}
+	procedure := Procedure{Name: "PROC_NAME", InputCount: sql.NullInt64{Int64: 0, Valid: true}, OutputCount: sql.NullInt64{Int64: 0, Valid: true}, Source: sql.NullString{String: `AS BEGIN POST_EVENT 'same-dialect'; END`, Valid: true}}
+	if ddl, err := procedure.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); err != nil || !strings.HasSuffix(ddl, procedure.Source.String) {
+		t.Fatalf("Dialect 1 same-source procedure DDL=(%q,%v)", ddl, err)
+	}
+	trigger := Trigger{Name: "TRIGGER_NAME", TriggerType: sql.NullInt64{Int64: 1, Valid: true}, Sequence: sql.NullInt64{Int64: 0, Valid: true}, Source: sql.NullString{String: `AS BEGIN POST_EVENT 'same-dialect'; END`, Valid: true}}
+	if ddl, err := trigger.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); err != nil || !strings.HasSuffix(ddl, trigger.Source.String) {
+		t.Fatalf("Dialect 1 same-source trigger DDL=(%q,%v)", ddl, err)
+	}
+}
+
+func TestProcedureDDLDoesNotDuplicateLeadingSourceWhitespace(t *testing.T) {
+	procedure := Procedure{Name: "SOURCE_PROC", InputCount: sql.NullInt64{Int64: 0, Valid: true}, OutputCount: sql.NullInt64{Int64: 0, Valid: true}, Source: sql.NullString{String: " BEGIN POST_EVENT 'kept'; END", Valid: true}}
+	ddl, err := procedure.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "CREATE PROCEDURE SOURCE_PROC AS" + procedure.Source.String
+	if ddl != want {
+		t.Fatalf("procedure DDL=%q, want exact delimiter+source %q", ddl, want)
 	}
 }
 

@@ -24,7 +24,9 @@ const (
 )
 
 // DDLOptions selects the SQL dialect for one rendering operation. A zero
-// Dialect preserves the historical Dialect 3 default.
+// Dialect preserves the historical Dialect 3 default. SQL source catalog
+// fields are preserved verbatim rather than translated; when rendering such
+// source, callers must select the dialect compatible with the source database.
 type DDLOptions struct {
 	Dialect DDLDialect
 }
@@ -46,7 +48,7 @@ func (r ddlRenderer) identifier(name, label string) (string, error) {
 	if r.dialect == Dialect3 {
 		return quoteRequiredIdentifier(name, label)
 	}
-	if name == "" || len(name) > 31 || !asciiIdentifierStart(name[0]) || name != strings.ToUpper(name) || dialect1ReservedIdentifier(name) {
+	if name == "" || len(name) > 67 || !asciiIdentifierStart(name[0]) || name != strings.ToUpper(name) || dialect1ReservedIdentifier(name) {
 		return "", fmt.Errorf("schema: %s %q cannot be represented in SQL dialect 1", label, name)
 	}
 	for i := 1; i < len(name); i++ {
@@ -294,6 +296,9 @@ func (d Domain) sqlTypePartsWithRenderer(renderer ddlRenderer) (sqlTypeParts, er
 	var partsLegacy bool
 	switch fieldType {
 	case fieldTypeSmallint, fieldTypeInteger, fieldTypeBigint:
+		if renderer.dialect == Dialect1 && fieldType == fieldTypeBigint {
+			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "Dialect 1 has no faithful exact BIGINT storage declaration")
+		}
 		result = integerTypeName(fieldType)
 		if d.FieldScale.Valid && d.FieldScale.Int64 > 0 {
 			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "positive numeric scale is invalid")
@@ -309,8 +314,11 @@ func (d Domain) sqlTypePartsWithRenderer(renderer ddlRenderer) (sqlTypeParts, er
 			if d.FieldSubType.Int64 == 2 {
 				name = "DECIMAL"
 			}
-			if !validNumericDeclaration(d.FieldPrecision.Int64, d.FieldScale.Int64, renderer.dialect) {
+			if !validNumericDeclaration(d.FieldPrecision.Int64, d.FieldScale.Int64) {
 				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "numeric precision or scale is out of range")
+			}
+			if renderer.dialect == Dialect1 && !dialect1NumericStorageCompatible(fieldType, d.FieldPrecision.Int64) {
+				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "Dialect 1 numeric precision would use a different physical storage type than the recorded catalog field")
 			}
 			result = fmt.Sprintf("%s(%d, %d)", name, d.FieldPrecision.Int64, -d.FieldScale.Int64)
 		} else if d.FieldSubType.Valid && d.FieldSubType.Int64 != 0 {
@@ -323,7 +331,7 @@ func (d Domain) sqlTypePartsWithRenderer(renderer ddlRenderer) (sqlTypeParts, er
 			case fieldTypeBigint:
 				precision = 18
 			}
-			if !validNumericDeclaration(precision, d.FieldScale.Int64, renderer.dialect) {
+			if !validNumericDeclaration(precision, d.FieldScale.Int64) {
 				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "inferred numeric precision or scale is out of range")
 			}
 			result = fmt.Sprintf("NUMERIC(%d, %d)", precision, -d.FieldScale.Int64)
@@ -345,8 +353,11 @@ func (d Domain) sqlTypePartsWithRenderer(renderer ddlRenderer) (sqlTypeParts, er
 			if d.FieldSubType.Int64 == 2 {
 				name = "DECIMAL"
 			}
-			if !validNumericDeclaration(d.FieldPrecision.Int64, d.FieldScale.Int64, renderer.dialect) {
+			if !validNumericDeclaration(d.FieldPrecision.Int64, d.FieldScale.Int64) {
 				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "numeric precision or scale is out of range")
+			}
+			if renderer.dialect == Dialect1 && !dialect1NumericStorageCompatible(fieldTypeDouble, d.FieldPrecision.Int64) {
+				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "Dialect 1 numeric precision would use a different physical storage type than the recorded DOUBLE field")
 			}
 			result = fmt.Sprintf("%s(%d, %d)", name, d.FieldPrecision.Int64, -d.FieldScale.Int64)
 		} else if d.FieldSubType.Valid && d.FieldSubType.Int64 != 0 {
@@ -375,10 +386,10 @@ func (d Domain) sqlTypePartsWithRenderer(renderer ddlRenderer) (sqlTypeParts, er
 		}
 		result = "TIME"
 	case fieldTypeTimestamp:
-		if renderer.dialect == Dialect1 {
-			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "TIMESTAMP is not representable with SQL dialect 1 semantics")
-		}
 		result = "TIMESTAMP"
+		if renderer.dialect == Dialect1 {
+			result = "DATE"
+		}
 	case fieldTypeChar, fieldTypeVarchar:
 		length := d.CharacterLength
 		if !length.Valid {
@@ -455,15 +466,24 @@ func characterSetClauseWithRenderer(object, name string, setName sql.NullString,
 	return "", nil
 }
 
-func validNumericDeclaration(precision, scale int64, dialect DDLDialect) bool {
-	maxPrecision := int64(18)
-	if dialect == Dialect1 {
-		maxPrecision = 15
-	}
-	if precision < 1 || precision > maxPrecision || scale > 0 || scale < -precision || scale < -15 {
+func validNumericDeclaration(precision, scale int64) bool {
+	if precision < 1 || precision > 18 || scale > 0 || scale < -precision {
 		return false
 	}
 	return true
+}
+
+func dialect1NumericStorageCompatible(fieldType, precision int64) bool {
+	switch fieldType {
+	case fieldTypeSmallint:
+		return precision <= 4
+	case fieldTypeInteger:
+		return precision >= 5 && precision <= 9
+	case fieldTypeDouble:
+		return precision >= 10 && precision <= 18
+	default:
+		return false
+	}
 }
 
 // DataType is an alias for SQLType.
@@ -783,9 +803,6 @@ func (r Relation) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 	}
 	switch r.Kind {
 	case RelationView:
-		if renderer.dialect == Dialect1 {
-			return "", unsupportedDDL("view", r.Name, "view query source is opaque and cannot be proven executable in SQL dialect 1")
-		}
 		if !r.ViewSource.Valid || strings.TrimSpace(r.ViewSource.String) == "" {
 			return "", unsupportedDDL("view", r.Name, "view source is unavailable")
 		}
@@ -991,9 +1008,6 @@ func (p Procedure) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 	if !p.Source.Valid || strings.TrimSpace(p.Source.String) == "" {
 		return "", unsupportedDDL("procedure", p.Name, "procedure source is unavailable")
 	}
-	if renderer.dialect == Dialect1 {
-		return "", unsupportedDDL("procedure", p.Name, "PSQL source is opaque and cannot be proven executable in SQL dialect 1")
-	}
 	if err := validateProcedureParameters(p, p.InputParameters, p.InputCount, ParameterInput); err != nil {
 		return "", err
 	}
@@ -1029,7 +1043,10 @@ func (p Procedure) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 		builder.WriteString(strings.Join(parameters, ", "))
 		builder.WriteByte(')')
 	}
-	builder.WriteString(" AS ")
+	builder.WriteString(" AS")
+	if strings.TrimLeftFunc(p.Source.String, unicode.IsSpace) == p.Source.String {
+		builder.WriteByte(' ')
+	}
 	builder.WriteString(p.Source.String)
 	return builder.String(), nil
 }
@@ -1127,9 +1144,6 @@ func (t Trigger) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 	}
 	if !t.Source.Valid || strings.TrimSpace(t.Source.String) == "" {
 		return "", unsupportedDDL("trigger", t.Name, "trigger source is unavailable")
-	}
-	if renderer.dialect == Dialect1 {
-		return "", unsupportedDDL("trigger", t.Name, "trigger source is opaque and cannot be proven executable in SQL dialect 1")
 	}
 	if !t.Sequence.Valid {
 		return "", unsupportedDDL("trigger", t.Name, "trigger position is NULL")
@@ -1229,9 +1243,6 @@ func (i Index) StatementsWithOptions(options DDLOptions) ([]string, error) {
 	builder.WriteString(" ON ")
 	builder.WriteString(relation)
 	if i.Expression.Valid && strings.TrimSpace(i.Expression.String) != "" {
-		if renderer.dialect == Dialect1 {
-			return nil, unsupportedDDL("index", i.Name, "computed index source is opaque and cannot be proven executable in SQL dialect 1")
-		}
 		expression, err := sourceClause(sqlNullString{String: i.Expression.String, Valid: true}, "COMPUTED BY")
 		if err != nil {
 			return nil, unsupportedDDL("index", i.Name, err.Error())
