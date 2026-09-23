@@ -8668,13 +8668,32 @@ static size_t ib_text_character_count_for_charset(size_t length, short charset)
 	}
 }
 
-static size_t ib_text_character_count(const XSQLVAR *variable)
+static size_t ib_fixed_text_character_count(const ib_cursor *cursor,
+	const XSQLVAR *variable, size_t index)
 {
-	if (variable == NULL || variable->sqllen < 0) {
+	size_t character_count;
+
+	if (cursor == NULL || cursor->output == NULL || variable == NULL ||
+		variable->sqllen < 0 ||
+		index >= (size_t) cursor->output->sqld) {
 		return 0U;
 	}
-	return ib_text_character_count_for_charset((size_t) variable->sqllen,
-		ib_text_charset(variable));
+	character_count = 0U;
+	if (cursor->metadata != NULL && cursor->metadata[index].has_length &&
+		cursor->metadata[index].length > 0) {
+		character_count = (size_t) cursor->metadata[index].length;
+		if (character_count <= (size_t) variable->sqllen) {
+			return character_count;
+		}
+	}
+	if (cursor->fixed_text_lengths != NULL) {
+		character_count = cursor->fixed_text_lengths[index];
+		if (character_count > 0U && character_count <= (size_t) variable->sqllen) {
+			return character_count;
+		}
+	}
+	/* Invalid evidence is unknown; never let it cap the fixed buffer. */
+	return 0U;
 }
 
 static size_t ib_utf8_text_length(const ib_cursor *cursor, const XSQLVAR *variable,
@@ -8687,20 +8706,10 @@ static size_t ib_utf8_text_length(const ib_cursor *cursor, const XSQLVAR *variab
 		return 0U;
 	}
 	length = (size_t) variable->sqllen;
-	if (variable->relname_length <= 0 || variable->sqlname_length <= 0) {
-		if (cursor != NULL && cursor->fixed_text_lengths != NULL &&
-			cursor->output != NULL && index < (size_t) cursor->output->sqld &&
-			cursor->fixed_text_lengths[index] != 0U) {
-			return ib_utf8_prefix_length(variable->sqldata, length,
-				cursor->fixed_text_lengths[index]);
-		}
-		/* SQL_TEXT descriptors for expressions do not carry a source relation and
-		 * field. Unless the SQL expression is known to be a fixed-width CHAR cast,
-		 * its descriptor length is the exact expression result length. Never infer
-		 * padding by inspecting content: a literal may legitimately end in spaces. */
+	character_count = ib_fixed_text_character_count(cursor, variable, index);
+	if (character_count == 0U) {
 		return length;
 	}
-	character_count = ib_text_character_count(variable);
 	return ib_utf8_prefix_length(variable->sqldata, length, character_count);
 }
 
@@ -9194,21 +9203,23 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 	switch (type) {
 	case SQL_TEXT:
 		source_length = (size_t) variable->sqllen;
+		character_count = ib_fixed_text_character_count(cursor, variable, index);
 		if (connection_charset == IB_CHARSET_UTF8) {
 			source_length = ib_utf8_text_length(cursor, variable, index);
-		} else if (connection_charset != 0 && connection_charset != 1 &&
-			text_charset != 1) {
-			character_count = ib_text_character_count(variable);
-			if (character_count < source_length) {
-				source_length = character_count;
-			}
 		}
 		if (connection_charset != 0 && connection_charset != IB_CHARSET_UTF8 &&
 			text_charset != 1) {
+			/* Convert every descriptor byte before applying a known character width;
+			 * unknown widths deliberately retain the complete fixed buffer. */
+			source_length = (size_t) variable->sqllen;
 			converted = ib_convert_to_utf8(variable->sqldata, source_length,
 				connection_charset, &converted_length, error);
 			if (converted == NULL) {
 				return -1;
+			}
+			if (character_count != 0U) {
+				converted_length = ib_utf8_prefix_length(converted, converted_length,
+					character_count);
 			}
 			((ib_cursor *) cursor)->converted_value = converted;
 			view->bytes = converted;

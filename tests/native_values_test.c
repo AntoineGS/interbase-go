@@ -222,6 +222,10 @@ static void test_utf8_fixed_text_and_scaled_float_decoding(void)
 	cursor.output->sqlvar[0].sqlname_length = 1;
 	cursor.output->sqlvar[1].sqltype = SQL_DOUBLE | 1;
 	cursor.output->sqlvar[1].sqlscale = -2;
+	cursor.metadata = (ib_column_metadata *) calloc(2U, sizeof(*cursor.metadata));
+	require_condition(cursor.metadata != NULL, "UTF8 metadata allocation failed");
+	cursor.metadata[0].length = 5;
+	cursor.metadata[0].has_length = 1;
 	error = NULL;
 	require_success(ib_validate_output_types(cursor.output, &error), error,
 		"Dialect 1 scaled floating output was rejected");
@@ -240,6 +244,7 @@ static void test_utf8_fixed_text_and_scaled_float_decoding(void)
 		"scaled floating decode failed");
 	require_condition(view.kind == IB_VALUE_FLOAT64 && view.float64_value == floating,
 		"scaled floating value was not decoded as a float");
+	free(cursor.metadata);
 	ib_free_sqlda(cursor.output);
 }
 
@@ -277,6 +282,58 @@ static void test_unattributed_utf8_text_preserves_literal_spaces(void)
 	require_condition(view.length == sizeof(unicode_trailing_spaces) &&
 		memcmp(view.bytes, unicode_trailing_spaces, sizeof(unicode_trailing_spaces)) == 0,
 		"unattributed non-ASCII literal lost trailing spaces");
+	ib_free_sqlda(cursor.output);
+}
+
+static void test_attributed_fixed_text_width_evidence(void)
+{
+	static const char known_text[] = "AA                  ";
+	static const char unknown_name_prefix[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZA123";
+	ib_cursor cursor;
+	ib_value_view view;
+	char *error;
+
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.output = ib_alloc_sqlda(2);
+	require_condition(cursor.output != NULL, "attributed text SQLDA allocation failed");
+	cursor.output->sqld = 2;
+	cursor.output->sqlvar[0].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[0].sqlsubtype = IB_CHARSET_UTF8;
+	cursor.output->sqlvar[0].sqllen = (short) (sizeof(known_text) - 1U);
+	cursor.output->sqlvar[0].relname[0] = 'T';
+	cursor.output->sqlvar[0].relname_length = 1;
+	cursor.output->sqlvar[0].sqlname[0] = 'C';
+	cursor.output->sqlvar[0].sqlname_length = 1;
+	cursor.output->sqlvar[1].sqltype = SQL_TEXT | 1;
+	cursor.output->sqlvar[1].sqlsubtype = 3; /* UNICODE_FSS catalog identifier. */
+	cursor.output->sqlvar[1].sqllen = 67;
+	cursor.output->sqlvar[1].relname[0] = 'R';
+	cursor.output->sqlvar[1].relname_length = 1;
+	cursor.output->sqlvar[1].sqlname[0] = 'N';
+	cursor.output->sqlvar[1].sqlname_length = 1;
+	cursor.metadata = (ib_column_metadata *) calloc(2U, sizeof(*cursor.metadata));
+	require_condition(cursor.metadata != NULL, "attributed metadata allocation failed");
+	cursor.metadata[0].length = 5;
+	cursor.metadata[0].has_length = 1;
+	error = NULL;
+	require_success(ib_allocate_output(&cursor, &error), error,
+		"attributed text output storage failed");
+	memcpy(cursor.output->sqlvar[0].sqldata, known_text, sizeof(known_text) - 1U);
+	memcpy(cursor.output->sqlvar[1].sqldata, unknown_name_prefix,
+		sizeof(unknown_name_prefix) - 1U);
+	memset(cursor.output->sqlvar[1].sqldata + sizeof(unknown_name_prefix) - 1U,
+		' ', 67U - (sizeof(unknown_name_prefix) - 1U));
+	cursor.fetched = 1;
+
+	require_success(ib_cursor_column(&cursor, 0, &view, &error), error, "known CHAR");
+	require_condition(view.length == 5U && memcmp(view.bytes, "AA   ", 5U) == 0,
+		"known CHAR width lost padding or gained capacity padding");
+	require_success(ib_cursor_column(&cursor, 1, &view, &error), error,
+		"unknown-width catalog CHAR");
+	require_condition(view.length == 67U &&
+		memcmp(view.bytes, cursor.output->sqlvar[1].sqldata, 67U) == 0,
+		"unknown-width catalog CHAR did not preserve its full padded buffer");
+	free(cursor.metadata);
 	ib_free_sqlda(cursor.output);
 }
 
@@ -1377,6 +1434,7 @@ int main(void)
 	test_column_decoding();
 	test_utf8_fixed_text_and_scaled_float_decoding();
 	test_unattributed_utf8_text_preserves_literal_spaces();
+	test_attributed_fixed_text_width_evidence();
 	test_fixed_text_output_is_space_initialized();
 	test_octets_bind_and_decode_as_bytes();
 	test_exact_scaled_integer_binding();
