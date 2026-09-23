@@ -180,9 +180,19 @@ func TestRelationDescribeCatalogKeepsNamedDomainsChecksOverridesAndRelationKinds
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, fragment := range []string{"CREATE GLOBAL TEMPORARY TABLE", `"TEXT_VALUE" "GO_TEXT_DOMAIN"`, "DEFAULT 'column default'", "CONSTRAINT \"GO_TEMP_VALUE_NN\" NOT NULL", "COLLATE \"UNICODE_CI\"", "CHECK (VALUE <> '')", `"INHERITED_VALUE" "GO_TEXT_DOMAIN" CHECK (VALUE <> '')`, "/* inherited domain DEFAULT 'domain default' */", "ON COMMIT PRESERVE ROWS"} {
+	for _, fragment := range []string{"CREATE GLOBAL TEMPORARY TABLE", `"TEXT_VALUE" "GO_TEXT_DOMAIN"`, "DEFAULT 'column default'", "CONSTRAINT \"GO_TEMP_VALUE_NN\" NOT NULL", "COLLATE \"UNICODE_CI\"", `/* inherited domain check: CHECK (VALUE <> '') */`, `"INHERITED_VALUE" "GO_TEXT_DOMAIN" /* inherited domain check: CHECK (VALUE <> '') */`, "/* inherited domain default: DEFAULT 'domain default' */", "ON COMMIT PRESERVE ROWS"} {
 		if !strings.Contains(got.Body, fragment) {
 			t.Errorf("description missing known facet %q:\n%s", fragment, got.Body)
+		}
+	}
+	for _, name := range []string{"TEXT_VALUE", "INHERITED_VALUE"} {
+		line := descriptionLineForColumn(t, got.Body, `"`+name+`"`)
+		sqlPart := line
+		if commentStart := strings.Index(sqlPart, "/*"); commentStart >= 0 {
+			sqlPart = sqlPart[:commentStart]
+		}
+		if strings.Contains(sqlPart, "CHECK (VALUE") {
+			t.Errorf("named domain CHECK escaped informational comment for %s: %s", name, line)
 		}
 	}
 	if strings.Contains(got.Body, `"TEXT_VALUE" "GO_TEXT_DOMAIN" DEFAULT 'column default' /* inherited domain`) {
@@ -208,4 +218,52 @@ func TestRelationDescribeCatalogKeepsNamedDomainsChecksOverridesAndRelationKinds
 	if !strings.Contains(viewDescription.Body, "CREATE VIEW \"GO_VIEW\"") || !strings.HasSuffix(viewDescription.Body, view.ViewSource.String) {
 		t.Fatalf("view description lost relation kind/source:\n%s", viewDescription.Body)
 	}
+}
+
+func TestRelationDescribeCatalogAnnotatesUnrenderableInheritedClauses(t *testing.T) {
+	validNamedDomain := &Domain{Name: "GO_VALID_DOMAIN", SystemFlag: sql.NullInt64{Int64: 0, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}, DefaultSource: sql.NullString{Valid: true}, ValidationSource: sql.NullString{Valid: true}}
+	fallbackNamedDomain := &Domain{Name: "GO_FALLBACK_DOMAIN", SystemFlag: sql.NullInt64{Int64: 0, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeVarchar, Valid: true}, CharacterLength: sql.NullInt64{Int64: 12, Valid: true}, DefaultSource: sql.NullString{Valid: true}, ValidationSource: sql.NullString{Valid: true}}
+	relation := Relation{Name: "GO_BAD_INHERITED_CLAUSES", Columns: []Column{
+		{Name: "VALID_PATH", FieldSource: sql.NullString{String: "GO_VALID_DOMAIN", Valid: true}, Domain: validNamedDomain},
+		{Name: "FALLBACK_PATH", FieldSource: sql.NullString{String: "GO_FALLBACK_DOMAIN", Valid: true}, Domain: fallbackNamedDomain, CollationID: sql.NullInt64{Int64: 1, Valid: true}},
+	}}
+	got, err := relation.DescribeCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, column := range []string{"VALID_PATH", "FALLBACK_PATH"} {
+		line := descriptionLineForColumn(t, got.Body, `"`+column+`"`)
+		for _, facet := range []string{"inherited domain default unknown:", "inherited domain check unknown:"} {
+			if !strings.Contains(line, facet) {
+				t.Errorf("column %s missing %q:\n%s", column, facet, line)
+			}
+		}
+	}
+}
+
+func TestRelationDescribeCatalogEscapesInheritedSourceComments(t *testing.T) {
+	domain := &Domain{Name: "GO_COMMENT_DOMAIN", SystemFlag: sql.NullInt64{Int64: 0, Valid: true}, FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}, DefaultSource: sql.NullString{String: "DEFAULT 'default */\n continued'", Valid: true}, ValidationSource: sql.NullString{String: "CHECK (VALUE <> '*/\n continued')", Valid: true}}
+	relation := Relation{Name: "GO_COMMENT_TABLE", Columns: []Column{{Name: "VALUE", FieldSource: sql.NullString{String: domain.Name, Valid: true}, Domain: domain}}}
+	got, err := relation.DescribeCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := descriptionLineForColumn(t, got.Body, `"VALUE"`)
+	if !strings.Contains(line, `DEFAULT 'default * /  continued'`) || !strings.Contains(line, `CHECK (VALUE <> '* /  continued')`) {
+		t.Fatalf("inherited source comments were not escaped/single-line:\n%s", line)
+	}
+	if strings.Count(line, "/*") != strings.Count(line, "*/") {
+		t.Fatalf("unterminated comment due to catalog source text:\n%s", line)
+	}
+}
+
+func descriptionLineForColumn(t *testing.T, body, column string) string {
+	t.Helper()
+	for _, line := range strings.Split(body, "\n") {
+		if strings.Contains(line, column) {
+			return line
+		}
+	}
+	t.Fatalf("column %s not found in description:\n%s", column, body)
+	return ""
 }

@@ -140,25 +140,9 @@ func (r Relation) DescribeCatalogWithOptions(options DDLOptions) (CatalogDescrip
 		definition, definitionErr := columnDefinition(column, notNullPtr, renderer)
 		if definitionErr != nil {
 			definition = descriptionColumnFallback(column, notNullPtr, renderer, definitionErr)
-		} else if userDomainReference(column.Domain) && column.Domain.ValidationSource.Valid {
-			check, checkErr := checkClause(sqlNullString{String: column.Domain.ValidationSource.String, Valid: true})
-			if checkErr == nil {
-				collation, _ := columnCollation(column, column.Domain, renderer)
-				if collation != "" && strings.HasSuffix(definition, " "+collation) {
-					definition = strings.TrimSuffix(definition, " "+collation)
-					definition = appendDDLClauseString(definition, check)
-					definition = appendDDLClauseString(definition, collation)
-				} else {
-					definition = appendDDLClauseString(definition, check)
-				}
-			}
 		}
-		if !column.DefaultSource.Valid && column.Domain != nil && column.Domain.DefaultSource.Valid {
-			defaultText, defaultErr := defaultClause(sqlNullString{String: column.Domain.DefaultSource.String, Valid: true})
-			if defaultErr == nil {
-				definition = appendDDLClauseString(definition, "/* inherited domain "+descriptionComment(defaultText)+" */")
-			}
-		}
+		definition = appendDomainValidationDescription(definition, column, definitionErr != nil)
+		definition = appendInheritedDomainDefaultDescription(definition, column)
 		body.WriteString(definition)
 		if index+1 < len(r.Columns) || len(otherConstraints) != 0 {
 			body.WriteByte(',')
@@ -267,11 +251,6 @@ func descriptionColumnFallback(column Column, notNull *Constraint, renderer ddlR
 	} else if column.Nullable.Valid && !column.Nullable.Bool {
 		appendDDLClause(&definition, "NOT NULL")
 	}
-	if column.Domain != nil && column.Domain.ValidationSource.Valid {
-		if check, checkErr := checkClause(sqlNullString{String: column.Domain.ValidationSource.String, Valid: true}); checkErr == nil {
-			appendDDLClause(&definition, check)
-		}
-	}
 	if collation, collationErr := columnCollation(column, column.Domain, renderer); collationErr == nil {
 		appendDDLClause(&definition, collation)
 	} else {
@@ -279,6 +258,46 @@ func descriptionColumnFallback(column Column, notNull *Constraint, renderer ddlR
 	}
 	definition.WriteString(" /* declaration incomplete: " + descriptionComment(cause.Error()) + " */")
 	return definition.String()
+}
+
+func appendDomainValidationDescription(definition string, column Column, fallback bool) string {
+	domain := column.Domain
+	if domain == nil || !domain.ValidationSource.Valid {
+		return definition
+	}
+	check, err := checkClause(sqlNullString{String: domain.ValidationSource.String, Valid: true})
+	if isColumnUserDomain(column) {
+		if err != nil {
+			return appendDescriptionComment(definition, "inherited domain check unknown", err.Error())
+		}
+		return appendDescriptionComment(definition, "inherited domain check", check)
+	}
+	if fallback {
+		if err != nil {
+			return appendDescriptionComment(definition, "check unknown", err.Error())
+		}
+		return appendDDLClauseString(definition, check)
+	}
+	return definition
+}
+
+func appendInheritedDomainDefaultDescription(definition string, column Column) string {
+	if column.DefaultSource.Valid || column.Domain == nil || !column.Domain.DefaultSource.Valid {
+		return definition
+	}
+	defaultText, err := defaultClause(sqlNullString{String: column.Domain.DefaultSource.String, Valid: true})
+	if err != nil {
+		return appendDescriptionComment(definition, "inherited domain default unknown", err.Error())
+	}
+	return appendDescriptionComment(definition, "inherited domain default", defaultText)
+}
+
+func appendDescriptionComment(definition, label, text string) string {
+	return appendDDLClauseString(definition, "/* "+label+": "+descriptionComment(text)+" */")
+}
+
+func isColumnUserDomain(column Column) bool {
+	return userDomainReference(column.Domain) && column.FieldSource.Valid && strings.TrimRight(column.FieldSource.String, " ") != ""
 }
 
 func appendDDLClauseString(builder, clause string) string {
