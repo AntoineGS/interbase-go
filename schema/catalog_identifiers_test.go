@@ -57,7 +57,7 @@ func TestCatalogIdentifierProjectionsUseCatalogByteWidths(t *testing.T) {
 		t.Fatal("catalogIdentifier accepted a non-positive width")
 	}
 
-	columnQuery := normalizeFixtureSQL(relationColumnsQuery)
+	columnQuery := normalizeFixtureSQL(relationColumnsQueryTemplate)
 	if !strings.Contains(columnQuery, "WHERE RF.RDB$RELATION_NAME = ?") {
 		t.Fatalf("column query filter = %q, want the original uncast catalog predicate", columnQuery)
 	}

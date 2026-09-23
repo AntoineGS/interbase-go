@@ -124,7 +124,7 @@ func TestRelationsAndViewsPreserveMetadataAndReturnCatalogOrder(t *testing.T) {
 	}
 
 	for _, call := range state.callsSnapshot() {
-		if call.query != "" && strings.Contains(strings.ToUpper(call.query), "FROM RDB$RELATION_FIELDS") {
+		if fixtureQueryKind(call.query) == "columns" {
 			upper := strings.ToUpper(call.query)
 			if !strings.Contains(upper, "V.RDB$VIEW_NAME = RF.RDB$RELATION_NAME") ||
 				!strings.Contains(upper, "V.RDB$VIEW_CONTEXT = RF.RDB$VIEW_CONTEXT") {
@@ -217,29 +217,71 @@ func TestCatalogProjectionAndOrderingContracts(t *testing.T) {
 	if _, err := catalog.Columns(context.Background(), "ORDERS"); err != nil {
 		t.Fatalf("Columns returned error: %v", err)
 	}
+	if _, err := catalog.Domains(context.Background(), "IN_NAME"); err != nil {
+		t.Fatalf("Domains returned error: %v", err)
+	}
 	if _, err := catalog.Procedures(context.Background(), "PROC_TWO"); err != nil {
 		t.Fatalf("Procedures returned error: %v", err)
 	}
 
 	calls := state.callsSnapshot()
 	relationQuery := fixtureCallQuery(t, calls, "relations")
-	if !strings.Contains(strings.ToUpper(relationQuery), "ORDER BY R.RDB$RELATION_NAME") {
+	relationUpper := strings.ToUpper(relationQuery)
+	for _, projection := range []string{
+		"CAST(R.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(R.RDB$SECURITY_CLASS AS VARCHAR(31)) AS RDB$SECURITY_CLASS",
+		"CAST(R.RDB$OWNER_NAME AS VARCHAR(31)) AS RDB$OWNER_NAME",
+		"CAST(R.RDB$DEFAULT_CLASS AS VARCHAR(31)) AS RDB$DEFAULT_CLASS",
+	} {
+		if !strings.Contains(relationUpper, projection) {
+			t.Fatalf("relation query = %q, want identifier projection %q", relationQuery, projection)
+		}
+	}
+	if !strings.Contains(relationUpper, "AND R.RDB$RELATION_NAME = ?") || !strings.Contains(relationUpper, "ORDER BY R.RDB$RELATION_NAME") {
 		t.Fatalf("relation query ordering = %q, want relation-name ordering", relationQuery)
 	}
-	if !strings.Contains(strings.ToUpper(relationQuery), "R.RDB$VIEW_BLR IS NULL") {
+	if !strings.Contains(relationUpper, "R.RDB$VIEW_BLR IS NULL") {
 		t.Fatalf("table query filter = %q, want view-BLR table filter", relationQuery)
 	}
 
 	columnQuery := fixtureCallQuery(t, calls, "columns")
 	columnUpper := strings.ToUpper(columnQuery)
+	for _, projection := range []string{
+		"CAST(RF.RDB$FIELD_NAME AS VARCHAR(31)) AS RDB$FIELD_NAME",
+		"CAST(RF.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(RF.RDB$FIELD_SOURCE AS VARCHAR(31)) AS RDB$FIELD_SOURCE",
+		"CAST(RF.RDB$SECURITY_CLASS AS VARCHAR(31)) AS RDB$SECURITY_CLASS",
+		"CAST(RF.RDB$BASE_FIELD AS VARCHAR(31)) AS RDB$BASE_FIELD",
+		"CAST(V.RDB$RELATION_NAME AS VARCHAR(67)) AS BASE_RELATION",
+		"CAST(F.RDB$FIELD_NAME AS VARCHAR(31)) AS DOMAIN_NAME",
+		"CAST(CS.RDB$CHARACTER_SET_NAME AS VARCHAR(31)) AS RDB$CHARACTER_SET_NAME",
+		"CAST(CO.RDB$COLLATION_NAME AS VARCHAR(31)) AS RDB$COLLATION_NAME",
+		"CAST(RCO.RDB$COLLATION_NAME AS VARCHAR(31)) AS COLUMN_COLLATION_NAME",
+	} {
+		if !strings.Contains(columnUpper, projection) {
+			t.Fatalf("column query = %q, want identifier projection %q", columnQuery, projection)
+		}
+	}
 	for _, clause := range []string{
 		"V.RDB$VIEW_NAME = RF.RDB$RELATION_NAME",
 		"V.RDB$VIEW_CONTEXT = RF.RDB$VIEW_CONTEXT",
+		"WHERE RF.RDB$RELATION_NAME = ?",
 		"ORDER BY RF.RDB$FIELD_POSITION",
 	} {
 		if !strings.Contains(columnUpper, clause) {
 			t.Fatalf("column query = %q, want clause %q", columnQuery, clause)
 		}
+	}
+	parameterDomainQuery := ""
+	for _, call := range calls {
+		upper := strings.ToUpper(call.query)
+		if fixtureQueryKind(call.query) == "domains" && !strings.Contains(upper, "NOT STARTING WITH 'RDB$'") {
+			parameterDomainQuery = call.query
+			break
+		}
+	}
+	if parameterDomainQuery == "" || !strings.Contains(strings.ToUpper(parameterDomainQuery), "CAST(F.RDB$FIELD_NAME AS VARCHAR(31)) AS RDB$FIELD_NAME") {
+		t.Fatalf("procedure parameter domain query = %q, want cast domain identity", parameterDomainQuery)
 	}
 
 	procedureQuery := fixtureCallQuery(t, calls, "procedures")
@@ -248,16 +290,39 @@ func TestCatalogProjectionAndOrderingContracts(t *testing.T) {
 		t.Fatalf("procedure query selects unsupported internal runtime field: %q", procedureQuery)
 	}
 	wantProcedureQuery := normalizeFixtureSQL(`
-SELECT p.RDB$PROCEDURE_NAME, p.RDB$PROCEDURE_ID,
+SELECT CAST(p.RDB$PROCEDURE_NAME AS VARCHAR(31)) AS RDB$PROCEDURE_NAME, p.RDB$PROCEDURE_ID,
        p.RDB$PROCEDURE_INPUTS, p.RDB$PROCEDURE_OUTPUTS,
        p.RDB$DESCRIPTION, p.RDB$PROCEDURE_SOURCE,
-       p.RDB$SECURITY_CLASS, p.RDB$OWNER_NAME, p.RDB$SYSTEM_FLAG
+       CAST(p.RDB$SECURITY_CLASS AS VARCHAR(31)) AS RDB$SECURITY_CLASS,
+       CAST(p.RDB$OWNER_NAME AS VARCHAR(31)) AS RDB$OWNER_NAME, p.RDB$SYSTEM_FLAG
 FROM RDB$PROCEDURES p
 WHERE COALESCE(p.RDB$SYSTEM_FLAG, 0) = 0
   AND p.RDB$PROCEDURE_NAME = ?
 ORDER BY p.RDB$PROCEDURE_NAME`)
 	if got := normalizeFixtureSQL(procedureQuery); got != wantProcedureQuery {
 		t.Fatalf("procedure query = %q, want %q", got, wantProcedureQuery)
+	}
+
+	domainQuery := fixtureCallQuery(t, calls, "domains")
+	domainUpper := normalizeFixtureSQL(domainQuery)
+	for _, projection := range []string{
+		"CAST(F.RDB$FIELD_NAME AS VARCHAR(31)) AS RDB$FIELD_NAME",
+		"CAST(CS.RDB$CHARACTER_SET_NAME AS VARCHAR(31)) AS RDB$CHARACTER_SET_NAME",
+		"CAST(CO.RDB$COLLATION_NAME AS VARCHAR(31)) AS RDB$COLLATION_NAME",
+	} {
+		if !strings.Contains(domainUpper, projection) {
+			t.Fatalf("domain query = %q, want identifier projection %q", domainQuery, projection)
+		}
+	}
+	for _, clause := range []string{
+		"LEFT JOIN RDB$CHARACTER_SETS CS ON CS.RDB$CHARACTER_SET_ID = F.RDB$CHARACTER_SET_ID",
+		"LEFT JOIN RDB$COLLATIONS CO ON CO.RDB$CHARACTER_SET_ID = F.RDB$CHARACTER_SET_ID",
+		"AND F.RDB$FIELD_NAME = ?",
+		"ORDER BY F.RDB$FIELD_NAME",
+	} {
+		if !strings.Contains(domainUpper, clause) {
+			t.Fatalf("domain query = %q, want original clause %q", domainQuery, clause)
+		}
 	}
 
 	parameterQuery := fixtureCallQuery(t, calls, "parameters")
@@ -272,14 +337,68 @@ ORDER BY p.RDB$PROCEDURE_NAME`)
 		}
 	}
 	wantParameterQuery := normalizeFixtureSQL(`
-SELECT pp.RDB$PARAMETER_NAME, pp.RDB$PROCEDURE_NAME,
+SELECT CAST(pp.RDB$PARAMETER_NAME AS VARCHAR(31)) AS RDB$PARAMETER_NAME,
+       CAST(pp.RDB$PROCEDURE_NAME AS VARCHAR(31)) AS RDB$PROCEDURE_NAME,
        pp.RDB$PARAMETER_NUMBER, pp.RDB$PARAMETER_TYPE,
-       pp.RDB$FIELD_SOURCE, pp.RDB$DESCRIPTION, pp.RDB$SYSTEM_FLAG
+       CAST(pp.RDB$FIELD_SOURCE AS VARCHAR(31)) AS RDB$FIELD_SOURCE,
+       pp.RDB$DESCRIPTION, pp.RDB$SYSTEM_FLAG
 FROM RDB$PROCEDURE_PARAMETERS pp
 WHERE pp.RDB$PROCEDURE_NAME = ?
 ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER`)
 	if got := normalizeFixtureSQL(parameterQuery); got != wantParameterQuery {
 		t.Fatalf("parameter query = %q, want %q", got, wantParameterQuery)
+	}
+}
+
+func TestCatalogFullIdentifiers(t *testing.T) {
+	db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+	defer db.Close()
+	catalog := New(db)
+	ctx := context.Background()
+
+	for _, test := range []struct {
+		tableName  string
+		columnName string
+	}{
+		{tableName: "IMPORT_ORDER_LINE_ITEMS", columnName: "ITEMS_ONLY_COLUMN"},
+		{tableName: "IMPORT_ORDER_LINE_ITEMX", columnName: "ITEMX_ONLY_COLUMN"},
+	} {
+		table, err := catalog.Table(ctx, test.tableName)
+		if err != nil || table == nil || table.Name != test.tableName || len(table.Columns) != 1 || table.Columns[0].Name != test.columnName {
+			t.Fatalf("Table(%q) = %#v, %v; want only column %q", test.tableName, table, err, test.columnName)
+		}
+	}
+
+	// InterBase stores quoted mixed-case names without the quote delimiters.
+	const mixedCaseTable = "MiXeD_Table"
+	table, err := catalog.Table(ctx, mixedCaseTable)
+	if err != nil || table == nil || table.Name != mixedCaseTable || len(table.Columns) != 1 || table.Columns[0].Name != "MiXeD_Column" {
+		t.Fatalf("Table(%q) = %#v, %v; want exact mixed-case identity", mixedCaseTable, table, err)
+	}
+	miss, err := catalog.Table(ctx, "mixed_table")
+	if err != nil || miss != nil {
+		t.Fatalf("Table(case-mismatched name) = %#v, %v; want nil without error", miss, err)
+	}
+
+	calls := state.callsSnapshot()
+	relationQuery := fixtureCallQuery(t, calls, "relations")
+	relationUpper := strings.ToUpper(relationQuery)
+	if !strings.Contains(relationUpper, "CAST(R.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME") {
+		t.Fatalf("relation query = %q, want cast full relation identity", relationQuery)
+	}
+	if !strings.Contains(relationUpper, "AND R.RDB$RELATION_NAME = ?") || strings.Contains(relationUpper, "AND CAST(") {
+		t.Fatalf("relation query filter = %q, want original exact bound filter", relationQuery)
+	}
+	columnQuery := fixtureCallQuery(t, calls, "columns")
+	columnUpper := strings.ToUpper(columnQuery)
+	if !strings.Contains(columnUpper, "CAST(RF.RDB$FIELD_NAME AS VARCHAR(31)) AS RDB$FIELD_NAME") ||
+		!strings.Contains(columnUpper, "WHERE RF.RDB$RELATION_NAME = ?") ||
+		!strings.Contains(columnUpper, "ORDER BY RF.RDB$FIELD_POSITION") {
+		t.Fatalf("column query = %q, want cast field identities and original filter/order", columnQuery)
+	}
+	if !strings.Contains(columnUpper, "V.RDB$VIEW_NAME = RF.RDB$RELATION_NAME") ||
+		!strings.Contains(columnUpper, "V.RDB$VIEW_CONTEXT = RF.RDB$VIEW_CONTEXT") {
+		t.Fatalf("column query = %q, want original view joins", columnQuery)
 	}
 }
 
@@ -375,14 +494,15 @@ func TestNameFiltersAreBoundAndRowsDoNotOverlapFollowUpQueries(t *testing.T) {
 		t.Fatalf("malicious table filter returned error: %v", err)
 	}
 	calls := state.callsSnapshot()
-	if len(calls) != 1 {
-		t.Fatalf("query count = %d, want 1", len(calls))
+	if len(calls) != 4 {
+		t.Fatalf("query count = %d, want 3 identifier-width queries and 1 relation query", len(calls))
 	}
-	if strings.Contains(calls[0].query, maliciousName) {
-		t.Fatalf("filter was interpolated into query: %q", calls[0].query)
+	relationCall := fixtureCallForKind(t, calls, "relations")
+	if strings.Contains(relationCall.query, maliciousName) {
+		t.Fatalf("filter was interpolated into query: %q", relationCall.query)
 	}
-	if len(calls[0].args) != 1 || calls[0].args[0].Value != maliciousName {
-		t.Fatalf("bound filter args = %#v, want malicious value as one argument", calls[0].args)
+	if len(relationCall.args) != 1 || relationCall.args[0].Value != maliciousName {
+		t.Fatalf("bound filter args = %#v, want malicious value as one argument", relationCall.args)
 	}
 
 	if _, err := New(db).Tables(context.Background(), "ORDERS"); err != nil {
@@ -524,8 +644,8 @@ func TestCatalogHonorsCanceledContextsBeforeAndBetweenQueries(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("between-query cancellation error = %v, want context.Canceled", err)
 	}
-	if len(state.callsSnapshot()) != 1 {
-		t.Fatalf("between-query cancellation calls = %d, want relation query only", len(state.callsSnapshot()))
+	if len(state.callsSnapshot()) != 4 {
+		t.Fatalf("between-query cancellation calls = %d, want identifier-width queries followed by relation query", len(state.callsSnapshot()))
 	}
 }
 
@@ -537,8 +657,8 @@ func TestCatalogClosesRowsWhenParameterDirectionIsInvalid(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "invalid parameter type") {
 		t.Fatalf("invalid parameter type error = %v, want validation error", err)
 	}
-	if state.activeRows() != 0 || state.closedRows() != 2 {
-		t.Fatalf("invalid parameter row lifetime = (active %d, closed %d), want both cursors closed", state.activeRows(), state.closedRows())
+	if state.activeRows() != 0 || state.closedRows() != 5 {
+		t.Fatalf("invalid parameter row lifetime = (active %d, closed %d), want identifier-width and catalog cursors closed", state.activeRows(), state.closedRows())
 	}
 }
 
@@ -754,6 +874,17 @@ func fixtureCallQuery(t *testing.T, calls []fixtureCall, kind string) string {
 	}
 	t.Fatalf("no %s query recorded", kind)
 	return ""
+}
+
+func fixtureCallForKind(t *testing.T, calls []fixtureCall, kind string) fixtureCall {
+	t.Helper()
+	for _, call := range calls {
+		if fixtureQueryKind(call.query) == kind {
+			return call
+		}
+	}
+	t.Fatalf("no %s query recorded", kind)
+	return fixtureCall{}
 }
 
 func normalizeFixtureSQL(query string) string {
@@ -1046,8 +1177,9 @@ func fixtureErrorFor(kind, configuredKind string, configured error) error {
 
 func fixtureQueryKind(query string) string {
 	upper := strings.ToUpper(query)
+	normalized := normalizeFixtureSQL(query)
 	switch {
-	case strings.Contains(upper, "FROM RDB$RELATION_FIELDS RF") && strings.Contains(upper, "CAST(RF.RDB$RELATION_NAME"):
+	case strings.HasPrefix(normalized, "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR("):
 		return "identifier_widths"
 	case strings.Contains(upper, "FROM RDB$RELATION_FIELDS RF") && strings.Contains(upper, "SELECT F.RDB$FIELD_LENGTH"):
 		return "identifier_width_bootstrap"
@@ -1114,21 +1246,34 @@ func fixtureResult(kind, query string, args []driver.NamedValue) ([]string, [][]
 			wantKind = RelationView
 		}
 		values := make([][]driver.Value, 0)
-		for _, relation := range fixtureRelations() {
+		relations := fixtureRelations()
+		if strings.HasPrefix(filter, "IMPORT_ORDER_LINE_ITEM") || filter == "MiXeD_Table" {
+			relations = fixtureFullIdentifierRelations()
+		}
+		for _, relation := range relations {
 			if wantKind != "" && relation.kind != wantKind {
 				continue
 			}
 			if filter != "" && relation.name != filter {
 				continue
 			}
-			values = append(values, relation.values)
+			relationValues := append([]driver.Value(nil), relation.values...)
+			if strings.HasPrefix(relation.name, "IMPORT_ORDER_LINE_ITEM") && !strings.Contains(upper, "CAST(R.RDB$RELATION_NAME") {
+				name := strings.TrimRight(relationValues[0].(string), " ")
+				relationValues[0] = name[:22]
+			}
+			values = append(values, relationValues)
 		}
 		return relationResultColumns, values, nil
 	case "columns":
 		if filter == "" {
 			return nil, nil, errors.New("fixture: missing relation filter")
 		}
-		for _, relation := range fixtureRelations() {
+		relations := fixtureRelations()
+		if strings.HasPrefix(filter, "IMPORT_ORDER_LINE_ITEM") || filter == "MiXeD_Table" {
+			relations = fixtureFullIdentifierRelations()
+		}
+		for _, relation := range relations {
 			if relation.name == filter {
 				values := relation.columns
 				for row := range values {
@@ -1364,7 +1509,23 @@ JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME`)
 	}
 	return []string{"RELATION_NAME", "FIELD_NAME", "FIELD_LENGTH"}, [][]driver.Value{
 		{"RDB$RELATIONS      ", "RDB$RELATION_NAME     ", int64(67)},
+		{"RDB$RELATIONS      ", "RDB$SECURITY_CLASS    ", int64(31)},
+		{"RDB$RELATIONS      ", "RDB$OWNER_NAME        ", int64(31)},
+		{"RDB$RELATIONS      ", "RDB$DEFAULT_CLASS     ", int64(31)},
 		{"RDB$RELATION_FIELDS      ", "RDB$FIELD_NAME      ", int64(31)},
+		{"RDB$RELATION_FIELDS      ", "RDB$FIELD_SOURCE     ", int64(31)},
+		{"RDB$RELATION_FIELDS      ", "RDB$SECURITY_CLASS    ", int64(31)},
+		{"RDB$RELATION_FIELDS      ", "RDB$BASE_FIELD        ", int64(31)},
+		{"RDB$VIEW_RELATIONS      ", "RDB$RELATION_NAME     ", int64(67)},
+		{"RDB$FIELDS      ", "RDB$FIELD_NAME     ", int64(31)},
+		{"RDB$CHARACTER_SETS      ", "RDB$CHARACTER_SET_NAME     ", int64(31)},
+		{"RDB$COLLATIONS      ", "RDB$COLLATION_NAME     ", int64(31)},
+		{"RDB$PROCEDURES      ", "RDB$PROCEDURE_NAME     ", int64(31)},
+		{"RDB$PROCEDURES      ", "RDB$SECURITY_CLASS    ", int64(31)},
+		{"RDB$PROCEDURES      ", "RDB$OWNER_NAME        ", int64(31)},
+		{"RDB$PROCEDURE_PARAMETERS      ", "RDB$PARAMETER_NAME     ", int64(31)},
+		{"RDB$PROCEDURE_PARAMETERS      ", "RDB$PROCEDURE_NAME     ", int64(31)},
+		{"RDB$PROCEDURE_PARAMETERS      ", "RDB$FIELD_SOURCE     ", int64(31)},
 		{"RDB$RELATION_CONSTRAINTS      ", "RDB$CONSTRAINT_NAME     ", int64(31)},
 	}, nil
 }
@@ -1723,6 +1884,32 @@ func fixtureRelations() []fixtureRelation {
 			values:  []driver.Value{"OTHER_VIEW    ", int64(10), "SELECT  OTHER_ID  FROM SECOND_ORDERS\n", nil, "SQL$VIEW", "SYSDBA", nil, int64(8), int64(5), nil, int64(0), "VIEW                          ", int64(0), int64(1)},
 			columns: [][]driver.Value{fixtureOtherViewColumn()},
 		},
+	}
+}
+
+func fixtureFullIdentifierRelations() []fixtureRelation {
+	return []fixtureRelation{
+		fixtureFullIdentifierRelation("IMPORT_ORDER_LINE_ITEMS", "ITEMS_ONLY_COLUMN", 20),
+		fixtureFullIdentifierRelation("IMPORT_ORDER_LINE_ITEMX", "ITEMX_ONLY_COLUMN", 21),
+		fixtureFullIdentifierRelation("MiXeD_Table", "MiXeD_Column", 22),
+	}
+}
+
+func fixtureFullIdentifierRelation(name, columnName string, id int64) fixtureRelation {
+	nameValue := name + strings.Repeat(" ", 67-len(name))
+	column := append([]driver.Value(nil), fixtureOrderIDColumn()...)
+	column[0] = columnName + strings.Repeat(" ", 31-len(columnName))
+	column[1] = nameValue
+	column[2] = "DOMAIN_" + columnName
+	column[14] = "DOMAIN_" + columnName
+	return fixtureRelation{
+		name: name,
+		kind: RelationTable,
+		values: []driver.Value{
+			nameValue, id, nil, nil, nil, "SYSDBA", nil, int64(8), int64(1), nil,
+			int64(0), "PERSISTENT                     ", int64(0), int64(0),
+		},
+		columns: [][]driver.Value{column},
 	}
 }
 

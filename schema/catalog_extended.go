@@ -176,15 +176,15 @@ type Privilege struct {
 	SubjectType   sql.NullInt64
 }
 
-const extendedDomainQuery = `
-SELECT f.RDB$FIELD_NAME, f.RDB$VALIDATION_SOURCE,
+const extendedDomainQueryTemplate = `
+SELECT %s, f.RDB$VALIDATION_SOURCE,
        f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE, f.RDB$FIELD_LENGTH,
        f.RDB$FIELD_SCALE, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
        f.RDB$DESCRIPTION, f.RDB$SYSTEM_FLAG, f.RDB$SEGMENT_LENGTH,
        f.RDB$EXTERNAL_LENGTH, f.RDB$EXTERNAL_SCALE, f.RDB$EXTERNAL_TYPE,
        f.RDB$DIMENSIONS, f.RDB$NULL_FLAG, f.RDB$CHARACTER_LENGTH,
        f.RDB$COLLATION_ID, f.RDB$CHARACTER_SET_ID, f.RDB$FIELD_PRECISION,
-       cs.RDB$CHARACTER_SET_NAME, co.RDB$COLLATION_NAME
+        %s, %s
 FROM RDB$FIELDS f
 LEFT JOIN RDB$CHARACTER_SETS cs
        ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
@@ -301,7 +301,11 @@ func (c *Catalog) Domains(ctx context.Context, name string) ([]Domain, error) {
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := extendedDomainQuery + "\nWHERE COALESCE(f.RDB$SYSTEM_FLAG, 0) = 0\n  AND f.RDB$FIELD_NAME NOT STARTING WITH 'RDB$'"
+	projection, err := c.domainQuery(ctx, extendedDomainQueryTemplate)
+	if err != nil {
+		return nil, err
+	}
+	query := projection + "\nWHERE COALESCE(f.RDB$SYSTEM_FLAG, 0) = 0\n  AND f.RDB$FIELD_NAME NOT STARTING WITH 'RDB$'"
 	args := make([]any, 0, 1)
 	if name != "" {
 		query += "\n  AND f.RDB$FIELD_NAME = ?"
