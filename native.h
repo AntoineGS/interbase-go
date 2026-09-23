@@ -148,6 +148,14 @@ typedef struct ib_column_metadata {
 	int has_precision_scale;
 } ib_column_metadata;
 
+typedef struct ib_input_metadata {
+	int sql_type;
+	int sql_subtype;
+	int sql_scale;
+	int sql_precision;
+	int nullable;
+} ib_input_metadata;
+
 ib_connection *ib_connection_open(const char *database, size_t database_length,
 	const char *user, size_t user_length, const char *password,
 	size_t password_length, const char *role, size_t role_length,
@@ -273,6 +281,8 @@ ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
 	size_t query_length, ib_cancel_slot *cancel, uint64_t generation,
 	char **error);
 int ib_statement_num_input(const ib_statement *statement);
+int ib_statement_input_metadata(const ib_statement *statement, size_t index,
+	ib_input_metadata *metadata, char **error);
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,
 	char **error);

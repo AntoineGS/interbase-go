@@ -7975,6 +7975,24 @@ int ib_statement_num_input(const ib_statement *statement)
 	return (int) statement->input->sqld;
 }
 
+int ib_statement_input_metadata(const ib_statement *statement, size_t index,
+	ib_input_metadata *metadata, char **error)
+{
+	const XSQLVAR *variable;
+
+	if (statement == NULL || statement->input == NULL || metadata == NULL ||
+		statement->input->sqld < 0 || index >= (size_t) statement->input->sqld) {
+		return ib_fail(error, "invalid prepared input metadata index");
+	}
+	variable = &statement->input->sqlvar[index];
+	metadata->sql_type = ib_sql_type(variable);
+	metadata->sql_subtype = variable->sqlsubtype;
+	metadata->sql_scale = variable->sqlscale;
+	metadata->sql_precision = variable->sqlprecision;
+	metadata->nullable = (variable->sqltype & 1) != 0;
+	return 0;
+}
+
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,
 	char **error)
