@@ -9107,6 +9107,64 @@ static int ib_append_blob_data(char **data, size_t *length, size_t *capacity,
 	return 0;
 }
 
+static int ib_catalog_name_is(const char *name, short length,
+	const char *expected)
+{
+	size_t expected_length = strlen(expected);
+
+	return name != NULL && length >= 0 && length <= METADATALENGTH &&
+		(size_t) length == expected_length &&
+		memcmp(name, expected, expected_length) == 0;
+}
+
+static short ib_catalog_text_override(const ib_cursor *cursor,
+	const XSQLVAR *variable)
+{
+	static const struct {
+		const char *relation;
+		const char *field;
+	} allowlist[] = {
+		{"RDB$PROCEDURES", "RDB$PROCEDURE_SOURCE"},
+		{"RDB$PROCEDURES", "RDB$DESCRIPTION"},
+		{"RDB$PROCEDURE_PARAMETERS", "RDB$DESCRIPTION"},
+		{"RDB$TRIGGERS", "RDB$TRIGGER_SOURCE"},
+		{"RDB$TRIGGERS", "RDB$DESCRIPTION"},
+		{"RDB$RELATIONS", "RDB$VIEW_SOURCE"},
+		{"RDB$RELATIONS", "RDB$DESCRIPTION"},
+		{"RDB$RELATION_FIELDS", "RDB$DEFAULT_SOURCE"},
+		{"RDB$RELATION_FIELDS", "RDB$DESCRIPTION"},
+		{"RDB$FIELDS", "RDB$DEFAULT_SOURCE"},
+		{"RDB$FIELDS", "RDB$COMPUTED_SOURCE"},
+		{"RDB$FIELDS", "RDB$VALIDATION_SOURCE"},
+		{"RDB$FIELDS", "RDB$DESCRIPTION"},
+		{"RDB$INDICES", "RDB$EXPRESSION_SOURCE"},
+		{"RDB$INDICES", "RDB$DESCRIPTION"},
+		{"RDB$FUNCTIONS", "RDB$DESCRIPTION"}
+	};
+	short charset;
+
+	if (cursor == NULL || variable == NULL || cursor->connection == NULL ||
+		cursor->allow_arrays ||
+		(variable->sqltype & ~1) != SQL_BLOB ||
+		variable->sqlsubtype != 1 || variable->relname_length <= 0 ||
+		variable->sqlname_length <= 0) {
+		return 0;
+	}
+	charset = cursor->connection->catalog_text_charset;
+	if (charset == 0) {
+		return 0;
+	}
+	for (size_t index = 0U; index < sizeof(allowlist) / sizeof(allowlist[0]); index++) {
+		if (ib_catalog_name_is(variable->relname, variable->relname_length,
+			allowlist[index].relation) &&
+			ib_catalog_name_is(variable->sqlname, variable->sqlname_length,
+			allowlist[index].field)) {
+			return charset;
+		}
+	}
+	return 0;
+}
+
 static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	size_t *length, int *is_utf8, char **error)
 {
@@ -9126,6 +9184,7 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	size_t capacity;
 	int cleanup_failed;
 	int use_bpb;
+	short override_charset;
 
 	if (length == NULL || cursor == NULL || cursor->connection == NULL ||
 		cursor->connection->database == NULL || cursor->transaction == NULL ||
@@ -9135,9 +9194,11 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	}
 	memcpy(&blob_id, variable->sqldata, sizeof(blob_id));
 	*is_utf8 = 0;
+	override_charset = ib_catalog_text_override(cursor, variable);
 	bpb_length = 0U;
 	use_bpb = 0;
-	if (variable->sqlsubtype == 1 && variable->sqlname_length > 0 &&
+	if (override_charset == 0 && variable->sqlsubtype == 1 &&
+		variable->sqlname_length > 0 &&
 		variable->relname_length > 0) {
 		if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
 			error) != 0) {
@@ -9231,6 +9292,35 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 			return NULL;
 		}
 		data[0] = '\0';
+	}
+	if (override_charset != 0) {
+		size_t converted_length = 0U;
+		char *converted;
+
+		converted = ib_convert_to_utf8(data, data_length, override_charset,
+			&converted_length, error);
+		free(data);
+		if (converted == NULL) {
+			char context[256];
+			char *context_error;
+			const char *charset_name = ib_charset_name(override_charset);
+
+			(void) snprintf(context, sizeof(context),
+				"decode catalog BLOB %.*s.%.*s using %s",
+				(int) variable->relname_length, variable->relname,
+				(int) variable->sqlname_length, variable->sqlname,
+				charset_name == NULL ? "unknown" : charset_name);
+			context_error = ib_copy_string(context, strlen(context));
+			if (error != NULL) {
+				ib_append_error(error, context_error);
+			} else {
+				free(context_error);
+			}
+			return NULL;
+		}
+		*is_utf8 = 1;
+		*length = converted_length;
+		return converted;
 	}
 	*length = data_length;
 	return data;

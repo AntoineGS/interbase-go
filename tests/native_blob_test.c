@@ -8,6 +8,12 @@ static int fail_close;
 static int close_calls;
 static int open_calls;
 static int open_blob2_calls;
+static int lookup_desc_calls;
+static int get_segment_calls;
+static int cancel_calls;
+static const unsigned char *controlled_payload;
+static size_t controlled_payload_length;
+static int fail_segment;
 static size_t blob_offset;
 static char blob_token;
 static char handle_token;
@@ -31,6 +37,7 @@ static void *test_malloc(size_t size)
 #define isc_close_blob test_close_blob
 #define isc_cancel_blob test_cancel_blob
 #define isc_blob_gen_bpb2 test_blob_gen_bpb2
+#define isc_blob_lookup_desc2 test_blob_lookup_desc2
 #define isc_create_blob2 test_create_blob2
 #define isc_put_segment test_put_segment
 #include "../native.c"
@@ -90,18 +97,27 @@ ISC_STATUS ISC_EXPORT test_get_segment(ISC_STATUS *status, isc_blob_handle *blob
 {
 	static const size_t total_length = 90000U;
 	static unsigned char value;
+	size_t source_length = controlled_payload == NULL ? total_length : controlled_payload_length;
 	size_t remaining;
 	size_t chunk;
 
 	(void) blob;
-	if (blob_offset == total_length) {
+	get_segment_calls++;
+	if (fail_segment) {
+		return status_result(status, isc_network_error);
+	}
+	if (blob_offset == source_length) {
 		*length = 0;
 		return status_result(status, isc_segstr_eof);
 	}
-	remaining = total_length - blob_offset;
+	remaining = source_length - blob_offset;
 	chunk = remaining > (size_t) buffer_length ? (size_t) buffer_length : remaining;
-	for (size_t index = 0U; index < chunk; index++) {
-		buffer[index] = (char) (value + (unsigned char) ((blob_offset + index) & 0xffU));
+	if (controlled_payload != NULL) {
+		memcpy(buffer, controlled_payload + blob_offset, chunk);
+	} else {
+		for (size_t index = 0U; index < chunk; index++) {
+			buffer[index] = (char) (value + (unsigned char) ((blob_offset + index) & 0xffU));
+		}
 	}
 	*length = (unsigned short) chunk;
 	blob_offset += chunk;
@@ -124,7 +140,24 @@ ISC_STATUS ISC_EXPORT test_close_blob(ISC_STATUS *status, isc_blob_handle *blob)
 ISC_STATUS ISC_EXPORT test_cancel_blob(ISC_STATUS *status, isc_blob_handle *blob)
 {
 	(void) blob;
+	cancel_calls++;
 	return status_result(status, isc_network_error);
+}
+
+ISC_STATUS ISC_EXPORT test_blob_lookup_desc2(ISC_STATUS *status,
+	isc_db_handle *database, isc_tr_handle *transaction, unsigned char *relation,
+	unsigned char *field, ISC_BLOB_DESC_V2 *descriptor, unsigned char *global_field)
+{
+	(void) database;
+	(void) transaction;
+	(void) relation;
+	(void) field;
+	(void) global_field;
+	lookup_desc_calls++;
+	memset(descriptor, 0, sizeof(*descriptor));
+	descriptor->blob_desc_subtype = 1;
+	descriptor->blob_desc_charset = 3;
+	return status_result(status, 0);
 }
 
 ISC_STATUS ISC_EXPORT test_blob_gen_bpb2(ISC_STATUS *status,
@@ -222,6 +255,354 @@ static void test_large_segment_materialization(void)
 			"large segmented BLOB data changed");
 	}
 	free(data);
+}
+
+static void reset_controlled_blob(const unsigned char *payload, size_t length)
+{
+	controlled_payload = payload;
+	controlled_payload_length = length;
+	fail_segment = 0;
+	blob_offset = 0U;
+	open_calls = 0;
+	open_blob2_calls = 0;
+	close_calls = 0;
+	lookup_desc_calls = 0;
+	blob_gen_bpb2_calls = 0;
+	get_segment_calls = 0;
+	cancel_calls = 0;
+}
+
+static void test_catalog_text_is_raw_read_and_locally_decoded(short attachment_charset,
+	short catalog_charset, const unsigned char *payload, size_t payload_length,
+	const unsigned char *expected, size_t expected_length, const char *relation,
+	const char *field)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLDA *output;
+	ISC_QUAD blob_id = {0};
+	short indicator = 0;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &handle_token;
+	connection.charset = attachment_charset;
+	connection.catalog_text_charset = catalog_charset;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = &handle_token;
+	cursor.fetched = 1;
+	output = (XSQLDA *) calloc(1U, XSQLDA_LENGTH(1));
+	check(output != NULL, "catalog SQLDA allocation failed");
+	output->sqln = 1;
+	output->sqld = 1;
+	output->sqlvar[0].sqltype = SQL_BLOB | 1;
+	output->sqlvar[0].sqlsubtype = 1;
+	output->sqlvar[0].sqldata = (char *) &blob_id;
+	output->sqlvar[0].sqlind = &indicator;
+	memcpy(output->sqlvar[0].relname, relation, strlen(relation));
+	output->sqlvar[0].relname_length = (short) strlen(relation);
+	memcpy(output->sqlvar[0].sqlname, field, strlen(field));
+	output->sqlvar[0].sqlname_length = (short) strlen(field);
+	memcpy(output->sqlvar[0].aliasname, "USER_ALIAS", sizeof("USER_ALIAS") - 1U);
+	output->sqlvar[0].aliasname_length = (short) (sizeof("USER_ALIAS") - 1U);
+	cursor.output = output;
+	reset_controlled_blob(payload, payload_length);
+	check(ib_cursor_column(&cursor, 0U, &view, &error) == 0 && error == NULL,
+		"catalog BLOB column conversion failed");
+	check(view.kind == IB_VALUE_STRING, "catalog BLOB was not returned as a string");
+	check(view.length == expected_length && memcmp(view.bytes, expected, expected_length) == 0,
+		"catalog BLOB bytes did not match selected local charset");
+	check(open_calls == 1 && open_blob2_calls == 0,
+		"catalog override did not use one raw BLOB open");
+	check(blob_gen_bpb2_calls == 0 && lookup_desc_calls == 0,
+		"catalog override unexpectedly requested descriptor conversion");
+	check(close_calls == 1, "catalog BLOB was not closed");
+	free(cursor.materialized_value);
+	free(cursor.converted_value);
+	free(output);
+	ib_error_free(error);
+	controlled_payload = NULL;
+	controlled_payload_length = 0U;
+}
+
+static void test_catalog_text_uses_configured_source_not_attachment(void)
+{
+	static const unsigned char legacy[] = {
+		'C', 'R', 0xc9, 'A', 'T', 'I', 'O', 'N', '\r', '\n'
+	};
+	static const unsigned char utf8[] = {
+		'C', 'R', 0xc3, 0x89, 'A', 'T', 'I', 'O', 'N', '\r', '\n'
+	};
+	static const unsigned char win1250_aogonek[] = {0xc4, 0x84};
+	static const unsigned char win1252_yen[] = {0xc2, 0xa5};
+	static const unsigned char aogonek_raw[] = {0xa5};
+	test_catalog_text_is_raw_read_and_locally_decoded(IB_CHARSET_UTF8,
+		IB_CHARSET_WIN1250, legacy, sizeof(legacy), utf8, sizeof(utf8),
+		"RDB$PROCEDURES", "RDB$PROCEDURE_SOURCE");
+	test_catalog_text_is_raw_read_and_locally_decoded(IB_CHARSET_WIN1252,
+		IB_CHARSET_WIN1250, legacy, sizeof(legacy), utf8, sizeof(utf8),
+		"RDB$PROCEDURES", "RDB$PROCEDURE_SOURCE");
+	test_catalog_text_is_raw_read_and_locally_decoded(IB_CHARSET_UTF8,
+		IB_CHARSET_WIN1250, aogonek_raw, sizeof(aogonek_raw), win1250_aogonek,
+		sizeof(win1250_aogonek), "RDB$PROCEDURES", "RDB$PROCEDURE_SOURCE");
+	test_catalog_text_is_raw_read_and_locally_decoded(IB_CHARSET_UTF8,
+		IB_CHARSET_WIN1252, aogonek_raw, sizeof(aogonek_raw), win1252_yen,
+		sizeof(win1252_yen), "RDB$PROCEDURES", "RDB$PROCEDURE_SOURCE");
+	test_catalog_text_is_raw_read_and_locally_decoded(IB_CHARSET_UTF8,
+		IB_CHARSET_WIN1250, (const unsigned char *) "", 0U,
+		(const unsigned char *) "", 0U, "RDB$PROCEDURES", "RDB$PROCEDURE_SOURCE");
+}
+
+static void test_catalog_allowlist_pairs(void)
+{
+	static const unsigned char source[] = {0xc9};
+	static const unsigned char converted[] = {0xc3, 0x89};
+	static const struct {
+		const char *relation;
+		const char *field;
+	} pairs[] = {
+		{"RDB$PROCEDURES", "RDB$PROCEDURE_SOURCE"},
+		{"RDB$PROCEDURES", "RDB$DESCRIPTION"},
+		{"RDB$PROCEDURE_PARAMETERS", "RDB$DESCRIPTION"},
+		{"RDB$TRIGGERS", "RDB$TRIGGER_SOURCE"},
+		{"RDB$TRIGGERS", "RDB$DESCRIPTION"},
+		{"RDB$RELATIONS", "RDB$VIEW_SOURCE"},
+		{"RDB$RELATIONS", "RDB$DESCRIPTION"},
+		{"RDB$RELATION_FIELDS", "RDB$DEFAULT_SOURCE"},
+		{"RDB$RELATION_FIELDS", "RDB$DESCRIPTION"},
+		{"RDB$FIELDS", "RDB$DEFAULT_SOURCE"},
+		{"RDB$FIELDS", "RDB$COMPUTED_SOURCE"},
+		{"RDB$FIELDS", "RDB$VALIDATION_SOURCE"},
+		{"RDB$FIELDS", "RDB$DESCRIPTION"},
+		{"RDB$INDICES", "RDB$EXPRESSION_SOURCE"},
+		{"RDB$INDICES", "RDB$DESCRIPTION"},
+		{"RDB$FUNCTIONS", "RDB$DESCRIPTION"},
+	};
+
+	for (size_t index = 0U; index < sizeof(pairs) / sizeof(pairs[0]); index++) {
+		test_catalog_text_is_raw_read_and_locally_decoded(IB_CHARSET_UTF8,
+			IB_CHARSET_WIN1250, source, sizeof(source), converted, sizeof(converted),
+			pairs[index].relation, pairs[index].field);
+	}
+}
+
+static void test_catalog_classifier_requires_exact_scope(void)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLVAR variable;
+	static const char relation[] = "RDB$PROCEDURES";
+	static const char field[] = "RDB$PROCEDURE_SOURCE";
+
+	memset(&connection, 0, sizeof(connection));
+	connection.catalog_text_charset = IB_CHARSET_WIN1250;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	memset(&variable, 0, sizeof(variable));
+	variable.sqltype = SQL_BLOB | 1;
+	variable.sqlsubtype = 1;
+	memcpy(variable.relname, relation, sizeof(relation) - 1U);
+	variable.relname_length = (short) (sizeof(relation) - 1U);
+	memcpy(variable.sqlname, field, sizeof(field) - 1U);
+	variable.sqlname_length = (short) (sizeof(field) - 1U);
+	check(ib_catalog_text_override(&cursor, &variable) == IB_CHARSET_WIN1250,
+		"exact catalog source pair was not classified");
+	cursor.allow_arrays = 1;
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"direct API route received the materialized override");
+	cursor.allow_arrays = 0;
+	variable.sqlsubtype = 0;
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"binary BLOB received the catalog text override");
+	variable.sqlsubtype = 1;
+	variable.sqltype = SQL_LONG | 1;
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"non-BLOB SQLDA type was accepted");
+	variable.sqltype = SQL_BLOB | 1;
+	variable.relname[0] = 'r';
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"case-folded catalog relation was accepted");
+	variable.relname[0] = 'R';
+	variable.relname_length--;
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"catalog relation prefix was accepted");
+	variable.relname_length = -1;
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"negative relation length was accepted");
+	variable.relname_length = METADATALENGTH + 1;
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"oversized relation length was accepted");
+	variable.relname_length = (short) (sizeof(relation) - 1U);
+	variable.sqlname_length = METADATALENGTH + 1;
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"oversized field length was accepted");
+	variable.sqlname_length = (short) (sizeof(field) - 1U);
+	variable.relname[0] = 'U';
+	memcpy(variable.relname, "USER_TABLE", sizeof("USER_TABLE") - 1U);
+	variable.relname_length = (short) (sizeof("USER_TABLE") - 1U);
+	check(ib_catalog_text_override(&cursor, &variable) == 0,
+		"user-table field received catalog override");
+}
+
+static void test_catalog_conversion_error_has_context_and_closes_blob(void)
+{
+	static const unsigned char invalid_ascii[] = {0xc9};
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLDA *output;
+	ISC_QUAD blob_id = {0};
+	short indicator = 0;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &handle_token;
+	connection.charset = IB_CHARSET_UTF8;
+	connection.catalog_text_charset = IB_CHARSET_ASCII;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = &handle_token;
+	cursor.fetched = 1;
+	output = (XSQLDA *) calloc(1U, XSQLDA_LENGTH(1));
+	check(output != NULL, "catalog error SQLDA allocation failed");
+	output->sqln = 1;
+	output->sqld = 1;
+	output->sqlvar[0].sqltype = SQL_BLOB | 1;
+	output->sqlvar[0].sqlsubtype = 1;
+	output->sqlvar[0].sqldata = (char *) &blob_id;
+	output->sqlvar[0].sqlind = &indicator;
+	memcpy(output->sqlvar[0].relname, "RDB$PROCEDURES", sizeof("RDB$PROCEDURES") - 1U);
+	output->sqlvar[0].relname_length = (short) (sizeof("RDB$PROCEDURES") - 1U);
+	memcpy(output->sqlvar[0].sqlname, "RDB$PROCEDURE_SOURCE", sizeof("RDB$PROCEDURE_SOURCE") - 1U);
+	output->sqlvar[0].sqlname_length = (short) (sizeof("RDB$PROCEDURE_SOURCE") - 1U);
+	cursor.output = output;
+	reset_controlled_blob(invalid_ascii, sizeof(invalid_ascii));
+	check(ib_cursor_column(&cursor, 0U, &view, &error) != 0 && error != NULL,
+		"invalid ASCII catalog bytes were silently converted");
+	check(strstr(error, "RDB$PROCEDURES.RDB$PROCEDURE_SOURCE") != NULL &&
+		strstr(error, "ASCII") != NULL,
+		"catalog conversion error omitted field or charset context");
+	check(strstr(error, "\xc9") == NULL,
+		"catalog conversion error exposed source contents");
+	check(close_calls == 1 && open_calls == 1,
+		"conversion failure occurred before raw BLOB close");
+	free(cursor.materialized_value);
+	free(cursor.converted_value);
+	free(output);
+	ib_error_free(error);
+	controlled_payload = NULL;
+	controlled_payload_length = 0U;
+}
+
+static void test_catalog_non_allowlisted_field_keeps_declared_path(
+	const char *relation, const char *field, const char *alias)
+{
+	static const unsigned char payload[] = {'A'};
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLDA *output;
+	ISC_QUAD blob_id = {0};
+	short indicator = 0;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &handle_token;
+	connection.charset = IB_CHARSET_UTF8;
+	connection.catalog_text_charset = IB_CHARSET_WIN1250;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = &handle_token;
+	cursor.fetched = 1;
+	output = (XSQLDA *) calloc(1U, XSQLDA_LENGTH(1));
+	check(output != NULL, "declared-path SQLDA allocation failed");
+	output->sqln = 1;
+	output->sqld = 1;
+	output->sqlvar[0].sqltype = SQL_BLOB | 1;
+	output->sqlvar[0].sqlsubtype = 1;
+	output->sqlvar[0].sqldata = (char *) &blob_id;
+	output->sqlvar[0].sqlind = &indicator;
+	memcpy(output->sqlvar[0].relname, relation, strlen(relation));
+	output->sqlvar[0].relname_length = (short) strlen(relation);
+	memcpy(output->sqlvar[0].sqlname, field, strlen(field));
+	output->sqlvar[0].sqlname_length = (short) strlen(field);
+	memcpy(output->sqlvar[0].aliasname, alias, strlen(alias));
+	output->sqlvar[0].aliasname_length = (short) strlen(alias);
+	cursor.output = output;
+	reset_controlled_blob(payload, sizeof(payload));
+	check(ib_cursor_column(&cursor, 0U, &view, &error) == 0 && error == NULL,
+		"non-allowlisted declared-path BLOB read failed");
+	check(view.kind == IB_VALUE_STRING && view.length == sizeof(payload) &&
+		memcmp(view.bytes, payload, sizeof(payload)) == 0,
+		"non-allowlisted BLOB output changed");
+	check(lookup_desc_calls == 1 && blob_gen_bpb2_calls == 1 &&
+		open_blob2_calls == 1 && open_calls == 0,
+		"non-allowlisted BLOB bypassed declared-charset conversion");
+	check(close_calls == 1, "non-allowlisted BLOB was not closed");
+	free(cursor.materialized_value);
+	free(cursor.converted_value);
+	free(output);
+	ib_error_free(error);
+	controlled_payload = NULL;
+	controlled_payload_length = 0U;
+}
+
+static void test_catalog_alias_does_not_expand_scope(void)
+{
+	test_catalog_non_allowlisted_field_keeps_declared_path("USER_TABLE",
+		"RDB$PROCEDURE_SOURCE", "RDB$PROCEDURE_SOURCE");
+	test_catalog_non_allowlisted_field_keeps_declared_path("rdb$procedures",
+		"RDB$PROCEDURE_SOURCE", "PROCEDURE_SOURCE");
+	test_catalog_non_allowlisted_field_keeps_declared_path("RDB$PROCEDURES",
+		"RDB$PROCEDURE_SOURCE_EXTRA", "RDB$PROCEDURE_SOURCE");
+}
+
+static void test_catalog_read_failure_cancels_and_marks_connection_broken(void)
+{
+	static const unsigned char payload[] = {'A'};
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLDA *output;
+	ISC_QUAD blob_id = {0};
+	short indicator = 0;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &handle_token;
+	connection.catalog_text_charset = IB_CHARSET_WIN1250;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = &handle_token;
+	cursor.fetched = 1;
+	output = (XSQLDA *) calloc(1U, XSQLDA_LENGTH(1));
+	check(output != NULL, "read-failure SQLDA allocation failed");
+	output->sqln = 1;
+	output->sqld = 1;
+	output->sqlvar[0].sqltype = SQL_BLOB | 1;
+	output->sqlvar[0].sqlsubtype = 1;
+	output->sqlvar[0].sqldata = (char *) &blob_id;
+	output->sqlvar[0].sqlind = &indicator;
+	memcpy(output->sqlvar[0].relname, "RDB$PROCEDURES", sizeof("RDB$PROCEDURES") - 1U);
+	output->sqlvar[0].relname_length = (short) (sizeof("RDB$PROCEDURES") - 1U);
+	memcpy(output->sqlvar[0].sqlname, "RDB$PROCEDURE_SOURCE", sizeof("RDB$PROCEDURE_SOURCE") - 1U);
+	output->sqlvar[0].sqlname_length = (short) (sizeof("RDB$PROCEDURE_SOURCE") - 1U);
+	cursor.output = output;
+	reset_controlled_blob(payload, sizeof(payload));
+	fail_segment = 1;
+	check(ib_cursor_column(&cursor, 0U, &view, &error) != 0 && error != NULL,
+		"injected catalog segment failure was hidden");
+	check(strstr(error, "read output BLOB segment") != NULL,
+		"segment failure did not preserve its native context");
+	check(cancel_calls == 1 && close_calls == 1 && connection.broken != 0,
+		"segment failure did not cancel and poison the failed BLOB connection");
+	free(output);
+	ib_error_free(error);
+	controlled_payload = NULL;
+	controlled_payload_length = 0U;
+	fail_segment = 0;
 }
 
 static void test_stream_reader(void)
@@ -513,6 +894,12 @@ int main(void)
 {
 	test_cleanup_failure_without_message();
 	test_large_segment_materialization();
+	test_catalog_text_uses_configured_source_not_attachment();
+	test_catalog_allowlist_pairs();
+	test_catalog_classifier_requires_exact_scope();
+	test_catalog_conversion_error_has_context_and_closes_blob();
+	test_catalog_alias_does_not_expand_scope();
+	test_catalog_read_failure_cancels_and_marks_connection_broken();
 	test_stream_reader();
 	test_stream_reader_uses_text_blob_descriptor();
 	test_stream_writer();

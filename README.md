@@ -109,6 +109,36 @@ Set `Dialect: 1` to opt into Dialect 1. The example spells out the Dialect 3
 default; it requires no dependency beyond Go's standard `database/sql` package
 and this connector.
 
+For databases whose known system-catalog text BLOBs contain bytes from a
+configured legacy single-byte code page, opt in explicitly and independently
+of the attachment charset:
+
+```go
+connector, err := interbase.NewConnector(interbase.Config{
+    Database:            database,
+    User:                user,
+    Password:            password,
+    Charset:             "UTF8",
+    CatalogTextCharset:  "WIN1250",
+})
+```
+
+`CatalogTextCharset` accepts `WIN1250`, `WIN1252`, `ISO8859_1`, or `ASCII`
+(case-insensitive, surrounding whitespace trimmed). Empty leaves the existing
+declared-column-charset behavior unchanged. The override is restricted to
+materialized `database/sql` text BLOBs in the exact original system relation / field
+pairs: procedure source and description; procedure-parameter description;
+trigger source and description; relation view source and description;
+relation-field default source and description; field default, computed,
+validation source and description; index expression source and description;
+and function description. It uses original SQLDA metadata, not result aliases.
+It does not affect user-table fields, binary/BLR BLOBs, CHAR/VARCHAR values,
+or direct API `BlobRef`/`OpenBlob` streams, which retain their declared-charset
+semantics. The option is a deterministic assertion about the encoding of those
+catalog values, not automatic detection: if catalog values contain mixed
+non-ASCII encodings, choose a verified code page or leave the option disabled;
+the driver does not guess per value.
+
 Set `Config.Host` together with `Config.Database` to construct a native
 `[host[/port]]:database` attachment. `Config.TLS` adds the InterBase native
 TLS attachment parameters, while `Config.Role`, `Config.EncryptedPassword`,
