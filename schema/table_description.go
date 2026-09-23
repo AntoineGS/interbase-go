@@ -7,8 +7,9 @@ import (
 	"strings"
 )
 
-// CatalogDescription is a comment-only, non-executable description of a table
-// assembled from its catalog metadata.
+// CatalogDescription is a CREATE TABLE-shaped navigation description. It is
+// informational and does not imply the complete catalog snapshot needed for
+// executable DDL generation.
 type CatalogDescription struct {
 	Body    string
 	Table   DescriptionSpan
@@ -34,6 +35,7 @@ type DescriptionColumn struct {
 func (d Domain) CatalogTypeLabel() (label string, normalized bool) {
 	if d.FieldType.Valid && d.FieldType.Int64 == fieldTypeDouble &&
 		d.FieldScale.Valid && d.FieldScale.Int64 < 0 &&
+		d.FieldScale.Int64 >= -15 &&
 		(!d.FieldSubType.Valid || d.FieldSubType.Int64 == 0) && !d.FieldPrecision.Valid {
 		return fmt.Sprintf("NUMERIC(15, %d)", -d.FieldScale.Int64), true
 	}
@@ -45,11 +47,21 @@ func (d Domain) CatalogTypeLabel() (label string, normalized bool) {
 	return label, false
 }
 
-// DescribeCatalog returns a comment-only description of this relation using
-// its exact table and ordered column names. The result is informational and is
-// not executable DDL.
+// DescribeCatalog returns a SQL-shaped informational description using the
+// historical Dialect 3 rendering default.
 func (r Relation) DescribeCatalog() (CatalogDescription, error) {
-	tableName, err := quoteDescriptionIdentifier(r.Name, "relation name")
+	return r.DescribeCatalogWithOptions(DDLOptions{})
+}
+
+// DescribeCatalogWithOptions renders a SQL-shaped navigation description for
+// the requested dialect. It does not weaken GenerateDDL's complete-catalog
+// requirement.
+func (r Relation) DescribeCatalogWithOptions(options DDLOptions) (CatalogDescription, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return CatalogDescription{}, err
+	}
+	tableName, err := renderer.identifier(r.Name, "relation name")
 	if err != nil {
 		return CatalogDescription{}, err
 	}
@@ -65,29 +77,87 @@ func (r Relation) DescribeCatalog() (CatalogDescription, error) {
 		}
 		seen[column.Name] = struct{}{}
 
-		quotedColumns[index], err = quoteDescriptionIdentifier(column.Name, "column name")
+		quotedColumns[index], err = renderer.identifier(column.Name, "column name")
 		if err != nil {
 			return CatalogDescription{}, err
 		}
 	}
 
 	var body strings.Builder
-	appendCatalogComment(&body, "Informational catalog description; not executable DDL.")
-	body.WriteString("-- Table: ")
+	describedConstraints := make([]Constraint, 0, len(r.Constraints))
+	for _, constraint := range r.Constraints {
+		if strings.TrimSpace(constraint.ConstraintType) != string(ConstraintNotNull) {
+			describedConstraints = append(describedConstraints, constraint)
+		}
+	}
+	body.WriteString("-- Informational catalog description; not executable DDL.\n")
+	body.WriteString("CREATE TABLE ")
 	tableSpan := appendDescriptionName(&body, tableName)
-	body.WriteByte('\n')
+	body.WriteString(" (\n")
 
 	descriptionColumns := make([]DescriptionColumn, 0, len(r.Columns))
 	for index, column := range r.Columns {
-		body.WriteString("-- Column: ")
+		body.WriteString("  ")
 		span := appendDescriptionName(&body, quotedColumns[index])
-		body.WriteByte('\n')
 		descriptionColumns = append(descriptionColumns, DescriptionColumn{
 			Name: column.Name,
 			Span: span,
 		})
-		appendDomainCatalogDescription(&body, column.Domain)
+		if column.Domain == nil {
+			body.WriteString(" /* type unknown: no resolved domain metadata */")
+		} else if column.ComputedSource.Valid && strings.TrimSpace(column.ComputedSource.String) != "" {
+			body.WriteString(" /* computed column declaration not reconstructed */")
+		} else if isLegacyScaledDouble(*column.Domain) {
+			body.WriteString(fmt.Sprintf(" NUMERIC(15, %d) /* normalized legacy scaled DOUBLE catalog type; %s */", -column.Domain.FieldScale.Int64, rawCatalogTypeMetadata(column.Domain)))
+		} else {
+			typeName, typeErr := column.Domain.SQLTypeWithOptions(options)
+			if typeErr != nil {
+				body.WriteString(" /* type unknown: ")
+				body.WriteString(strings.ReplaceAll(strings.ReplaceAll(typeErr.Error(), "*/", "* /"), "\n", " "))
+				body.WriteString("; ")
+				body.WriteString(rawCatalogTypeMetadata(column.Domain))
+				body.WriteString(" */")
+			} else {
+				body.WriteByte(' ')
+				body.WriteString(typeName)
+			}
+		}
+		defaultSource := column.DefaultSource
+		if !defaultSource.Valid && column.Domain != nil {
+			defaultSource = column.Domain.DefaultSource
+		}
+		if defaultSource.Valid {
+			defaultText, defaultErr := defaultClause(sqlNullString{String: defaultSource.String, Valid: true})
+			if defaultErr == nil {
+				appendDDLClause(&body, defaultText)
+			} else {
+				appendDDLClause(&body, "/* default unknown: "+strings.ReplaceAll(strings.ReplaceAll(defaultErr.Error(), "*/", "* /"), "\n", " ")+" */")
+			}
+		}
+		if column.Nullable.Valid && !column.Nullable.Bool {
+			appendDDLClause(&body, "NOT NULL")
+		}
+		if index+1 < len(r.Columns) || len(describedConstraints) != 0 {
+			body.WriteByte(',')
+		}
+		body.WriteByte('\n')
 	}
+	for index, constraint := range describedConstraints {
+		definition, constraintErr := constraintDefinitionWithRenderer(constraint, renderer)
+		if constraintErr != nil {
+			definition = "/* constraint unavailable: " + strings.ReplaceAll(strings.ReplaceAll(constraintErr.Error(), "*/", "* /"), "\n", " ") + " */"
+		}
+		body.WriteString("  ")
+		body.WriteString(definition)
+		if index+1 < len(describedConstraints) {
+			body.WriteByte(',')
+		}
+		body.WriteByte('\n')
+	}
+	if !r.ConstraintsLoaded {
+		body.WriteString("  /* constraints unknown: complete metadata was not loaded */\n")
+	}
+	body.WriteByte(')')
 
 	result := strings.TrimSuffix(body.String(), "\n")
 	return CatalogDescription{
@@ -97,11 +167,8 @@ func (r Relation) DescribeCatalog() (CatalogDescription, error) {
 	}, nil
 }
 
-func quoteDescriptionIdentifier(name, label string) (string, error) {
-	if strings.ContainsAny(name, "\r\n") {
-		return "", fmt.Errorf("schema: %s contains a line break and cannot be represented in a comment-only description", label)
-	}
-	return quoteRequiredIdentifier(name, label)
+func isLegacyScaledDouble(domain Domain) bool {
+	return domain.FieldType.Valid && domain.FieldType.Int64 == fieldTypeDouble && domain.FieldScale.Valid && domain.FieldScale.Int64 < 0 && domain.FieldScale.Int64 >= -15 && (!domain.FieldSubType.Valid || domain.FieldSubType.Int64 == 0) && !domain.FieldPrecision.Valid
 }
 
 func appendDescriptionName(body *strings.Builder, name string) DescriptionSpan {

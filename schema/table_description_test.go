@@ -51,19 +51,14 @@ func TestRelationDescribeCatalog(t *testing.T) {
 			t.Errorf("column %d span = %q, want %q", index, got.Body[column.Span.Start:column.Span.End], want)
 		}
 	}
-	for lineNumber, line := range strings.Split(got.Body, "\n") {
-		if !strings.HasPrefix(line, "-- ") {
-			t.Errorf("body line %d is not comment-only: %q", lineNumber+1, line)
-		}
-	}
 	for _, want := range []string{
-		"normalized legacy display",
+		"CREATE TABLE \"IMPORT_ORDER_PAYMENT\"",
+		"normalized legacy scaled DOUBLE catalog type",
 		"NUMERIC(15, 2)",
 		"type=27, scale=-2, subtype=0, precision=NULL",
-		"recorded domain type metadata",
-		"type=27, scale=-2, subtype=1, precision=15",
 		"unknown field type 999",
 		"type=999, scale=NULL, subtype=NULL, precision=NULL",
+		"constraints unknown",
 	} {
 		if !strings.Contains(got.Body, want) {
 			t.Errorf("description body does not contain %q:\n%s", want, got.Body)
@@ -144,5 +139,33 @@ func TestRelationDescribeCatalogSpansUseByteOffsets(t *testing.T) {
 	}
 	if value := got.Body[got.Columns[0].Span.Start:got.Columns[0].Span.End]; value != `"列"` {
 		t.Fatalf("multibyte column span = %q, want exact quoted column name", value)
+	}
+}
+
+func TestRelationDescribeCatalogUsesOptionsAndKeepsSQLShapedKnownFacets(t *testing.T) {
+	relation := Relation{Name: "TABLE_NAME", Kind: RelationTable, Columns: []Column{
+		{Name: "AMOUNT", Domain: &Domain{FieldType: sql.NullInt64{Int64: fieldTypeDouble, Valid: true}, FieldScale: sql.NullInt64{Int64: -2, Valid: true}}, DefaultSource: sql.NullString{String: "DEFAULT  1.25", Valid: true}, Nullable: sql.NullBool{Bool: false, Valid: true}},
+	}}
+	got, err := relation.DescribeCatalogWithOptions(DDLOptions{Dialect: Dialect1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Body[got.Table.Start:got.Table.End] != "TABLE_NAME" {
+		t.Fatalf("Dialect 1 table span=%q", got.Body[got.Table.Start:got.Table.End])
+	}
+	if got.Body[got.Columns[0].Span.Start:got.Columns[0].Span.End] != "AMOUNT" {
+		t.Fatalf("Dialect 1 column span=%q", got.Body[got.Columns[0].Span.Start:got.Columns[0].Span.End])
+	}
+	for _, fragment := range []string{"CREATE TABLE TABLE_NAME", "AMOUNT NUMERIC(15, 2)", "DEFAULT  1.25", "NOT NULL", "normalized legacy scaled DOUBLE", "constraints unknown"} {
+		if !strings.Contains(got.Body, fragment) {
+			t.Errorf("description missing %q:\n%s", fragment, got.Body)
+		}
+	}
+	if strings.Contains(got.Body, `"TABLE_NAME"`) {
+		t.Fatalf("Dialect 1 description quoted identifier:\n%s", got.Body)
+	}
+	relation.ConstraintsLoaded = false
+	if _, err := relation.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("incomplete table executable DDL error=%v; strict completeness must remain", err)
 	}
 }

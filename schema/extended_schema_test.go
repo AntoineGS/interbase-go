@@ -997,6 +997,109 @@ func TestDDLRejectsAmbiguousAndLossyTypeMetadata(t *testing.T) {
 	}
 }
 
+func TestDialect1CanonicalScaledDoubleDDLAndDialect3Compatibility(t *testing.T) {
+	legacy := Domain{Name: "AMOUNT_DOMAIN", FieldType: sql.NullInt64{Int64: fieldTypeDouble, Valid: true}, FieldScale: sql.NullInt64{Int64: -2, Valid: true}}
+	if _, err := legacy.SQLType(); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("default SQLType error = %v, want Dialect 3-compatible refusal", err)
+	}
+	got, err := legacy.SQLTypeWithOptions(DDLOptions{Dialect: 1})
+	if err != nil || got != "NUMERIC(15, 2)" {
+		t.Fatalf("Dialect 1 SQLTypeWithOptions = (%q, %v), want canonical NUMERIC(15, 2)", got, err)
+	}
+	ddl, err := legacy.GenerateDDLWithOptions(DDLOptions{Dialect: 1})
+	if err != nil || !strings.Contains(ddl, "CREATE DOMAIN AMOUNT_DOMAIN AS NUMERIC(15, 2)") {
+		t.Fatalf("Dialect 1 domain DDL = (%q, %v), want unquoted canonical declaration", ddl, err)
+	}
+	if ddl, err := legacy.GenerateDDL(); err == nil || !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("default GenerateDDL = (%q, %v), want preserved Dialect 3 refusal", ddl, err)
+	}
+	legacy.FieldSubType = sql.NullInt64{Int64: 0, Valid: true}
+	if got, err := legacy.SQLTypeWithOptions(DDLOptions{Dialect: 1}); err != nil || got != "NUMERIC(15, 2)" {
+		t.Fatalf("zero subtype = (%q, %v), want canonical numeric", got, err)
+	}
+	legacy.FieldScale = sql.NullInt64{Int64: -16, Valid: true}
+	if _, err := legacy.SQLTypeWithOptions(DDLOptions{Dialect: 1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("scale 16 SQLType error = %v, want unsupported", err)
+	}
+	legacy.FieldScale = sql.NullInt64{Int64: -1 << 63, Valid: true}
+	if _, err := legacy.SQLTypeWithOptions(DDLOptions{Dialect: 1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("overflow scale SQLType error = %v, want unsupported", err)
+	}
+	legacy.FieldScale = sql.NullInt64{Int64: -2, Valid: true}
+	legacy.FieldSubType = sql.NullInt64{Int64: 1, Valid: true}
+	legacy.FieldPrecision = sql.NullInt64{Int64: 16, Valid: true}
+	if _, err := legacy.SQLTypeWithOptions(DDLOptions{Dialect: 1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("precision 16 SQLType error = %v, want unsupported", err)
+	}
+	plainDouble := Domain{Name: "PLAIN_DOUBLE", FieldType: sql.NullInt64{Int64: fieldTypeDouble, Valid: true}, FieldScale: sql.NullInt64{Int64: 0, Valid: true}}
+	if got, err := plainDouble.SQLTypeWithOptions(DDLOptions{Dialect: 1}); err != nil || got != "DOUBLE PRECISION" {
+		t.Fatalf("plain DOUBLE = (%q, %v), want unchanged DOUBLE PRECISION", got, err)
+	}
+}
+
+func TestDialect1RenderingAppliesIdentifierPolicyWithoutRewritingSource(t *testing.T) {
+	domain := Domain{Name: "GOOD_DOMAIN1", FieldType: sql.NullInt64{Int64: fieldTypeInteger, Valid: true}, DefaultSource: sql.NullString{String: "DEFAULT 'a\"b'", Valid: true}}
+	got, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 1})
+	if err != nil || got != "CREATE DOMAIN GOOD_DOMAIN1 AS INTEGER DEFAULT 'a\"b'" {
+		t.Fatalf("Dialect 1 DDL = (%q, %v), want identifier unquoted and source preserved", got, err)
+	}
+	domain.Name = "éName"
+	if _, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 1}); err == nil {
+		t.Fatal("Dialect 1 accepted an identifier it cannot represent")
+	}
+	domain.Name = "LOWERCASE"
+	if _, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 1}); err != nil {
+		t.Fatalf("uppercase representable identifier rejected: %v", err)
+	}
+	domain.Name = "SELECT"
+	if _, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 1}); err == nil {
+		t.Fatal("Dialect 1 accepted a reserved word as an unquoted identifier")
+	}
+	domain.Name = "éName"
+	if got, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: 3}); err != nil || got != `CREATE DOMAIN "éName" AS INTEGER DEFAULT 'a"b'` {
+		t.Fatalf("Dialect 3 Unicode DDL = (%q, %v), want quoted exact identifier", got, err)
+	}
+}
+
+func TestDialect1TableNamesConstraintsAndLegacyInlineProvenance(t *testing.T) {
+	table := Relation{Name: "PAYMENT", Kind: RelationTable, ConstraintsLoaded: true,
+		Columns:     []Column{{Name: "AMOUNT", Domain: &Domain{FieldType: sql.NullInt64{Int64: fieldTypeDouble, Valid: true}, FieldScale: sql.NullInt64{Int64: -2, Valid: true}}, Nullable: sql.NullBool{Bool: false, Valid: true}, DefaultSource: sql.NullString{String: "DEFAULT  1.25", Valid: true}}},
+		Constraints: []Constraint{{Name: "PAYMENT_PK", ConstraintType: string(ConstraintPrimaryKey), Columns: []string{"AMOUNT"}}},
+	}
+	ddl, err := table.GenerateDDLWithOptions(DDLOptions{Dialect: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{"CREATE TABLE PAYMENT", "AMOUNT NUMERIC(15, 2) /* legacy scaled DOUBLE", "*/ DEFAULT  1.25 NOT NULL", "CONSTRAINT PAYMENT_PK PRIMARY KEY (AMOUNT)"} {
+		if !strings.Contains(ddl, fragment) {
+			t.Errorf("Dialect 1 table DDL missing %q:\n%s", fragment, ddl)
+		}
+	}
+	if strings.Contains(ddl, `"PAYMENT"`) {
+		t.Errorf("Dialect 1 table DDL quoted identifiers:\n%s", ddl)
+	}
+}
+
+func TestDialect1ReferencesUseRendererAndOpaqueSourceIsExplicitlyUnsupported(t *testing.T) {
+	domain := Domain{Name: "GOOD_DOMAIN", FieldType: sql.NullInt64{Int64: fieldTypeVarchar, Valid: true}, CharacterLength: sql.NullInt64{Int64: 20, Valid: true}, CharacterSetName: sql.NullString{String: "UTF8", Valid: true}, CollationID: sql.NullInt64{Int64: 1, Valid: true}, CollationName: sql.NullString{String: "UTF8", Valid: true}}
+	ddl, err := domain.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1})
+	if err != nil || ddl != "CREATE DOMAIN GOOD_DOMAIN AS VARCHAR(20) CHARACTER SET UTF8 COLLATE UTF8" {
+		t.Fatalf("Dialect 1 charset/collation DDL = (%q, %v)", ddl, err)
+	}
+	date := Domain{FieldType: sql.NullInt64{Int64: fieldTypeDate, Valid: true}}
+	if _, err := date.SQLTypeWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("Dialect 1 DATE error = %v, want semantic refusal", err)
+	}
+	view := Relation{Name: "VIEW_NAME", Kind: RelationView, ViewSource: sql.NullString{String: "SELECT 1", Valid: true}, Columns: []Column{{Name: "VALUE"}}}
+	if _, err := view.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("Dialect 1 opaque view error = %v, want explicit unsupported", err)
+	}
+	index := Index{Name: "COMPUTED_INDEX", RelationName: "TABLE_NAME", UniqueFlag: sql.NullInt64{Int64: 0, Valid: true}, IndexType: sql.NullInt64{Int64: 0, Valid: true}, Expression: sql.NullString{String: "COMPUTED BY VALUE + 1", Valid: true}}
+	if _, err := index.GenerateDDLWithOptions(DDLOptions{Dialect: Dialect1}); !errors.Is(err, ErrUnsupportedDDL) {
+		t.Fatalf("Dialect 1 opaque expression index error = %v, want explicit unsupported", err)
+	}
+}
+
 func TestProcedureDDLRequiresExactCountsAndCompleteParameters(t *testing.T) {
 	base := Procedure{
 		Name:        "COUNTED_PROCEDURE",

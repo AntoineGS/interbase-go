@@ -14,6 +14,63 @@ import (
 // losing a semantic or textual part of the object definition.
 var ErrUnsupportedDDL = errors.New("schema: unsupported DDL")
 
+// DDLDialect identifies the InterBase SQL dialect used to render identifiers
+// and dialect-sensitive catalog types.
+type DDLDialect int
+
+const (
+	Dialect3 DDLDialect = 3
+	Dialect1 DDLDialect = 1
+)
+
+// DDLOptions selects the SQL dialect for one rendering operation. A zero
+// Dialect preserves the historical Dialect 3 default.
+type DDLOptions struct {
+	Dialect DDLDialect
+}
+
+type ddlRenderer struct{ dialect DDLDialect }
+
+func newDDLRenderer(options DDLOptions) (ddlRenderer, error) {
+	dialect := options.Dialect
+	if dialect == 0 {
+		dialect = Dialect3
+	}
+	if dialect != Dialect1 && dialect != Dialect3 {
+		return ddlRenderer{}, fmt.Errorf("schema: unsupported SQL dialect %d", dialect)
+	}
+	return ddlRenderer{dialect: dialect}, nil
+}
+
+func (r ddlRenderer) identifier(name, label string) (string, error) {
+	if r.dialect == Dialect3 {
+		return quoteRequiredIdentifier(name, label)
+	}
+	if name == "" || len(name) > 31 || !asciiIdentifierStart(name[0]) || name != strings.ToUpper(name) || dialect1ReservedIdentifier(name) {
+		return "", fmt.Errorf("schema: %s %q cannot be represented in SQL dialect 1", label, name)
+	}
+	for i := 1; i < len(name); i++ {
+		if !asciiIdentifierPart(name[i]) {
+			return "", fmt.Errorf("schema: %s %q cannot be represented in SQL dialect 1", label, name)
+		}
+	}
+	return name, nil
+}
+
+func dialect1ReservedIdentifier(name string) bool {
+	switch name {
+	case "ADD", "ALL", "ALTER", "AND", "ANY", "AS", "ASC", "AVG", "BEGIN", "BETWEEN", "BIGINT", "BLOB", "BOOLEAN", "BY", "CASE", "CAST", "CHAR", "CHARACTER", "CHECK", "COLLATE", "COMMIT", "CONNECT", "CONSTRAINT", "COUNT", "CREATE", "CROSS", "CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP", "DATABASE", "DATE", "DECIMAL", "DEFAULT", "DELETE", "DESC", "DISTINCT", "DOUBLE", "DROP", "ELSE", "END", "EXISTS", "EXTERNAL", "FETCH", "FILTER", "FLOAT", "FOR", "FOREIGN", "FROM", "FULL", "FUNCTION", "GRANT", "GROUP", "HAVING", "IN", "INDEX", "INNER", "INSERT", "INTEGER", "INTO", "IS", "JOIN", "LEFT", "LIKE", "LONG", "MAX", "MIN", "NOT", "NULL", "NUMERIC", "ON", "OR", "ORDER", "OUTER", "PLAN", "PRIMARY", "PROCEDURE", "REAL", "REFERENCES", "RETURNS", "REVOKE", "RIGHT", "ROLLBACK", "SELECT", "SET", "SMALLINT", "SUM", "TABLE", "THEN", "TIME", "TIMESTAMP", "TO", "TRIGGER", "UNION", "UNIQUE", "UPDATE", "USER", "USING", "VALUES", "VARCHAR", "VIEW", "WHEN", "WHERE", "WHILE", "WITH":
+		return true
+	default:
+		return false
+	}
+}
+
+func asciiIdentifierStart(c byte) bool { return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' }
+func asciiIdentifierPart(c byte) bool {
+	return asciiIdentifierStart(c) || c >= '0' && c <= '9' || c == '_' || c == '$'
+}
+
 // UnsupportedDDLError identifies the object and metadata facet that prevents
 // faithful DDL generation.
 type UnsupportedDDLError struct {
@@ -186,7 +243,16 @@ var blobSubtypeNames = map[int64]string{
 // It returns an error when the catalog does not carry enough information for a
 // faithful declaration, rather than guessing from an internal code.
 func (d Domain) SQLType() (string, error) {
-	parts, err := d.sqlTypeParts()
+	return d.SQLTypeWithOptions(DDLOptions{})
+}
+
+// SQLTypeWithOptions renders a type for the requested SQL dialect.
+func (d Domain) SQLTypeWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
+	parts, err := d.sqlTypePartsWithRenderer(renderer)
 	if err != nil {
 		return "", err
 	}
@@ -194,9 +260,10 @@ func (d Domain) SQLType() (string, error) {
 }
 
 type sqlTypeParts struct {
-	base      string
-	charset   string
-	collation string
+	base               string
+	charset            string
+	collation          string
+	legacyScaledDouble bool
 }
 
 func (p sqlTypeParts) render(includeCollation bool) string {
@@ -211,6 +278,10 @@ func (p sqlTypeParts) render(includeCollation bool) string {
 }
 
 func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
+	return d.sqlTypePartsWithRenderer(ddlRenderer{dialect: Dialect3})
+}
+
+func (d Domain) sqlTypePartsWithRenderer(renderer ddlRenderer) (sqlTypeParts, error) {
 	if d.Dimensions.Valid && d.Dimensions.Int64 != 0 {
 		return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "array bounds require RDB$FIELD_DIMENSIONS metadata")
 	}
@@ -220,6 +291,7 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 
 	fieldType := d.FieldType.Int64
 	var result string
+	var partsLegacy bool
 	switch fieldType {
 	case fieldTypeSmallint, fieldTypeInteger, fieldTypeBigint:
 		result = integerTypeName(fieldType)
@@ -237,6 +309,9 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 			if d.FieldSubType.Int64 == 2 {
 				name = "DECIMAL"
 			}
+			if !validNumericDeclaration(d.FieldPrecision.Int64, d.FieldScale.Int64, renderer.dialect) {
+				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "numeric precision or scale is out of range")
+			}
 			result = fmt.Sprintf("%s(%d, %d)", name, d.FieldPrecision.Int64, -d.FieldScale.Int64)
 		} else if d.FieldSubType.Valid && d.FieldSubType.Int64 != 0 {
 			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, fmt.Sprintf("unknown numeric subtype %d", d.FieldSubType.Int64))
@@ -247,6 +322,9 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 				precision = 4
 			case fieldTypeBigint:
 				precision = 18
+			}
+			if !validNumericDeclaration(precision, d.FieldScale.Int64, renderer.dialect) {
+				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "inferred numeric precision or scale is out of range")
 			}
 			result = fmt.Sprintf("NUMERIC(%d, %d)", precision, -d.FieldScale.Int64)
 		}
@@ -267,9 +345,18 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 			if d.FieldSubType.Int64 == 2 {
 				name = "DECIMAL"
 			}
+			if !validNumericDeclaration(d.FieldPrecision.Int64, d.FieldScale.Int64, renderer.dialect) {
+				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "numeric precision or scale is out of range")
+			}
 			result = fmt.Sprintf("%s(%d, %d)", name, d.FieldPrecision.Int64, -d.FieldScale.Int64)
 		} else if d.FieldSubType.Valid && d.FieldSubType.Int64 != 0 {
 			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, fmt.Sprintf("unknown numeric subtype %d", d.FieldSubType.Int64))
+		} else if d.FieldScale.Valid && d.FieldScale.Int64 < 0 && renderer.dialect == Dialect1 && (!d.FieldSubType.Valid || d.FieldSubType.Int64 == 0) && !d.FieldPrecision.Valid {
+			if d.FieldScale.Int64 < -15 {
+				return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "legacy scaled DOUBLE scale exceeds canonical NUMERIC(15) range")
+			}
+			result = fmt.Sprintf("NUMERIC(15, %d)", -d.FieldScale.Int64)
+			partsLegacy = true
 		} else if d.FieldScale.Valid && d.FieldScale.Int64 != 0 {
 			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "scaled DOUBLE metadata has no numeric subtype")
 		} else if !d.FieldScale.Valid {
@@ -278,10 +365,19 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 			result = "DOUBLE PRECISION"
 		}
 	case fieldTypeDate:
+		if renderer.dialect == Dialect1 {
+			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "DATE has timestamp semantics in SQL dialect 1 and cannot preserve the catalog type")
+		}
 		result = "DATE"
 	case fieldTypeTime:
+		if renderer.dialect == Dialect1 {
+			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "TIME is not representable with SQL dialect 1 semantics")
+		}
 		result = "TIME"
 	case fieldTypeTimestamp:
+		if renderer.dialect == Dialect1 {
+			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "TIMESTAMP is not representable with SQL dialect 1 semantics")
+		}
 		result = "TIMESTAMP"
 	case fieldTypeChar, fieldTypeVarchar:
 		length := d.CharacterLength
@@ -320,9 +416,9 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 		return sqlTypeParts{}, unsupportedDDL("domain", d.Name, fmt.Sprintf("unknown field type %d", fieldType))
 	}
 
-	parts := sqlTypeParts{base: result}
+	parts := sqlTypeParts{base: result, legacyScaledDouble: partsLegacy}
 	if fieldType == fieldTypeChar || fieldType == fieldTypeVarchar || fieldType == fieldTypeBlob {
-		charset, err := characterSetClause("domain", d.Name, d.CharacterSetName, d.CharacterSetID)
+		charset, err := characterSetClauseWithRenderer("domain", d.Name, d.CharacterSetName, d.CharacterSetID, renderer)
 		if err != nil {
 			return sqlTypeParts{}, err
 		}
@@ -332,7 +428,7 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 		if !d.CollationName.Valid || strings.TrimSpace(d.CollationName.String) == "" {
 			return sqlTypeParts{}, unsupportedDDL("domain", d.Name, "collation name is unavailable")
 		}
-		collation, err := quoteRequiredIdentifier(strings.TrimRight(d.CollationName.String, " "), "collation")
+		collation, err := renderer.identifier(strings.TrimRight(d.CollationName.String, " "), "collation")
 		if err != nil {
 			return sqlTypeParts{}, err
 		}
@@ -342,8 +438,12 @@ func (d Domain) sqlTypeParts() (sqlTypeParts, error) {
 }
 
 func characterSetClause(object, name string, setName sql.NullString, setID sql.NullInt64) (string, error) {
+	return characterSetClauseWithRenderer(object, name, setName, setID, ddlRenderer{dialect: Dialect3})
+}
+
+func characterSetClauseWithRenderer(object, name string, setName sql.NullString, setID sql.NullInt64, renderer ddlRenderer) (string, error) {
 	if setName.Valid && strings.TrimSpace(setName.String) != "" {
-		charset, err := quoteRequiredIdentifier(strings.TrimRight(setName.String, " "), "character set")
+		charset, err := renderer.identifier(strings.TrimRight(setName.String, " "), "character set")
 		if err != nil {
 			return "", err
 		}
@@ -353,6 +453,17 @@ func characterSetClause(object, name string, setName sql.NullString, setID sql.N
 		return "", unsupportedDDL(object, name, "character set name is unavailable")
 	}
 	return "", nil
+}
+
+func validNumericDeclaration(precision, scale int64, dialect DDLDialect) bool {
+	maxPrecision := int64(18)
+	if dialect == Dialect1 {
+		maxPrecision = 15
+	}
+	if precision < 1 || precision > maxPrecision || scale > 0 || scale < -precision || scale < -15 {
+		return false
+	}
+	return true
 }
 
 // DataType is an alias for SQLType.
@@ -371,6 +482,15 @@ func integerTypeName(fieldType int64) string {
 
 // GenerateDDL returns an executable CREATE DOMAIN statement for a user domain.
 func (d Domain) GenerateDDL() (string, error) {
+	return d.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates a domain using the requested SQL dialect.
+func (d Domain) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
 	if d.Name == "" {
 		return "", errors.New("schema: domain name is required")
 	}
@@ -380,16 +500,19 @@ func (d Domain) GenerateDDL() (string, error) {
 	if d.ComputedSource.Valid && strings.TrimSpace(d.ComputedSource.String) != "" {
 		return "", unsupportedDDL("domain", d.Name, "computed field metadata is not a standalone domain")
 	}
-	name, err := quoteRequiredIdentifier(d.Name, "domain name")
+	name, err := renderer.identifier(d.Name, "domain name")
 	if err != nil {
 		return "", err
 	}
-	parts, err := d.sqlTypeParts()
+	parts, err := d.sqlTypePartsWithRenderer(renderer)
 	if err != nil {
 		return "", err
 	}
 	var builder strings.Builder
 	fmt.Fprintf(&builder, "CREATE DOMAIN %s AS %s", name, parts.render(false))
+	if parts.legacyScaledDouble {
+		builder.WriteString(" /* legacy scaled DOUBLE; canonical Dialect 1 NUMERIC(15, scale) */")
+	}
 	defaultText, err := defaultClause(sqlNullString{String: d.DefaultSource.String, Valid: d.DefaultSource.Valid})
 	if err != nil {
 		return "", unsupportedDDL("domain", d.Name, err.Error())
@@ -421,7 +544,7 @@ func userDomainReference(domain *Domain) bool {
 	return !domain.SystemFlag.Valid || domain.SystemFlag.Int64 == 0
 }
 
-func columnCollation(column Column, domain *Domain) (string, error) {
+func columnCollation(column Column, domain *Domain, renderer ddlRenderer) (string, error) {
 	if !column.CollationID.Valid || column.CollationID.Int64 == 0 {
 		return "", nil
 	}
@@ -432,15 +555,15 @@ func columnCollation(column Column, domain *Domain) (string, error) {
 	if !column.CollationName.Valid || strings.TrimSpace(column.CollationName.String) == "" {
 		return "", unsupportedDDL("table", column.RelationName, fmt.Sprintf("column %q collation name is unavailable", column.Name))
 	}
-	collation, err := quoteRequiredIdentifier(strings.TrimRight(column.CollationName.String, " "), "column collation")
+	collation, err := renderer.identifier(strings.TrimRight(column.CollationName.String, " "), "column collation")
 	if err != nil {
 		return "", err
 	}
 	return collationClause(collation), nil
 }
 
-func columnDefinition(column Column, notNullConstraint *Constraint) (string, error) {
-	name, err := quoteRequiredIdentifier(column.Name, "column name")
+func columnDefinition(column Column, notNullConstraint *Constraint, renderer ddlRenderer) (string, error) {
+	name, err := renderer.identifier(column.Name, "column name")
 	if err != nil {
 		return "", err
 	}
@@ -452,7 +575,7 @@ func columnDefinition(column Column, notNullConstraint *Constraint) (string, err
 	if computed {
 		return "", unsupportedDDL("table", column.RelationName, fmt.Sprintf("computed column %q has no faithful typed declaration in the catalog DDL grammar", column.Name))
 	} else if userDomain {
-		domainName, err := quoteRequiredIdentifier(strings.TrimRight(column.Domain.Name, " "), "column domain")
+		domainName, err := renderer.identifier(strings.TrimRight(column.Domain.Name, " "), "column domain")
 		if err != nil {
 			return "", err
 		}
@@ -461,11 +584,14 @@ func columnDefinition(column Column, notNullConstraint *Constraint) (string, err
 		if column.Domain == nil {
 			return "", unsupportedDDL("table", column.RelationName, fmt.Sprintf("column %q has no resolved domain", column.Name))
 		}
-		domainParts, err = column.Domain.sqlTypeParts()
+		domainParts, err = column.Domain.sqlTypePartsWithRenderer(renderer)
 		if err != nil {
 			return "", err
 		}
 		appendDDLClause(&definition, domainParts.render(false))
+		if domainParts.legacyScaledDouble {
+			appendDDLClause(&definition, "/* legacy scaled DOUBLE; canonical Dialect 1 NUMERIC(15, scale) */")
+		}
 	}
 	defaultText, err := defaultClause(sqlNullString{String: column.DefaultSource.String, Valid: column.DefaultSource.Valid})
 	if err != nil {
@@ -473,7 +599,7 @@ func columnDefinition(column Column, notNullConstraint *Constraint) (string, err
 	}
 	appendDDLClause(&definition, defaultText)
 	if notNullConstraint != nil && notNullConstraint.Name != "" && !implicitNotNullConstraintName(notNullConstraint.Name) {
-		constraintName, err := quoteRequiredIdentifier(notNullConstraint.Name, "NOT NULL constraint name")
+		constraintName, err := renderer.identifier(notNullConstraint.Name, "NOT NULL constraint name")
 		if err != nil {
 			return "", err
 		}
@@ -490,7 +616,7 @@ func columnDefinition(column Column, notNullConstraint *Constraint) (string, err
 		}
 		appendDDLClause(&definition, checkText)
 	}
-	collation, err := columnCollation(column, column.Domain)
+	collation, err := columnCollation(column, column.Domain, renderer)
 	if err != nil {
 		return "", err
 	}
@@ -529,10 +655,14 @@ func referencedConstraintColumns(constraint Constraint) []string {
 }
 
 func constraintDefinition(constraint Constraint) (string, error) {
+	return constraintDefinitionWithRenderer(constraint, ddlRenderer{dialect: Dialect3})
+}
+
+func constraintDefinitionWithRenderer(constraint Constraint, renderer ddlRenderer) (string, error) {
 	constraintType := strings.TrimSpace(constraint.ConstraintType)
 	var builder strings.Builder
 	if constraint.Name != "" {
-		name, err := quoteRequiredIdentifier(constraint.Name, "constraint name")
+		name, err := renderer.identifier(constraint.Name, "constraint name")
 		if err != nil {
 			return "", err
 		}
@@ -546,7 +676,7 @@ func constraintDefinition(constraint Constraint) (string, error) {
 		if len(columns) == 0 {
 			return "", unsupportedDDL("constraint", constraint.Name, "index segments are unavailable")
 		}
-		quoted, err := quoteIdentifiers(columns, "constraint column")
+		quoted, err := quoteIdentifiers(columns, "constraint column", renderer)
 		if err != nil {
 			return "", err
 		}
@@ -566,15 +696,15 @@ func constraintDefinition(constraint Constraint) (string, error) {
 		if constraint.ReferencedRelationName == "" {
 			return "", unsupportedDDL("constraint", constraint.Name, "referenced relation is unavailable")
 		}
-		quotedColumns, err := quoteIdentifiers(columns, "foreign-key column")
+		quotedColumns, err := quoteIdentifiers(columns, "foreign-key column", renderer)
 		if err != nil {
 			return "", err
 		}
-		quotedReferencedColumns, err := quoteIdentifiers(referencedColumns, "referenced column")
+		quotedReferencedColumns, err := quoteIdentifiers(referencedColumns, "referenced column", renderer)
 		if err != nil {
 			return "", err
 		}
-		referencedRelation, err := quoteRequiredIdentifier(constraint.ReferencedRelationName, "referenced relation")
+		referencedRelation, err := renderer.identifier(constraint.ReferencedRelationName, "referenced relation")
 		if err != nil {
 			return "", err
 		}
@@ -621,10 +751,10 @@ func normalizedRule(rule sql.NullString) string {
 	return strings.ToUpper(strings.TrimSpace(rule.String))
 }
 
-func quoteIdentifiers(names []string, label string) ([]string, error) {
+func quoteIdentifiers(names []string, label string, renderer ddlRenderer) ([]string, error) {
 	result := make([]string, 0, len(names))
 	for _, name := range names {
-		quoted, err := quoteRequiredIdentifier(name, label)
+		quoted, err := renderer.identifier(name, label)
 		if err != nil {
 			return nil, err
 		}
@@ -638,18 +768,30 @@ func quoteIdentifiers(names []string, label string) ([]string, error) {
 // the result misleading. Standalone indexes and triggers are separate typed
 // objects and are generated by their own GenerateDDL methods.
 func (r Relation) GenerateDDL() (string, error) {
-	name, err := quoteRequiredIdentifier(r.Name, "relation name")
+	return r.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates a relation using the requested dialect.
+func (r Relation) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
+	name, err := renderer.identifier(r.Name, "relation name")
 	if err != nil {
 		return "", err
 	}
 	switch r.Kind {
 	case RelationView:
+		if renderer.dialect == Dialect1 {
+			return "", unsupportedDDL("view", r.Name, "view query source is opaque and cannot be proven executable in SQL dialect 1")
+		}
 		if !r.ViewSource.Valid || strings.TrimSpace(r.ViewSource.String) == "" {
 			return "", unsupportedDDL("view", r.Name, "view source is unavailable")
 		}
 		columns := make([]string, 0, len(r.Columns))
 		for _, column := range r.Columns {
-			quoted, err := quoteRequiredIdentifier(column.Name, "view column name")
+			quoted, err := renderer.identifier(column.Name, "view column name")
 			if err != nil {
 				return "", err
 			}
@@ -735,7 +877,7 @@ func (r Relation) GenerateDDL() (string, error) {
 		if hasNotNullConstraint {
 			notNullConstraintPtr = &notNullConstraint
 		}
-		definition, err := columnDefinition(column, notNullConstraintPtr)
+		definition, err := columnDefinition(column, notNullConstraintPtr, renderer)
 		if err != nil {
 			return "", err
 		}
@@ -745,7 +887,7 @@ func (r Relation) GenerateDDL() (string, error) {
 		if strings.TrimSpace(constraint.ConstraintType) == string(ConstraintNotNull) {
 			continue
 		}
-		definition, err := constraintDefinition(constraint)
+		definition, err := constraintDefinitionWithRenderer(constraint, renderer)
 		if err != nil {
 			return "", err
 		}
@@ -766,8 +908,8 @@ func quoteStringLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
-func parameterDefinition(parameter ProcedureParameter) (string, error) {
-	name, err := quoteRequiredIdentifier(parameter.Name, "parameter name")
+func parameterDefinition(parameter ProcedureParameter, renderer ddlRenderer) (string, error) {
+	name, err := renderer.identifier(parameter.Name, "parameter name")
 	if err != nil {
 		return "", err
 	}
@@ -788,9 +930,16 @@ func parameterDefinition(parameter ProcedureParameter) (string, error) {
 	}
 	var typeName string
 	if userDomainReference(parameter.Domain) && parameter.FieldSource.Valid && strings.TrimRight(parameter.FieldSource.String, " ") != "" {
-		typeName, err = quoteRequiredIdentifier(parameter.Domain.Name, "parameter domain")
+		typeName, err = renderer.identifier(parameter.Domain.Name, "parameter domain")
 	} else {
-		typeName, err = parameter.Domain.SQLType()
+		parts, partsErr := parameter.Domain.sqlTypePartsWithRenderer(renderer)
+		err = partsErr
+		if err == nil {
+			typeName = parts.render(true)
+			if parts.legacyScaledDouble {
+				typeName += " /* legacy scaled DOUBLE; canonical Dialect 1 NUMERIC(15, scale) */"
+			}
+		}
 	}
 	if err != nil {
 		return "", err
@@ -826,12 +975,24 @@ func validateProcedureParameters(procedure Procedure, parameters []ProcedurePara
 // GenerateDDL returns an executable CREATE PROCEDURE statement with the
 // catalog's exact PSQL source appended unchanged.
 func (p Procedure) GenerateDDL() (string, error) {
-	name, err := quoteRequiredIdentifier(p.Name, "procedure name")
+	return p.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates a procedure declaration for one dialect.
+func (p Procedure) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
+	name, err := renderer.identifier(p.Name, "procedure name")
 	if err != nil {
 		return "", err
 	}
 	if !p.Source.Valid || strings.TrimSpace(p.Source.String) == "" {
 		return "", unsupportedDDL("procedure", p.Name, "procedure source is unavailable")
+	}
+	if renderer.dialect == Dialect1 {
+		return "", unsupportedDDL("procedure", p.Name, "PSQL source is opaque and cannot be proven executable in SQL dialect 1")
 	}
 	if err := validateProcedureParameters(p, p.InputParameters, p.InputCount, ParameterInput); err != nil {
 		return "", err
@@ -845,7 +1006,7 @@ func (p Procedure) GenerateDDL() (string, error) {
 	if len(p.InputParameters) != 0 {
 		parameters := make([]string, 0, len(p.InputParameters))
 		for _, parameter := range p.InputParameters {
-			definition, err := parameterDefinition(parameter)
+			definition, err := parameterDefinition(parameter, renderer)
 			if err != nil {
 				return "", err
 			}
@@ -858,7 +1019,7 @@ func (p Procedure) GenerateDDL() (string, error) {
 	if len(p.OutputParameters) != 0 {
 		parameters := make([]string, 0, len(p.OutputParameters))
 		for _, parameter := range p.OutputParameters {
-			definition, err := parameterDefinition(parameter)
+			definition, err := parameterDefinition(parameter, renderer)
 			if err != nil {
 				return "", err
 			}
@@ -941,7 +1102,16 @@ func (t Trigger) Event() (string, error) {
 // GenerateDDL returns an executable CREATE TRIGGER statement with the exact
 // catalog source preserved.
 func (t Trigger) GenerateDDL() (string, error) {
-	name, err := quoteRequiredIdentifier(t.Name, "trigger name")
+	return t.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates a trigger declaration for one dialect.
+func (t Trigger) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
+	name, err := renderer.identifier(t.Name, "trigger name")
 	if err != nil {
 		return "", err
 	}
@@ -958,6 +1128,9 @@ func (t Trigger) GenerateDDL() (string, error) {
 	if !t.Source.Valid || strings.TrimSpace(t.Source.String) == "" {
 		return "", unsupportedDDL("trigger", t.Name, "trigger source is unavailable")
 	}
+	if renderer.dialect == Dialect1 {
+		return "", unsupportedDDL("trigger", t.Name, "trigger source is opaque and cannot be proven executable in SQL dialect 1")
+	}
 	if !t.Sequence.Valid {
 		return "", unsupportedDDL("trigger", t.Name, "trigger position is NULL")
 	}
@@ -969,7 +1142,7 @@ func (t Trigger) GenerateDDL() (string, error) {
 	builder.WriteString("CREATE TRIGGER ")
 	builder.WriteString(name)
 	if t.RelationName.Valid && strings.TrimRight(t.RelationName.String, " ") != "" {
-		relation, err := quoteRequiredIdentifier(strings.TrimRight(t.RelationName.String, " "), "trigger relation name")
+		relation, err := renderer.identifier(strings.TrimRight(t.RelationName.String, " "), "trigger relation name")
 		if err != nil {
 			return "", err
 		}
@@ -989,7 +1162,12 @@ func (t Trigger) GenerateDDL() (string, error) {
 // is represented by a second ALTER statement because CREATE INDEX has no
 // portable inactive clause.
 func (i Index) GenerateDDL() (string, error) {
-	statements, err := i.statementList()
+	return i.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates index DDL for one dialect.
+func (i Index) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	statements, err := i.StatementsWithOptions(options)
 	if err != nil {
 		return "", err
 	}
@@ -999,15 +1177,20 @@ func (i Index) GenerateDDL() (string, error) {
 // Statements returns the independently executable statements that reproduce
 // the index metadata. An inactive index requires CREATE followed by ALTER.
 func (i Index) Statements() ([]string, error) {
-	return i.statementList()
+	return i.StatementsWithOptions(DDLOptions{})
 }
 
-func (i Index) statementList() ([]string, error) {
-	name, err := quoteRequiredIdentifier(i.Name, "index name")
+// StatementsWithOptions returns index statements for one dialect.
+func (i Index) StatementsWithOptions(options DDLOptions) ([]string, error) {
+	renderer, err := newDDLRenderer(options)
 	if err != nil {
 		return nil, err
 	}
-	relation, err := quoteRequiredIdentifier(i.RelationName, "index relation name")
+	name, err := renderer.identifier(i.Name, "index name")
+	if err != nil {
+		return nil, err
+	}
+	relation, err := renderer.identifier(i.RelationName, "index relation name")
 	if err != nil {
 		return nil, err
 	}
@@ -1046,6 +1229,9 @@ func (i Index) statementList() ([]string, error) {
 	builder.WriteString(" ON ")
 	builder.WriteString(relation)
 	if i.Expression.Valid && strings.TrimSpace(i.Expression.String) != "" {
+		if renderer.dialect == Dialect1 {
+			return nil, unsupportedDDL("index", i.Name, "computed index source is opaque and cannot be proven executable in SQL dialect 1")
+		}
 		expression, err := sourceClause(sqlNullString{String: i.Expression.String, Valid: true}, "COMPUTED BY")
 		if err != nil {
 			return nil, unsupportedDDL("index", i.Name, err.Error())
@@ -1061,7 +1247,7 @@ func (i Index) statementList() ([]string, error) {
 		}
 		segments := make([]string, 0, len(i.Segments))
 		for _, segment := range i.Segments {
-			quoted, err := quoteRequiredIdentifier(segment.FieldName, "index segment field name")
+			quoted, err := renderer.identifier(segment.FieldName, "index segment field name")
 			if err != nil {
 				return nil, err
 			}
@@ -1083,7 +1269,16 @@ func (i Index) statementList() ([]string, error) {
 // grammar accepts CREATE GENERATOR rather than the Firebird CREATE SEQUENCE
 // spelling.
 func (s Sequence) GenerateDDL() (string, error) {
-	name, err := quoteRequiredIdentifier(s.Name, "sequence name")
+	return s.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates a generator declaration for one dialect.
+func (s Sequence) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
+	name, err := renderer.identifier(s.Name, "sequence name")
 	if err != nil {
 		return "", err
 	}
@@ -1095,7 +1290,16 @@ func (s Sequence) GenerateDDL() (string, error) {
 
 // GenerateDDL returns an executable CREATE ROLE statement.
 func (r Role) GenerateDDL() (string, error) {
-	name, err := quoteRequiredIdentifier(r.Name, "role name")
+	return r.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates a role declaration for one dialect.
+func (r Role) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
+	name, err := renderer.identifier(r.Name, "role name")
 	if err != nil {
 		return "", err
 	}
@@ -1159,11 +1363,20 @@ func privilegeObjectType(objectType sql.NullInt64, objectName, feature string, g
 
 // GenerateDDL returns an executable GRANT statement for a privilege row.
 func (p Privilege) GenerateDDL() (string, error) {
-	grantee, err := quoteRequiredIdentifier(p.Grantee, "privilege grantee")
+	return p.GenerateDDLWithOptions(DDLOptions{})
+}
+
+// GenerateDDLWithOptions generates a GRANT statement for one dialect.
+func (p Privilege) GenerateDDLWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
 	if err != nil {
 		return "", err
 	}
-	subject, err := quoteRequiredIdentifier(p.SubjectName, "privilege subject")
+	grantee, err := renderer.identifier(p.Grantee, "privilege grantee")
+	if err != nil {
+		return "", err
+	}
+	subject, err := renderer.identifier(p.SubjectName, "privilege subject")
 	if err != nil {
 		return "", err
 	}
@@ -1197,7 +1410,7 @@ func (p Privilege) GenerateDDL() (string, error) {
 		builder.WriteString("GRANT ")
 		builder.WriteString(privilege)
 		if p.FieldName.Valid && strings.TrimRight(p.FieldName.String, " ") != "" {
-			fields, err := quoteRequiredIdentifier(strings.TrimRight(p.FieldName.String, " "), "privilege field name")
+			fields, err := renderer.identifier(strings.TrimRight(p.FieldName.String, " "), "privilege field name")
 			if err != nil {
 				return "", err
 			}
@@ -1226,7 +1439,7 @@ func (p Privilege) GenerateDDL() (string, error) {
 		}
 	}
 	if p.Grantor != "" && !strings.EqualFold(strings.TrimSpace(p.Grantor), "SYSDBA") {
-		grantor, err := quoteRequiredIdentifier(p.Grantor, "privilege grantor")
+		grantor, err := renderer.identifier(p.Grantor, "privilege grantor")
 		if err != nil {
 			return "", err
 		}
@@ -1244,6 +1457,16 @@ func (p Privilege) GenerateDDL() (string, error) {
 // set returns an error wrapping ErrUnsupportedDDL rather than a declaration
 // with the clause silently dropped.
 func (a FunctionArgument) SQLType() (string, error) {
+	return a.SQLTypeWithOptions(DDLOptions{})
+}
+
+// SQLTypeWithOptions renders an external function argument type for one
+// dialect.
+func (a FunctionArgument) SQLTypeWithOptions(options DDLOptions) (string, error) {
+	renderer, err := newDDLRenderer(options)
+	if err != nil {
+		return "", err
+	}
 	if a.FieldType.Valid && a.FieldType.Int64 == fieldTypeCString {
 		// CSTRING declares a byte length, and RDB$CHARACTER_LENGTH is not
 		// populated for function arguments; RDB$FIELD_LENGTH is used verbatim.
@@ -1268,7 +1491,7 @@ func (a FunctionArgument) SQLType() (string, error) {
 		CharacterLength: a.CharacterLength,
 		CharacterSetID:  a.CharacterSetID,
 	}
-	parts, err := domain.sqlTypeParts()
+	parts, err := domain.sqlTypePartsWithRenderer(renderer)
 	if err != nil {
 		var unsupported *UnsupportedDDLError
 		if errors.As(err, &unsupported) {
@@ -1284,12 +1507,17 @@ func (a FunctionArgument) SQLType() (string, error) {
 // when it is N > 0 the return value is argument N, which is simultaneously an
 // input. Catalog positions are unique per function, so the first match wins.
 func (f Function) ReturnType() (string, error) {
+	return f.ReturnTypeWithOptions(DDLOptions{})
+}
+
+// ReturnTypeWithOptions renders the return argument type for one dialect.
+func (f Function) ReturnTypeWithOptions(options DDLOptions) (string, error) {
 	if !f.ReturnArgument.Valid {
 		return "", unsupportedDDL("external function", f.Name, "return argument position is NULL")
 	}
 	for _, argument := range f.Arguments {
 		if argument.Position.Valid && argument.Position.Int64 == f.ReturnArgument.Int64 {
-			return argument.SQLType()
+			return argument.SQLTypeWithOptions(options)
 		}
 	}
 	return "", unsupportedDDL("external function", f.Name, fmt.Sprintf("no argument at return position %d", f.ReturnArgument.Int64))
