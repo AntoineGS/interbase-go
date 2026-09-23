@@ -174,6 +174,9 @@ ib_connection *ib_connection_create(const char *database, size_t database_length
 int ib_connection_set_default_tpbs(ib_connection *connection,
 	const char *read_tpb, size_t read_tpb_length, const char *write_tpb,
 	size_t write_tpb_length, char **error);
+/* Zero disables the catalog text charset override. */
+int ib_connection_set_catalog_text_charset(ib_connection *connection,
+	int charset, char **error);
 int ib_connection_close(ib_connection *connection, char **error);
 int ib_connection_drop(ib_connection *connection, int *consumed, char **error);
 int ib_connection_is_broken(const ib_connection *connection);

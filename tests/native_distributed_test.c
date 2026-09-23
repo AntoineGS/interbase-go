@@ -21,6 +21,11 @@ static int rollback_consumes_handle_on_error;
 static int fail_cursor_close;
 static int cursor_close_calls;
 static int fail_message_allocation;
+static unsigned int ordinary_start_calls;
+
+ISC_STATUS ISC_EXPORT test_start_transaction(ISC_STATUS *status,
+	isc_tr_handle *transaction, short count, isc_db_handle *database,
+	short tpb_length, const char *tpb);
 
 static void *test_malloc(size_t size)
 {
@@ -67,6 +72,20 @@ ISC_STATUS ISC_EXPORT test_start_multiple(ISC_STATUS *status,
 		fake_status_failure(status);
 		return 1;
 	}
+	fake_status_success(status);
+	return 0;
+}
+
+ISC_STATUS ISC_EXPORT test_start_transaction(ISC_STATUS *status,
+	isc_tr_handle *transaction, short count, isc_db_handle *database,
+	short tpb_length, const char *tpb)
+{
+	(void) count;
+	(void) database;
+	(void) tpb_length;
+	(void) tpb;
+	ordinary_start_calls++;
+	*transaction = (isc_tr_handle) (uintptr_t) 0x2000U;
 	fake_status_success(status);
 	return 0;
 }
@@ -179,6 +198,7 @@ ISC_STATUS ISC_EXPORT test_free_statement(ISC_STATUS *status,
 #define isc_dsql_free_statement test_free_statement
 #define isc_transaction_info test_transaction_info
 #define isc_start_multiple test_start_multiple
+#define isc_start_transaction test_start_transaction
 #define isc_prepare_transaction2 test_prepare_transaction2
 #define isc_commit_transaction test_commit_transaction
 #define isc_rollback_transaction test_rollback_transaction
@@ -187,6 +207,7 @@ ISC_STATUS ISC_EXPORT test_free_statement(ISC_STATUS *status,
 #undef isc_dsql_free_statement
 #undef isc_transaction_info
 #undef isc_start_multiple
+#undef isc_start_transaction
 #undef isc_prepare_transaction2
 #undef isc_commit_transaction
 #undef isc_rollback_transaction
@@ -284,6 +305,12 @@ static void test_distributed_native_group_lifecycle(void)
 	memset(&second, 0, sizeof(second));
 	first.database = &first_database;
 	second.database = &second_database;
+	check(ib_connection_set_catalog_text_charset(&first, IB_CHARSET_WIN1250, &error) == 0 &&
+		error == NULL && first.catalog_text_charset == IB_CHARSET_WIN1250,
+		"catalog text charset setter did not install WIN1250");
+	check(ib_connection_set_catalog_text_charset(&second, IB_CHARSET_ASCII, &error) == 0 &&
+		error == NULL && second.catalog_text_charset == IB_CHARSET_ASCII,
+		"catalog text charset setter did not install ASCII");
 	connections[0] = &first;
 	connections[1] = &second;
 	fake_start_calls = 0U;
@@ -301,7 +328,9 @@ static void test_distributed_native_group_lifecycle(void)
 	second_participant = ib_distributed_participant(distributed, 1U);
 	check(first_participant != NULL && second_participant != NULL &&
 		first_participant->view.transaction == fake_active_handle &&
-		second_participant->view.transaction == fake_active_handle,
+		second_participant->view.transaction == fake_active_handle &&
+		first_participant->view.catalog_text_charset == IB_CHARSET_WIN1250 &&
+		second_participant->view.catalog_text_charset == IB_CHARSET_ASCII,
 		"distributed participants did not share the fake transaction identity");
 	check(ib_distributed_prepare(distributed, "recovery", 8U, &error) == 0 &&
 		error == NULL && fake_prepare_calls == 1U,
@@ -324,6 +353,35 @@ static void test_distributed_native_group_lifecycle(void)
 		fake_rollback_calls == 1U && distributed->handle == NULL,
 		"native distributed rollback did not consume the fake transaction handle");
 	ib_distributed_free(distributed);
+}
+
+static void test_catalog_text_charset_setter_and_transaction_copy(void)
+{
+	ib_connection connection;
+	ib_transaction *transaction;
+	char database;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &database;
+	check(ib_connection_set_catalog_text_charset(NULL, 0, &error) != 0 && error != NULL,
+		"catalog text charset setter accepted a null connection");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_connection_set_catalog_text_charset(&connection, 59, &error) != 0 &&
+		error != NULL && connection.catalog_text_charset == 0,
+		"catalog text charset setter accepted unsupported UTF8 ID");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_connection_set_catalog_text_charset(&connection, IB_CHARSET_WIN1252, &error) == 0 &&
+		error == NULL,
+		"catalog text charset setter rejected WIN1252");
+	ordinary_start_calls = 0U;
+	transaction = ib_transaction_begin(&connection, "read", 4U, &error);
+	check(transaction != NULL && error == NULL && ordinary_start_calls == 1U &&
+		transaction->view.catalog_text_charset == IB_CHARSET_WIN1252,
+		"ordinary transaction view did not inherit catalog text charset");
+	ib_transaction_free(transaction);
 }
 
 static void reset_failure_flags(void)
@@ -637,6 +695,7 @@ int main(void)
 	test_distributed_error_breaks_all_participant_views();
 	test_transaction_info_preserves_every_participant_record();
 	test_distributed_native_group_lifecycle();
+	test_catalog_text_charset_setter_and_transaction_copy();
 	test_distributed_failures_preserve_live_handle();
 	test_distributed_failures_report_consumed_handle();
 	test_distributed_start_failure_retains_handle();

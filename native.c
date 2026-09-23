@@ -119,6 +119,7 @@ struct ib_connection {
 	ib_statement *statements;
 	isc_tr_handle transaction;
 	short charset;
+	short catalog_text_charset;
 	int dialect;
 	int transaction_read_only;
 	int broken;
@@ -6602,6 +6603,25 @@ int ib_connection_set_default_tpbs(ib_connection *connection,
 	connection->write_tpb = write_copy;
 	connection->write_tpb_length = write_tpb_length;
 	return 0;
+}
+
+int ib_connection_set_catalog_text_charset(ib_connection *connection,
+	int charset, char **error)
+{
+	if (connection == NULL || connection->database == NULL || connection->broken) {
+		return ib_fail(error, "connection is unavailable");
+	}
+	switch (charset) {
+	case 0:
+	case IB_CHARSET_ASCII:
+	case IB_CHARSET_ISO8859_1:
+	case IB_CHARSET_WIN1250:
+	case IB_CHARSET_WIN1252:
+		connection->catalog_text_charset = (short) charset;
+		return 0;
+	default:
+		return ib_fail(error, "unsupported catalog text charset ID");
+	}
 }
 
 static void ib_connection_free_state(ib_connection *connection)

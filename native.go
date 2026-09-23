@@ -898,6 +898,10 @@ func openNativeContext(ctx context.Context, cfg Config) (*nativeConnection, erro
 	if err != nil {
 		return nil, err
 	}
+	catalogTextCharset, err := catalogTextCharsetID(cfg.CatalogTextCharset)
+	if err != nil {
+		return nil, err
+	}
 	attachment, err := buildAttachment(cfg)
 	if err != nil {
 		return nil, err
@@ -960,6 +964,16 @@ func openNativeContext(ctx context.Context, cfg Config) (*nativeConnection, erro
 	if connection == nil {
 		return nil, takeNativeError(errorPointer)
 	}
+	var catalogTextCharsetError *C.char
+	if result := C.ib_connection_set_catalog_text_charset(connection,
+		C.int(catalogTextCharset), &catalogTextCharsetError); result != 0 {
+		firstErr := takeNativeError(catalogTextCharsetError)
+		var closeError *C.char
+		if closeResult := C.ib_connection_close(connection, &closeError); closeResult != 0 {
+			firstErr = errors.Join(firstErr, takeNativeError(closeError))
+		}
+		return nil, firstErr
+	}
 	var defaultsError *C.char
 	if result := C.ib_connection_set_default_tpbs(connection,
 		(*C.char)(unsafe.Pointer(&readOnlyTPB[0])), C.size_t(len(readOnlyTPB)),
@@ -988,6 +1002,10 @@ func createNativeContext(ctx context.Context, cfg Config, pageSize int) (*native
 		return nil, err
 	}
 	connectTimeout, err := normalizeConnectTimeout(cfg.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+	catalogTextCharset, err := catalogTextCharsetID(cfg.CatalogTextCharset)
 	if err != nil {
 		return nil, err
 	}
@@ -1055,6 +1073,11 @@ func createNativeContext(ctx context.Context, cfg Config, pageSize int) (*native
 		return nil, takeNativeError(errorPointer)
 	}
 	native := &nativeConnection{ptr: connection, dialect: dialect}
+	var catalogTextCharsetError *C.char
+	if result := C.ib_connection_set_catalog_text_charset(connection,
+		C.int(catalogTextCharset), &catalogTextCharsetError); result != 0 {
+		return native, takeNativeError(catalogTextCharsetError)
+	}
 	var defaultsError *C.char
 	if result := C.ib_connection_set_default_tpbs(connection,
 		(*C.char)(unsafe.Pointer(&readOnlyTPB[0])), C.size_t(len(readOnlyTPB)),

@@ -80,10 +80,9 @@ type TransactionOptions struct {
 //
 // Dialect selects the SQL dialect for the attachment. Zero selects Dialect 3;
 // Dialects 1 and 3 are supported. Set Dialect to 1 to opt into Dialect 1.
-// Charset is the InterBase attachment
-// character set; an empty value selects UTF8. Passwords are sent only while
-// opening an attachment (and are retained only for error redaction); they are
-// never included in driver errors.
+// Charset is the InterBase attachment character set; an empty value selects
+// UTF8. Passwords are sent only while opening an attachment (and are retained
+// only for error redaction); they are never included in driver errors.
 type Config struct {
 	Database                 string
 	Host                     string
@@ -93,7 +92,11 @@ type Config struct {
 	EncryptedPassword        string
 	SystemEncryptionPassword string
 	Charset                  string
-	Dialect                  int
+	// CatalogTextCharset overrides decoding of materialized database/sql text
+	// BLOBs in documented catalog fields. Empty honors declared charsets. This
+	// does not change attachment encoding or direct-API BLOB streams.
+	CatalogTextCharset string
+	Dialect            int
 	// ConnectTimeout bounds the native attachment handshake. Zero leaves the
 	// InterBase client default unchanged; positive values are rounded up to
 	// whole seconds because the native DPB stores an unsigned 32-bit count.
@@ -123,6 +126,10 @@ func NewConnector(cfg Config) (driver.Connector, error) {
 	if err != nil {
 		return nil, err
 	}
+	catalogTextCharset, err := normalizeCatalogTextCharset(cfg.CatalogTextCharset)
+	if err != nil {
+		return nil, err
+	}
 	connectTimeout, err := normalizeConnectTimeout(cfg.ConnectTimeout)
 	if err != nil {
 		return nil, err
@@ -133,6 +140,7 @@ func NewConnector(cfg Config) (driver.Connector, error) {
 	}
 	cfg.Dialect = dialect
 	cfg.Charset = charset
+	cfg.CatalogTextCharset = catalogTextCharset
 	cfg.ConnectTimeout = connectTimeout
 	cfg.TransactionOptions = transactionOptions
 	return &connector{cfg: cfg}, nil
@@ -168,6 +176,9 @@ func validateConfig(cfg Config) error {
 		return errors.New("interbase: credential is too long")
 	}
 	if _, err := normalizeCharset(cfg.Charset); err != nil {
+		return err
+	}
+	if _, err := normalizeCatalogTextCharset(cfg.CatalogTextCharset); err != nil {
 		return err
 	}
 	if _, err := normalizeConnectTimeout(cfg.ConnectTimeout); err != nil {
