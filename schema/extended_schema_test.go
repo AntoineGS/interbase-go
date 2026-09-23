@@ -3,11 +3,419 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+func TestExtendedCatalogFullNames(t *testing.T) {
+	ctx := context.Background()
+	catalog, fixture := openExtendedFullNameFixture(t)
+
+	constraints, err := catalog.Constraints(ctx, "")
+	if err != nil {
+		t.Fatalf("Constraints returned error: %v", err)
+	}
+	if len(constraints) != 3 {
+		t.Fatalf("Constraints returned %d rows, want the two colliding names and a nullable reference", len(constraints))
+	}
+	if constraints[0].Name != extendedConstraintAlpha || constraints[1].Name != extendedConstraintBravo {
+		t.Fatalf("constraint names = %#v, want distinct full names sharing the 22-character prefix", []string{constraints[0].Name, constraints[1].Name})
+	}
+	if constraints[0].RelationName != extendedRelationName || !constraints[0].IndexName.Valid || constraints[0].IndexName.String != extendedIndexAlpha ||
+		constraints[0].Index == nil || constraints[0].Index.Name != extendedIndexAlpha || constraints[0].Index.RelationName != extendedRelationName ||
+		!constraints[0].Index.ConstraintName.Valid || constraints[0].Index.ConstraintName.String != extendedConstraintAlpha ||
+		!constraints[0].Index.ForeignKey.Valid || constraints[0].Index.ForeignKey.String != extendedConstraintAlpha ||
+		!reflect.DeepEqual(constraints[0].Columns, []string{"ALPHA_SEGMENT_FIELD"}) || len(constraints[0].Index.Segments) != 1 ||
+		constraints[0].Index.Segments[0].IndexName != extendedIndexAlpha {
+		t.Fatalf("alpha constraint index = %#v, want its own full index and segment", constraints[0])
+	}
+	if constraints[1].RelationName != extendedRelationName || !constraints[1].IndexName.Valid || constraints[1].IndexName.String != extendedIndexBravo ||
+		constraints[1].Index == nil || constraints[1].Index.Name != extendedIndexBravo || constraints[1].Index.RelationName != extendedRelationName ||
+		!constraints[1].Index.ConstraintName.Valid || constraints[1].Index.ConstraintName.String != extendedConstraintBravo ||
+		!constraints[1].Index.ForeignKey.Valid || constraints[1].Index.ForeignKey.String != extendedConstraintBravo ||
+		!reflect.DeepEqual(constraints[1].Columns, []string{"BRAVO_SEGMENT_FIELD"}) || len(constraints[1].Index.Segments) != 1 ||
+		constraints[1].Index.Segments[0].IndexName != extendedIndexBravo {
+		t.Fatalf("bravo constraint index = %#v, want its own full index and segment", constraints[1])
+	}
+	if constraints[2].ReferencedConstraintName.String != "MISSING_PARENT_CONSTRAINT" || constraints[2].ReferencedRelationName != "" ||
+		constraints[2].ReferencedIndexName.Valid || constraints[2].PartnerConstraint != nil {
+		t.Fatalf("nullable parent reference = %#v, want the absent LEFT JOIN row to remain absent", constraints[2])
+	}
+
+	if got, err := catalog.Constraint(ctx, extendedConstraintAlpha); err != nil || got == nil || got.Name != extendedConstraintAlpha {
+		t.Fatalf("exact long constraint lookup = (%#v, %v), want the exact full constraint", got, err)
+	}
+
+	domains, err := catalog.Domains(ctx, "")
+	if err != nil {
+		t.Fatalf("Domains returned error: %v", err)
+	}
+	if len(domains) != 1 || domains[0].Name != "LONG_DOMAIN_PREFIX_NAME" || domains[0].CharacterSetName.String != extendedCharacterSetName || domains[0].CollationName.String != extendedCollationName {
+		t.Fatalf("domain character set/collation = %#v, want complete long names", domains)
+	}
+
+	sequences, err := catalog.Sequences(ctx, "")
+	if err != nil || len(sequences) != 1 || sequences[0].Name != extendedSequenceName {
+		t.Fatalf("sequence names = (%#v, %v), want the complete sequence identifier", sequences, err)
+	}
+	indexes, err := catalog.Indexes(ctx, "")
+	if err != nil || len(indexes) != 2 || indexes[0].Name != extendedIndexAlpha || indexes[1].Name != extendedIndexBravo {
+		t.Fatalf("index names = (%#v, %v), want distinct complete names", indexes, err)
+	}
+	triggers, err := catalog.Triggers(ctx, "")
+	if err != nil || len(triggers) != 1 || triggers[0].Name != extendedTriggerName || !triggers[0].RelationName.Valid || triggers[0].RelationName.String != extendedRelationName {
+		t.Fatalf("trigger identifiers = (%#v, %v), want complete trigger and relation names", triggers, err)
+	}
+	roles, err := catalog.Roles(ctx, "")
+	if err != nil || len(roles) != 1 || roles[0].Name != extendedRoleName {
+		t.Fatalf("role names = (%#v, %v), want the complete role identifier", roles, err)
+	}
+	dependencies, err := catalog.Dependencies(ctx, "")
+	if err != nil || len(dependencies) != 1 || dependencies[0].DependentName != extendedDependentName || !dependencies[0].FieldName.Valid || dependencies[0].FieldName.String != extendedFieldName || dependencies[0].DependedOnName != extendedDependedOnName {
+		t.Fatalf("dependency identifiers = (%#v, %v), want complete object and field names", dependencies, err)
+	}
+	functions, err := catalog.Functions(ctx, "")
+	if err != nil || len(functions) != 1 || functions[0].Name != extendedFunctionName || len(functions[0].Arguments) != 1 || functions[0].Arguments[0].FunctionName != extendedFunctionName {
+		t.Fatalf("function identifiers = (%#v, %v), want the full function name on the argument row", functions, err)
+	}
+	privileges, err := catalog.Privileges(ctx, "SYSDBA")
+	if err != nil || len(privileges) != 1 || privileges[0].SubjectName != extendedRelationName || !privileges[0].FieldName.Valid || privileges[0].FieldName.String != extendedFieldName {
+		t.Fatalf("privilege object identifiers = (%#v, %v), want complete subject and field names", privileges, err)
+	}
+
+	for _, expected := range []string{
+		"CAST(F.RDB$FIELD_NAME AS VARCHAR(67)) AS RDB$FIELD_NAME",
+		"CAST(CS.RDB$CHARACTER_SET_NAME AS VARCHAR(67)) AS RDB$CHARACTER_SET_NAME",
+		"CAST(CO.RDB$COLLATION_NAME AS VARCHAR(67)) AS RDB$COLLATION_NAME",
+		"CAST(G.RDB$GENERATOR_NAME AS VARCHAR(67)) AS RDB$GENERATOR_NAME",
+		"CAST(I.RDB$INDEX_NAME AS VARCHAR(67)) AS RDB$INDEX_NAME",
+		"CAST(I.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(I.RDB$FOREIGN_KEY AS VARCHAR(67)) AS RDB$FOREIGN_KEY",
+		"CAST(RC.RDB$CONSTRAINT_NAME AS VARCHAR(31)) AS RDB$CONSTRAINT_NAME",
+		"CAST(S.RDB$INDEX_NAME AS VARCHAR(67)) AS RDB$INDEX_NAME",
+		"CAST(S.RDB$FIELD_NAME AS VARCHAR(67)) AS RDB$FIELD_NAME",
+		"CAST(C.RDB$CONSTRAINT_NAME AS VARCHAR(31)) AS RDB$CONSTRAINT_NAME",
+		"CAST(C.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(C.RDB$INDEX_NAME AS VARCHAR(67)) AS RDB$INDEX_NAME",
+		"CAST(K.RDB$TRIGGER_NAME AS VARCHAR(67)) AS RDB$TRIGGER_NAME",
+		"CAST(R.RDB$CONST_NAME_UQ AS VARCHAR(67)) AS RDB$CONST_NAME_UQ",
+		"CAST(PC.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(PC.RDB$INDEX_NAME AS VARCHAR(67)) AS RDB$INDEX_NAME",
+		"CAST(T.RDB$TRIGGER_NAME AS VARCHAR(67)) AS RDB$TRIGGER_NAME",
+		"CAST(T.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(RDB$ROLE_NAME AS VARCHAR(67)) AS RDB$ROLE_NAME",
+		"CAST(D.RDB$DEPENDENT_NAME AS VARCHAR(67)) AS RDB$DEPENDENT_NAME",
+		"CAST(D.RDB$FIELD_NAME AS VARCHAR(67)) AS RDB$FIELD_NAME",
+		"CAST(D.RDB$DEPENDED_ON_NAME AS VARCHAR(67)) AS RDB$DEPENDED_ON_NAME",
+		"CAST(F.RDB$FUNCTION_NAME AS VARCHAR(67)) AS RDB$FUNCTION_NAME",
+		"CAST(A.RDB$FUNCTION_NAME AS VARCHAR(67)) AS RDB$FUNCTION_NAME",
+		"CAST(P.RDB$RELATION_NAME AS VARCHAR(67)) AS RDB$RELATION_NAME",
+		"CAST(P.RDB$FIELD_NAME AS VARCHAR(67)) AS RDB$FIELD_NAME",
+	} {
+		if !fixture.hasQueryContaining(expected) {
+			t.Errorf("catalog queries do not contain identifier projection %q", expected)
+		}
+	}
+	for _, nonIdentifier := range []string{
+		"CAST(RDB$OWNER_NAME AS VARCHAR(",
+		"CAST(P.RDB$USER AS VARCHAR(",
+		"CAST(P.RDB$GRANTOR AS VARCHAR(",
+	} {
+		if fixture.hasQueryContaining(nonIdentifier) {
+			t.Errorf("catalog query unexpectedly changed non-identifier projection %q", nonIdentifier)
+		}
+	}
+	constraintQuery := fixture.queryContaining("FROM RDB$RELATION_CONSTRAINTS C")
+	upperConstraintQuery := strings.ToUpper(constraintQuery)
+	if !strings.Contains(upperConstraintQuery, "LEFT JOIN RDB$RELATION_CONSTRAINTS PC") ||
+		!strings.Contains(upperConstraintQuery, "ON PC.RDB$CONSTRAINT_NAME = R.RDB$CONST_NAME_UQ") ||
+		!strings.Contains(upperConstraintQuery, "ORDER BY C.RDB$CONSTRAINT_NAME") ||
+		strings.Contains(upperConstraintQuery, "COALESCE(PC.RDB$RELATION_NAME") {
+		t.Fatalf("constraint query changed join/order semantics or collapsed a nullable projection: %q", constraintQuery)
+	}
+}
+
+const (
+	extendedConstraintAlpha  = "LONG_CONSTRAINT_PREFIX_ALPHA"
+	extendedConstraintBravo  = "LONG_CONSTRAINT_PREFIX_BRAVO"
+	extendedIndexAlpha       = "LONG_INDEX_PREFIX_ALPHA"
+	extendedIndexBravo       = "LONG_INDEX_PREFIX_BRAVO"
+	extendedRelationName     = "LONG_RELATION_PREFIX_TABLE"
+	extendedFieldName        = "LONG_FIELD_PREFIX_VALUE"
+	extendedCharacterSetName = "LONG_CHARACTER_SET_NAME"
+	extendedCollationName    = "LONG_COLLATION_NAME"
+	extendedSequenceName     = "LONG_SEQUENCE_PREFIX_GEN"
+	extendedTriggerName      = "LONG_TRIGGER_PREFIX_UPDATE"
+	extendedRoleName         = "LONG_ROLE_PREFIX_ACCOUNT"
+	extendedDependentName    = "LONG_DEPENDENT_PREFIX_VIEW"
+	extendedDependedOnName   = "LONG_DEPENDED_PREFIX_TABLE"
+	extendedFunctionName     = "LONG_FUNCTION_PREFIX_CALC"
+)
+
+type extendedFullNameFixture struct {
+	queries []string
+}
+
+func openExtendedFullNameFixture(t *testing.T) (*Catalog, *extendedFullNameFixture) {
+	t.Helper()
+	fixture := &extendedFullNameFixture{}
+	db := sql.OpenDB(extendedFullNameConnector{fixture: fixture})
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { _ = db.Close() })
+	return New(db), fixture
+}
+
+func (f *extendedFullNameFixture) hasQueryContaining(needle string) bool {
+	needle = strings.ToUpper(needle)
+	for _, query := range f.queries {
+		if strings.Contains(strings.ToUpper(query), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *extendedFullNameFixture) queryContaining(needle string) string {
+	needle = strings.ToUpper(needle)
+	for _, query := range f.queries {
+		if strings.Contains(strings.ToUpper(query), needle) {
+			return query
+		}
+	}
+	return ""
+}
+
+type extendedFullNameConnector struct {
+	fixture *extendedFullNameFixture
+}
+
+func (c extendedFullNameConnector) Connect(context.Context) (driver.Conn, error) {
+	return extendedFullNameConn{fixture: c.fixture}, nil
+}
+
+func (c extendedFullNameConnector) Driver() driver.Driver { return extendedFullNameDriver{} }
+
+type extendedFullNameDriver struct{}
+
+func (extendedFullNameDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("extended catalog fixture requires Connector")
+}
+
+type extendedFullNameConn struct {
+	fixture *extendedFullNameFixture
+}
+
+func (extendedFullNameConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
+func (extendedFullNameConn) Close() error                        { return nil }
+func (extendedFullNameConn) Begin() (driver.Tx, error)           { return nil, driver.ErrSkip }
+
+func (c extendedFullNameConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.fixture.queries = append(c.fixture.queries, query)
+	upper := strings.ToUpper(query)
+	switch {
+	case strings.Contains(upper, "SELECT F.RDB$FIELD_LENGTH") && strings.Contains(upper, "FROM RDB$RELATION_FIELDS RF"):
+		return extendedFixtureRows([]string{"FIELD_LENGTH"}, [][]driver.Value{{int64(67)}}), nil
+	case strings.HasPrefix(strings.TrimSpace(upper), "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR("):
+		return extendedFixtureRows([]string{"RELATION_NAME", "FIELD_NAME", "FIELD_LENGTH"}, extendedIdentifierWidthRows()), nil
+	case strings.Contains(upper, "FROM RDB$FIELDS F"):
+		row := []driver.Value{
+			projectExtendedIdentifier(query, "F.RDB$FIELD_NAME", "LONG_DOMAIN_PREFIX_NAME"),
+			nil, nil, nil, int64(20), int64(0), int64(37), int64(0), nil, int64(0),
+			int64(0), int64(0), int64(0), int64(0), nil, int64(0), int64(20), nil, int64(4), nil,
+			projectExtendedIdentifier(query, "CS.RDB$CHARACTER_SET_NAME", extendedCharacterSetName),
+			projectExtendedIdentifier(query, "CO.RDB$COLLATION_NAME", extendedCollationName),
+		}
+		return extendedFixtureRows(domainResultColumns, [][]driver.Value{row}), nil
+	case strings.Contains(upper, "FROM RDB$GENERATORS G"):
+		row := []driver.Value{projectExtendedIdentifier(query, "G.RDB$GENERATOR_NAME", extendedSequenceName), int64(1), int64(0)}
+		return extendedFixtureRows(sequenceResultColumns, [][]driver.Value{row}), nil
+	case strings.Contains(upper, "FROM RDB$INDICES I"):
+		filter := extendedFixtureFilter(args)
+		values := make([][]driver.Value, 0, 2)
+		for _, data := range []struct {
+			name       string
+			constraint string
+			foreignKey string
+			field      string
+		}{
+			{extendedIndexAlpha, extendedConstraintAlpha, extendedConstraintAlpha, "ALPHA_SEGMENT_FIELD"},
+			{extendedIndexBravo, extendedConstraintBravo, extendedConstraintBravo, "BRAVO_SEGMENT_FIELD"},
+		} {
+			if filter != "" && filter != data.name {
+				continue
+			}
+			values = append(values, []driver.Value{
+				projectExtendedIdentifier(query, "I.RDB$INDEX_NAME", data.name),
+				projectExtendedIdentifier(query, "I.RDB$RELATION_NAME", extendedRelationName),
+				int64(1), int64(1), nil, int64(1), int64(0), int64(0),
+				projectExtendedIdentifier(query, "I.RDB$FOREIGN_KEY", data.foreignKey), int64(0), nil, float64(0.5),
+				projectExtendedIdentifier(query, "RC.RDB$CONSTRAINT_NAME", data.constraint),
+			})
+		}
+		return extendedFixtureRows(indexResultColumns, values), nil
+	case strings.Contains(upper, "FROM RDB$INDEX_SEGMENTS S"):
+		filter := extendedFixtureFilter(args)
+		rows := make([][]driver.Value, 0, 1)
+		for _, segment := range []struct{ index, field string }{
+			{extendedIndexAlpha, "ALPHA_SEGMENT_FIELD"},
+			{extendedIndexBravo, "BRAVO_SEGMENT_FIELD"},
+		} {
+			if filter == segment.index {
+				rows = append(rows, []driver.Value{
+					projectExtendedIdentifier(query, "S.RDB$INDEX_NAME", segment.index),
+					projectExtendedIdentifier(query, "S.RDB$FIELD_NAME", segment.field),
+					int64(0), float64(0.5),
+				})
+			}
+		}
+		return extendedFixtureRows(indexSegmentResultColumns, rows), nil
+	case strings.Contains(upper, "FROM RDB$RELATION_CONSTRAINTS C"):
+		filter := extendedFixtureFilter(args)
+		values := [][]driver.Value{
+			extendedConstraintRow(query, extendedConstraintAlpha, extendedIndexAlpha, "", nil),
+			extendedConstraintRow(query, extendedConstraintBravo, extendedIndexBravo, "MISSING_PARENT_CONSTRAINT", nil),
+			extendedConstraintRow(query, "MISSING_PARENT_CONSTRAINT", "", "MISSING_PARENT_CONSTRAINT", nil),
+		}
+		if filter != "" {
+			filtered := values[:0]
+			for _, row := range values {
+				if row[0] == filter {
+					filtered = append(filtered, row)
+				}
+			}
+			values = filtered
+		}
+		return extendedFixtureRows(constraintResultColumns, values), nil
+	case strings.Contains(upper, "FROM RDB$TRIGGERS T"):
+		row := []driver.Value{
+			projectExtendedIdentifier(query, "T.RDB$TRIGGER_NAME", extendedTriggerName),
+			projectExtendedIdentifier(query, "T.RDB$RELATION_NAME", extendedRelationName),
+			int64(1), int64(1), "AS BEGIN END", nil, int64(0), int64(0), int64(0),
+		}
+		return extendedFixtureRows(triggerResultColumns, [][]driver.Value{row}), nil
+	case strings.Contains(upper, "FROM RDB$ROLES"):
+		row := []driver.Value{projectExtendedIdentifier(query, "RDB$ROLE_NAME", extendedRoleName), "SYSDBA"}
+		return extendedFixtureRows(roleResultColumns, [][]driver.Value{row}), nil
+	case strings.Contains(upper, "FROM RDB$DEPENDENCIES D"):
+		row := []driver.Value{
+			projectExtendedIdentifier(query, "D.RDB$DEPENDENT_NAME", extendedDependentName), int64(1),
+			projectExtendedIdentifier(query, "D.RDB$FIELD_NAME", extendedFieldName),
+			projectExtendedIdentifier(query, "D.RDB$DEPENDED_ON_NAME", extendedDependedOnName), int64(0),
+		}
+		return extendedFixtureRows(dependencyResultColumns, [][]driver.Value{row}), nil
+	case strings.Contains(upper, "FROM RDB$FUNCTION_ARGUMENTS A"):
+		row := []driver.Value{
+			projectExtendedIdentifier(query, "A.RDB$FUNCTION_NAME", extendedFunctionName),
+			int64(0), int64(0), int64(4), int64(0), int64(8), int64(0), nil, int64(10), nil,
+		}
+		return extendedFixtureRows(functionArgumentResultColumns, [][]driver.Value{row}), nil
+	case strings.Contains(upper, "FROM RDB$FUNCTIONS F"):
+		row := []driver.Value{
+			projectExtendedIdentifier(query, "F.RDB$FUNCTION_NAME", extendedFunctionName), int64(0), nil,
+			"module", "entry", int64(0), int64(0),
+		}
+		return extendedFixtureRows(functionResultColumns, [][]driver.Value{row}), nil
+	case strings.Contains(upper, "FROM RDB$USER_PRIVILEGES P"):
+		row := []driver.Value{
+			"SYSDBA", "SYSDBA", "S", int64(0),
+			projectExtendedIdentifier(query, "P.RDB$RELATION_NAME", extendedRelationName),
+			projectExtendedIdentifier(query, "P.RDB$FIELD_NAME", extendedFieldName), int64(8), int64(0),
+		}
+		return extendedFixtureRows(privilegeResultColumns, [][]driver.Value{row}), nil
+	default:
+		return nil, errors.New("extended catalog fixture: unexpected query: " + query)
+	}
+}
+
+func extendedIdentifierWidthRows() [][]driver.Value {
+	fields := []identifierField{
+		{"RDB$FIELDS", "RDB$FIELD_NAME"},
+		{"RDB$CHARACTER_SETS", "RDB$CHARACTER_SET_NAME"},
+		{"RDB$COLLATIONS", "RDB$COLLATION_NAME"},
+		{"RDB$GENERATORS", "RDB$GENERATOR_NAME"},
+		{"RDB$INDICES", "RDB$INDEX_NAME"}, {"RDB$INDICES", "RDB$RELATION_NAME"}, {"RDB$INDICES", "RDB$FOREIGN_KEY"},
+		{"RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME"}, {"RDB$INDEX_SEGMENTS", "RDB$FIELD_NAME"},
+		{"RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME"}, {"RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME"}, {"RDB$RELATION_CONSTRAINTS", "RDB$INDEX_NAME"},
+		{"RDB$REF_CONSTRAINTS", "RDB$CONST_NAME_UQ"}, {"RDB$CHECK_CONSTRAINTS", "RDB$TRIGGER_NAME"},
+		{"RDB$TRIGGERS", "RDB$TRIGGER_NAME"}, {"RDB$TRIGGERS", "RDB$RELATION_NAME"},
+		{"RDB$ROLES", "RDB$ROLE_NAME"},
+		{"RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME"}, {"RDB$DEPENDENCIES", "RDB$FIELD_NAME"}, {"RDB$DEPENDENCIES", "RDB$DEPENDED_ON_NAME"},
+		{"RDB$FUNCTIONS", "RDB$FUNCTION_NAME"}, {"RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME"},
+		{"RDB$USER_PRIVILEGES", "RDB$RELATION_NAME"}, {"RDB$USER_PRIVILEGES", "RDB$FIELD_NAME"},
+	}
+	rows := make([][]driver.Value, 0, len(fields))
+	for _, field := range fields {
+		width := int64(67)
+		if field.relation == "RDB$RELATION_CONSTRAINTS" && field.field == "RDB$CONSTRAINT_NAME" {
+			width = 31
+		}
+		rows = append(rows, []driver.Value{field.relation, field.field, width})
+	}
+	return rows
+}
+
+func extendedFixtureRows(columns []string, values [][]driver.Value) driver.Rows {
+	return &extendedFullNameRows{columns: columns, values: values}
+}
+
+type extendedFullNameRows struct {
+	columns []string
+	values  [][]driver.Value
+	index   int
+}
+
+func (r *extendedFullNameRows) Columns() []string { return r.columns }
+func (r *extendedFullNameRows) Close() error      { return nil }
+func (r *extendedFullNameRows) Next(dest []driver.Value) error {
+	if r.index >= len(r.values) {
+		return io.EOF
+	}
+	copy(dest, r.values[r.index])
+	r.index++
+	return nil
+}
+
+func extendedFixtureFilter(args []driver.NamedValue) string {
+	if len(args) == 0 {
+		return ""
+	}
+	value, _ := args[0].Value.(string)
+	return value
+}
+
+func projectExtendedIdentifier(query, ref, value string) driver.Value {
+	if value == "" {
+		return nil
+	}
+	cast := "CAST(" + strings.ToUpper(ref) + " AS VARCHAR("
+	if strings.Contains(strings.ToUpper(query), cast) || len(value) <= 22 {
+		return value
+	}
+	return value[:22]
+}
+
+func extendedConstraintRow(query, name, indexName, referencedConstraint string, referencedRelation driver.Value) []driver.Value {
+	var indexValue driver.Value
+	if indexName != "" {
+		indexValue = projectExtendedIdentifier(query, "C.RDB$INDEX_NAME", indexName)
+	}
+	var referencedName, referencedIndex driver.Value
+	if referencedConstraint != "" {
+		referencedName = projectExtendedIdentifier(query, "R.RDB$CONST_NAME_UQ", referencedConstraint)
+	}
+	return []driver.Value{
+		projectExtendedIdentifier(query, "C.RDB$CONSTRAINT_NAME", name), "UNIQUE",
+		projectExtendedIdentifier(query, "C.RDB$RELATION_NAME", extendedRelationName), nil, nil, indexValue,
+		nil, referencedName, nil, nil, nil, nil, nil, referencedRelation, referencedIndex,
+	}
+}
 
 func TestCatalogReadsExtendedSchemaFamilies(t *testing.T) {
 	db := openFixtureDB(t)
@@ -219,14 +627,13 @@ func TestCatalogExtendedFiltersAreBoundAndUseOfficialCatalogs(t *testing.T) {
 		t.Fatalf("malicious index filter returned error: %v", err)
 	}
 	calls := state.callsSnapshot()
-	if len(calls) != 1 {
-		t.Fatalf("query count = %d, want one filtered index query", len(calls))
+	indexQuery := fixtureCallQuery(t, calls, "indexes")
+	if strings.Contains(indexQuery, maliciousName) {
+		t.Fatalf("index filter was interpolated into query: %q", indexQuery)
 	}
-	if strings.Contains(calls[0].query, maliciousName) {
-		t.Fatalf("index filter was interpolated into query: %q", calls[0].query)
-	}
-	if len(calls[0].args) != 1 || calls[0].args[0].Value != maliciousName {
-		t.Fatalf("index filter args = %#v, want one bound argument", calls[0].args)
+	indexCall := fixtureCallForKind(t, calls, "indexes")
+	if len(indexCall.args) != 1 || indexCall.args[0].Value != maliciousName {
+		t.Fatalf("index filter args = %#v, want one bound argument", indexCall.args)
 	}
 
 	db, state = openFixtureDBWithOptions(t, fixtureOptions{})

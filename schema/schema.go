@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Queryer is the part of database/sql needed by Catalog.
@@ -34,7 +35,9 @@ const (
 // Catalog reads the bounded set of InterBase catalog objects supported by this
 // package.
 type Catalog struct {
-	queryer Queryer
+	queryer              Queryer
+	identifierWidthMu    sync.Mutex
+	identifierWidthCache map[identifierField]int
 }
 
 // New returns a catalog backed by queryer. A nil queryer is accepted so the
@@ -171,22 +174,22 @@ type ProcedureParameter struct {
 	Nullable sql.NullBool
 }
 
-const relationProjection = `
-SELECT r.RDB$RELATION_NAME, r.RDB$RELATION_ID, r.RDB$VIEW_SOURCE,
-       r.RDB$DESCRIPTION, r.RDB$SECURITY_CLASS, r.RDB$OWNER_NAME,
-       r.RDB$DEFAULT_CLASS, r.RDB$DBKEY_LENGTH, r.RDB$FORMAT,
+const relationProjectionTemplate = `
+SELECT %s, r.RDB$RELATION_ID, r.RDB$VIEW_SOURCE,
+       r.RDB$DESCRIPTION, %s, %s,
+       %s, r.RDB$DBKEY_LENGTH, r.RDB$FORMAT,
        r.RDB$EXTERNAL_FILE, r.RDB$FLAGS, r.RDB$RELATION_TYPE,
        r.RDB$SYSTEM_FLAG,
        CASE WHEN r.RDB$VIEW_BLR IS NULL THEN 0 ELSE 1 END AS RELATION_KIND
 FROM RDB$RELATIONS r`
 
-const relationColumnsQuery = `
-SELECT rf.RDB$FIELD_NAME, rf.RDB$RELATION_NAME, rf.RDB$FIELD_SOURCE,
+const relationColumnsQueryTemplate = `
+SELECT %s, %s, %s,
        rf.RDB$FIELD_POSITION, rf.RDB$UPDATE_FLAG, rf.RDB$FIELD_ID,
-       rf.RDB$DESCRIPTION, rf.RDB$SYSTEM_FLAG, rf.RDB$SECURITY_CLASS,
+       rf.RDB$DESCRIPTION, rf.RDB$SYSTEM_FLAG, %s,
        rf.RDB$NULL_FLAG, rf.RDB$DEFAULT_SOURCE, rf.RDB$COLLATION_ID,
-       rf.RDB$BASE_FIELD, v.RDB$RELATION_NAME AS BASE_RELATION,
-       f.RDB$FIELD_NAME AS DOMAIN_NAME, f.RDB$VALIDATION_SOURCE,
+       %s, %s,
+       %s, f.RDB$VALIDATION_SOURCE,
        f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE AS DOMAIN_DEFAULT_SOURCE,
        f.RDB$FIELD_LENGTH, f.RDB$FIELD_SCALE, f.RDB$FIELD_TYPE,
        f.RDB$FIELD_SUB_TYPE, f.RDB$DESCRIPTION AS DOMAIN_DESCRIPTION,
@@ -195,8 +198,8 @@ SELECT rf.RDB$FIELD_NAME, rf.RDB$RELATION_NAME, rf.RDB$FIELD_SOURCE,
        f.RDB$DIMENSIONS, f.RDB$NULL_FLAG AS DOMAIN_NULL_FLAG,
        f.RDB$CHARACTER_LENGTH, f.RDB$COLLATION_ID AS DOMAIN_COLLATION_ID,
        f.RDB$CHARACTER_SET_ID, f.RDB$FIELD_PRECISION,
-        cs.RDB$CHARACTER_SET_NAME, co.RDB$COLLATION_NAME,
-        rco.RDB$COLLATION_NAME AS COLUMN_COLLATION_NAME
+         %s, %s,
+         %s
  FROM RDB$RELATION_FIELDS rf
  LEFT JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE
  LEFT JOIN RDB$CHARACTER_SETS cs ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
@@ -209,35 +212,158 @@ SELECT rf.RDB$FIELD_NAME, rf.RDB$RELATION_NAME, rf.RDB$FIELD_SOURCE,
 WHERE rf.RDB$RELATION_NAME = ?
  ORDER BY rf.RDB$FIELD_POSITION`
 
-const domainQuery = `
-SELECT f.RDB$FIELD_NAME, f.RDB$VALIDATION_SOURCE,
+const domainQueryTemplate = `
+SELECT %s, f.RDB$VALIDATION_SOURCE,
        f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE, f.RDB$FIELD_LENGTH,
        f.RDB$FIELD_SCALE, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
        f.RDB$DESCRIPTION, f.RDB$SYSTEM_FLAG, f.RDB$SEGMENT_LENGTH,
        f.RDB$EXTERNAL_LENGTH, f.RDB$EXTERNAL_SCALE, f.RDB$EXTERNAL_TYPE,
        f.RDB$DIMENSIONS, f.RDB$NULL_FLAG, f.RDB$CHARACTER_LENGTH,
        f.RDB$COLLATION_ID, f.RDB$CHARACTER_SET_ID, f.RDB$FIELD_PRECISION,
-       cs.RDB$CHARACTER_SET_NAME, co.RDB$COLLATION_NAME
+        %s, %s
  FROM RDB$FIELDS f
  LEFT JOIN RDB$CHARACTER_SETS cs ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
  LEFT JOIN RDB$COLLATIONS co ON co.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
                             AND co.RDB$COLLATION_ID = f.RDB$COLLATION_ID
  WHERE f.RDB$FIELD_NAME = ?`
 
-const procedureProjection = `
-SELECT p.RDB$PROCEDURE_NAME, p.RDB$PROCEDURE_ID,
+const procedureProjectionTemplate = `
+SELECT %s, p.RDB$PROCEDURE_ID,
        p.RDB$PROCEDURE_INPUTS, p.RDB$PROCEDURE_OUTPUTS,
        p.RDB$DESCRIPTION, p.RDB$PROCEDURE_SOURCE,
-       p.RDB$SECURITY_CLASS, p.RDB$OWNER_NAME, p.RDB$SYSTEM_FLAG
+       %s, %s, p.RDB$SYSTEM_FLAG
 FROM RDB$PROCEDURES p`
 
-const procedureParametersQuery = `
-SELECT pp.RDB$PARAMETER_NAME, pp.RDB$PROCEDURE_NAME,
+const procedureParametersQueryTemplate = `
+SELECT %s, %s,
        pp.RDB$PARAMETER_NUMBER, pp.RDB$PARAMETER_TYPE,
-       pp.RDB$FIELD_SOURCE, pp.RDB$DESCRIPTION, pp.RDB$SYSTEM_FLAG
+       %s, pp.RDB$DESCRIPTION, pp.RDB$SYSTEM_FLAG
 FROM RDB$PROCEDURE_PARAMETERS pp
 WHERE pp.RDB$PROCEDURE_NAME = ?
 ORDER BY pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER`
+
+func identifierProjection(widths map[identifierField]int, relation, field, ref, alias string) (string, error) {
+	key := identifierField{relation: relation, field: field}
+	width, ok := widths[key]
+	if !ok {
+		return "", fmt.Errorf("schema: catalog identifier width for %s.%s is missing", relation, field)
+	}
+	projection, err := catalogIdentifier(ref, width)
+	if err != nil {
+		return "", err
+	}
+	return projection + " AS " + alias, nil
+}
+
+func (c *Catalog) relationProjection(ctx context.Context) (string, error) {
+	widths, err := c.identifierWidths(ctx)
+	if err != nil {
+		return "", err
+	}
+	projections := make([]string, 0, 4)
+	for _, spec := range []struct{ relation, field, ref, alias string }{
+		{"RDB$RELATIONS", "RDB$RELATION_NAME", "r.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+		{"RDB$RELATIONS", "RDB$SECURITY_CLASS", "r.RDB$SECURITY_CLASS", "RDB$SECURITY_CLASS"},
+		{"RDB$RELATIONS", "RDB$OWNER_NAME", "r.RDB$OWNER_NAME", "RDB$OWNER_NAME"},
+		{"RDB$RELATIONS", "RDB$DEFAULT_CLASS", "r.RDB$DEFAULT_CLASS", "RDB$DEFAULT_CLASS"},
+	} {
+		projection, err := identifierProjection(widths, spec.relation, spec.field, spec.ref, spec.alias)
+		if err != nil {
+			return "", err
+		}
+		projections = append(projections, projection)
+	}
+	return fmt.Sprintf(relationProjectionTemplate, projections[0], projections[1], projections[2], projections[3]), nil
+}
+
+func (c *Catalog) relationColumnsQuery(ctx context.Context) (string, error) {
+	widths, err := c.identifierWidths(ctx)
+	if err != nil {
+		return "", err
+	}
+	projections := make([]string, 0, 10)
+	for _, spec := range []struct{ relation, field, ref, alias string }{
+		{"RDB$RELATION_FIELDS", "RDB$FIELD_NAME", "rf.RDB$FIELD_NAME", "RDB$FIELD_NAME"},
+		{"RDB$RELATION_FIELDS", "RDB$RELATION_NAME", "rf.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+		{"RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE", "rf.RDB$FIELD_SOURCE", "RDB$FIELD_SOURCE"},
+		{"RDB$RELATION_FIELDS", "RDB$SECURITY_CLASS", "rf.RDB$SECURITY_CLASS", "RDB$SECURITY_CLASS"},
+		{"RDB$RELATION_FIELDS", "RDB$BASE_FIELD", "rf.RDB$BASE_FIELD", "RDB$BASE_FIELD"},
+		{"RDB$VIEW_RELATIONS", "RDB$RELATION_NAME", "v.RDB$RELATION_NAME", "BASE_RELATION"},
+		{"RDB$FIELDS", "RDB$FIELD_NAME", "f.RDB$FIELD_NAME", "DOMAIN_NAME"},
+		{"RDB$CHARACTER_SETS", "RDB$CHARACTER_SET_NAME", "cs.RDB$CHARACTER_SET_NAME", "RDB$CHARACTER_SET_NAME"},
+		{"RDB$COLLATIONS", "RDB$COLLATION_NAME", "co.RDB$COLLATION_NAME", "RDB$COLLATION_NAME"},
+		{"RDB$COLLATIONS", "RDB$COLLATION_NAME", "rco.RDB$COLLATION_NAME", "COLUMN_COLLATION_NAME"},
+	} {
+		projection, err := identifierProjection(widths, spec.relation, spec.field, spec.ref, spec.alias)
+		if err != nil {
+			return "", err
+		}
+		projections = append(projections, projection)
+	}
+	return fmt.Sprintf(relationColumnsQueryTemplate,
+		projections[0], projections[1], projections[2], projections[3], projections[4],
+		projections[5], projections[6], projections[7], projections[8], projections[9]), nil
+}
+
+func (c *Catalog) domainQuery(ctx context.Context, template string) (string, error) {
+	widths, err := c.identifierWidths(ctx)
+	if err != nil {
+		return "", err
+	}
+	fieldName, err := identifierProjection(widths, "RDB$FIELDS", "RDB$FIELD_NAME", "f.RDB$FIELD_NAME", "RDB$FIELD_NAME")
+	if err != nil {
+		return "", err
+	}
+	characterSetName, err := identifierProjection(widths, "RDB$CHARACTER_SETS", "RDB$CHARACTER_SET_NAME", "cs.RDB$CHARACTER_SET_NAME", "RDB$CHARACTER_SET_NAME")
+	if err != nil {
+		return "", err
+	}
+	collationName, err := identifierProjection(widths, "RDB$COLLATIONS", "RDB$COLLATION_NAME", "co.RDB$COLLATION_NAME", "RDB$COLLATION_NAME")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(template, fieldName, characterSetName, collationName), nil
+}
+
+func (c *Catalog) procedureProjection(ctx context.Context) (string, error) {
+	widths, err := c.identifierWidths(ctx)
+	if err != nil {
+		return "", err
+	}
+	procedureName, err := identifierProjection(widths, "RDB$PROCEDURES", "RDB$PROCEDURE_NAME", "p.RDB$PROCEDURE_NAME", "RDB$PROCEDURE_NAME")
+	if err != nil {
+		return "", err
+	}
+	securityClass, err := identifierProjection(widths, "RDB$PROCEDURES", "RDB$SECURITY_CLASS", "p.RDB$SECURITY_CLASS", "RDB$SECURITY_CLASS")
+	if err != nil {
+		return "", err
+	}
+	ownerName, err := identifierProjection(widths, "RDB$PROCEDURES", "RDB$OWNER_NAME", "p.RDB$OWNER_NAME", "RDB$OWNER_NAME")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(procedureProjectionTemplate, procedureName, securityClass, ownerName), nil
+}
+
+func (c *Catalog) procedureParametersQuery(ctx context.Context) (string, error) {
+	widths, err := c.identifierWidths(ctx)
+	if err != nil {
+		return "", err
+	}
+	parameterName, err := identifierProjection(widths, "RDB$PROCEDURE_PARAMETERS", "RDB$PARAMETER_NAME", "pp.RDB$PARAMETER_NAME", "RDB$PARAMETER_NAME")
+	if err != nil {
+		return "", err
+	}
+	procedureName, err := identifierProjection(widths, "RDB$PROCEDURE_PARAMETERS", "RDB$PROCEDURE_NAME", "pp.RDB$PROCEDURE_NAME", "RDB$PROCEDURE_NAME")
+	if err != nil {
+		return "", err
+	}
+	fieldSource, err := identifierProjection(widths, "RDB$PROCEDURE_PARAMETERS", "RDB$FIELD_SOURCE", "pp.RDB$FIELD_SOURCE", "RDB$FIELD_SOURCE")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(procedureParametersQueryTemplate, parameterName, procedureName, fieldSource), nil
+}
 
 // Tables returns user table relations matching name exactly. An empty name
 // lists all user tables in catalog order.
@@ -292,11 +418,15 @@ func (c *Catalog) relations(ctx context.Context, name string, kind RelationKind)
 		return nil, ErrNilQueryer
 	}
 
-	query := relationProjection + "\nWHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0"
+	projection, err := c.relationProjection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	query := projection + "\nWHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0"
 	if kind == RelationTable {
 		query += "\n  AND r.RDB$VIEW_BLR IS NULL"
 	} else if kind == RelationView {
-		query = relationProjection + "\nWHERE r.RDB$VIEW_BLR IS NOT NULL\n  AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0"
+		query = projection + "\nWHERE r.RDB$VIEW_BLR IS NOT NULL\n  AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0"
 	}
 	args := make([]any, 0, 1)
 	if name != "" {
@@ -411,7 +541,11 @@ func (c *Catalog) Columns(ctx context.Context, relationName string) ([]Column, e
 	if c == nil || c.queryer == nil {
 		return nil, ErrNilQueryer
 	}
-	rows, err := c.query(ctx, relationColumnsQuery, relationName)
+	query, err := c.relationColumnsQuery(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := c.query(ctx, query, relationName)
 	if err != nil {
 		return nil, fmt.Errorf("schema: query columns for %q: %w", relationName, err)
 	}
@@ -445,7 +579,11 @@ func (c *Catalog) Procedures(ctx context.Context, name string) ([]Procedure, err
 		return nil, ErrNilQueryer
 	}
 
-	query := procedureProjection + "\nWHERE COALESCE(p.RDB$SYSTEM_FLAG, 0) = 0"
+	projection, err := c.procedureProjection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	query := projection + "\nWHERE COALESCE(p.RDB$SYSTEM_FLAG, 0) = 0"
 	args := make([]any, 0, 1)
 	if name != "" {
 		query += "\n  AND p.RDB$PROCEDURE_NAME = ?"
@@ -513,7 +651,11 @@ func (c *Catalog) Procedure(ctx context.Context, name string) (*Procedure, error
 }
 
 func (c *Catalog) procedureParameters(ctx context.Context, procedureName string) ([]ProcedureParameter, []ProcedureParameter, error) {
-	rows, err := c.query(ctx, procedureParametersQuery, procedureName)
+	query, err := c.procedureParametersQuery(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := c.query(ctx, query, procedureName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("schema: query parameters for %q: %w", procedureName, err)
 	}
@@ -570,7 +712,11 @@ func (c *Catalog) loadParameterDomain(ctx context.Context, parameter *ProcedureP
 }
 
 func (c *Catalog) domain(ctx context.Context, name string) (*Domain, error) {
-	rows, err := c.query(ctx, domainQuery, name)
+	query, err := c.domainQuery(ctx, domainQueryTemplate)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := c.query(ctx, query, name)
 	if err != nil {
 		return nil, fmt.Errorf("schema: query domain %q: %w", name, err)
 	}

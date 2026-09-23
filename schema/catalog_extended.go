@@ -176,15 +176,15 @@ type Privilege struct {
 	SubjectType   sql.NullInt64
 }
 
-const extendedDomainQuery = `
-SELECT f.RDB$FIELD_NAME, f.RDB$VALIDATION_SOURCE,
+const extendedDomainQueryTemplate = `
+SELECT %s, f.RDB$VALIDATION_SOURCE,
        f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE, f.RDB$FIELD_LENGTH,
        f.RDB$FIELD_SCALE, f.RDB$FIELD_TYPE, f.RDB$FIELD_SUB_TYPE,
        f.RDB$DESCRIPTION, f.RDB$SYSTEM_FLAG, f.RDB$SEGMENT_LENGTH,
        f.RDB$EXTERNAL_LENGTH, f.RDB$EXTERNAL_SCALE, f.RDB$EXTERNAL_TYPE,
        f.RDB$DIMENSIONS, f.RDB$NULL_FLAG, f.RDB$CHARACTER_LENGTH,
        f.RDB$COLLATION_ID, f.RDB$CHARACTER_SET_ID, f.RDB$FIELD_PRECISION,
-       cs.RDB$CHARACTER_SET_NAME, co.RDB$COLLATION_NAME
+        %s, %s
 FROM RDB$FIELDS f
 LEFT JOIN RDB$CHARACTER_SETS cs
        ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
@@ -192,35 +192,35 @@ LEFT JOIN RDB$COLLATIONS co
        ON co.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
       AND co.RDB$COLLATION_ID = f.RDB$COLLATION_ID`
 
-const sequenceQuery = `
-SELECT g.RDB$GENERATOR_NAME, g.RDB$GENERATOR_ID, g.RDB$SYSTEM_FLAG
+const sequenceQueryTemplate = `
+SELECT %s, g.RDB$GENERATOR_ID, g.RDB$SYSTEM_FLAG
 FROM RDB$GENERATORS g`
 
-const indexQuery = `
-SELECT i.RDB$INDEX_NAME, i.RDB$RELATION_NAME, i.RDB$INDEX_ID,
+const indexQueryTemplate = `
+SELECT %s, %s, i.RDB$INDEX_ID,
        i.RDB$UNIQUE_FLAG, i.RDB$DESCRIPTION, i.RDB$SEGMENT_COUNT,
-       i.RDB$INDEX_INACTIVE, i.RDB$INDEX_TYPE, i.RDB$FOREIGN_KEY,
+       i.RDB$INDEX_INACTIVE, i.RDB$INDEX_TYPE, %s,
        i.RDB$SYSTEM_FLAG, i.RDB$EXPRESSION_SOURCE, i.RDB$STATISTICS,
-       rc.RDB$CONSTRAINT_NAME
+       %s
 FROM RDB$INDICES i
 LEFT JOIN RDB$RELATION_CONSTRAINTS rc
        ON rc.RDB$INDEX_NAME = i.RDB$INDEX_NAME`
 
-const indexSegmentsQuery = `
-SELECT s.RDB$INDEX_NAME, s.RDB$FIELD_NAME, s.RDB$FIELD_POSITION,
+const indexSegmentsQueryTemplate = `
+SELECT %s, %s, s.RDB$FIELD_POSITION,
        s.RDB$STATISTICS
 FROM RDB$INDEX_SEGMENTS s
 WHERE s.RDB$INDEX_NAME = ?
 ORDER BY s.RDB$FIELD_POSITION`
 
-const constraintQuery = `
-SELECT c.RDB$CONSTRAINT_NAME, c.RDB$CONSTRAINT_TYPE,
-       c.RDB$RELATION_NAME, c.RDB$DEFERRABLE,
-       c.RDB$INITIALLY_DEFERRED, c.RDB$INDEX_NAME,
-       k.RDB$TRIGGER_NAME, r.RDB$CONST_NAME_UQ,
+const constraintQueryTemplate = `
+SELECT %s, c.RDB$CONSTRAINT_TYPE,
+       %s, c.RDB$DEFERRABLE,
+       c.RDB$INITIALLY_DEFERRED, %s,
+       %s, %s,
        r.RDB$MATCH_OPTION, r.RDB$UPDATE_RULE, r.RDB$DELETE_RULE,
-       k.RDB$TRIGGER_NAME, t.RDB$TRIGGER_SOURCE,
-       pc.RDB$RELATION_NAME, pc.RDB$INDEX_NAME
+       %s, t.RDB$TRIGGER_SOURCE,
+       %s, %s
 FROM RDB$RELATION_CONSTRAINTS c
 JOIN RDB$RELATIONS cr
        ON cr.RDB$RELATION_NAME = c.RDB$RELATION_NAME
@@ -237,31 +237,31 @@ LEFT JOIN RDB$TRIGGERS t
 LEFT JOIN RDB$RELATION_CONSTRAINTS pc
        ON pc.RDB$CONSTRAINT_NAME = r.RDB$CONST_NAME_UQ`
 
-const triggerQuery = `
-SELECT t.RDB$TRIGGER_NAME, t.RDB$RELATION_NAME,
+const triggerQueryTemplate = `
+SELECT %s, %s,
        t.RDB$TRIGGER_SEQUENCE, t.RDB$TRIGGER_TYPE,
        t.RDB$TRIGGER_SOURCE, t.RDB$DESCRIPTION,
        t.RDB$TRIGGER_INACTIVE, t.RDB$SYSTEM_FLAG, t.RDB$FLAGS
 FROM RDB$TRIGGERS t`
 
-const roleQuery = `
-SELECT RDB$ROLE_NAME, RDB$OWNER_NAME
+const roleQueryTemplate = `
+SELECT %s, RDB$OWNER_NAME
 FROM RDB$ROLES`
 
-const dependencyQuery = `
-SELECT d.RDB$DEPENDENT_NAME, d.RDB$DEPENDENT_TYPE,
-       d.RDB$FIELD_NAME, d.RDB$DEPENDED_ON_NAME,
+const dependencyQueryTemplate = `
+SELECT %s, d.RDB$DEPENDENT_TYPE,
+       %s, %s,
        d.RDB$DEPENDED_ON_TYPE
 FROM RDB$DEPENDENCIES d`
 
-const functionQuery = `
-SELECT f.RDB$FUNCTION_NAME, f.RDB$FUNCTION_TYPE,
+const functionQueryTemplate = `
+SELECT %s, f.RDB$FUNCTION_TYPE,
        f.RDB$DESCRIPTION, f.RDB$MODULE_NAME, f.RDB$ENTRYPOINT,
        f.RDB$RETURN_ARGUMENT, f.RDB$SYSTEM_FLAG
 FROM RDB$FUNCTIONS f`
 
-const functionArgumentsQuery = `
-SELECT a.RDB$FUNCTION_NAME, a.RDB$ARGUMENT_POSITION,
+const functionArgumentsQueryTemplate = `
+SELECT %s, a.RDB$ARGUMENT_POSITION,
        a.RDB$MECHANISM, a.RDB$FIELD_LENGTH, a.RDB$FIELD_SCALE,
        a.RDB$FIELD_TYPE, a.RDB$FIELD_SUB_TYPE, a.RDB$CHARACTER_SET_ID,
        a.RDB$FIELD_PRECISION, a.RDB$CHARACTER_LENGTH
@@ -289,11 +289,42 @@ FROM RDB$FILES f
 WHERE f.RDB$SHADOW_NUMBER = ?
 ORDER BY f.RDB$FILE_SEQUENCE`
 
-const privilegeQuery = `
+const privilegeQueryTemplate = `
 SELECT p.RDB$USER, p.RDB$GRANTOR, p.RDB$PRIVILEGE,
-       p.RDB$GRANT_OPTION, p.RDB$RELATION_NAME, p.RDB$FIELD_NAME,
+       p.RDB$GRANT_OPTION, %s, %s,
        p.RDB$USER_TYPE, p.RDB$OBJECT_TYPE
 FROM RDB$USER_PRIVILEGES p`
+
+type extendedIdentifierSpec struct {
+	relation string
+	field    string
+	ref      string
+	alias    string
+}
+
+func (c *Catalog) extendedProjectionQuery(ctx context.Context, template string, identifiers ...extendedIdentifierSpec) (string, error) {
+	widths, err := c.identifierWidths(ctx)
+	if err != nil {
+		return "", err
+	}
+	projections := make([]string, len(identifiers))
+	for index, identifier := range identifiers {
+		projection, err := identifierProjection(widths, identifier.relation, identifier.field, identifier.ref, identifier.alias)
+		if err != nil {
+			return "", err
+		}
+		projections[index] = projection
+	}
+	return fmt.Sprintf(template, stringsToAny(projections)...), nil
+}
+
+func stringsToAny(values []string) []any {
+	result := make([]any, len(values))
+	for index := range values {
+		result[index] = values[index]
+	}
+	return result
+}
 
 // Domains returns user-defined domains matching name exactly. An empty name
 // returns all user domains in catalog order.
@@ -301,7 +332,11 @@ func (c *Catalog) Domains(ctx context.Context, name string) ([]Domain, error) {
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := extendedDomainQuery + "\nWHERE COALESCE(f.RDB$SYSTEM_FLAG, 0) = 0\n  AND f.RDB$FIELD_NAME NOT STARTING WITH 'RDB$'"
+	projection, err := c.domainQuery(ctx, extendedDomainQueryTemplate)
+	if err != nil {
+		return nil, err
+	}
+	query := projection + "\nWHERE COALESCE(f.RDB$SYSTEM_FLAG, 0) = 0\n  AND f.RDB$FIELD_NAME NOT STARTING WITH 'RDB$'"
 	args := make([]any, 0, 1)
 	if name != "" {
 		query += "\n  AND f.RDB$FIELD_NAME = ?"
@@ -352,7 +387,13 @@ func (c *Catalog) Sequences(ctx context.Context, name string) ([]Sequence, error
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := sequenceQuery + "\nWHERE COALESCE(g.RDB$SYSTEM_FLAG, 0) = 0"
+	query, err := c.extendedProjectionQuery(ctx, sequenceQueryTemplate,
+		extendedIdentifierSpec{"RDB$GENERATORS", "RDB$GENERATOR_NAME", "g.RDB$GENERATOR_NAME", "RDB$GENERATOR_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build sequence query: %w", err)
+	}
+	query += "\nWHERE COALESCE(g.RDB$SYSTEM_FLAG, 0) = 0"
 	args := make([]any, 0, 1)
 	if name != "" {
 		query += "\n  AND g.RDB$GENERATOR_NAME = ?"
@@ -433,7 +474,16 @@ func (c *Catalog) indexes(ctx context.Context, name, relationName string) ([]Ind
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := indexQuery + "\nWHERE COALESCE(i.RDB$SYSTEM_FLAG, 0) = 0"
+	query, err := c.extendedProjectionQuery(ctx, indexQueryTemplate,
+		extendedIdentifierSpec{"RDB$INDICES", "RDB$INDEX_NAME", "i.RDB$INDEX_NAME", "RDB$INDEX_NAME"},
+		extendedIdentifierSpec{"RDB$INDICES", "RDB$RELATION_NAME", "i.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+		extendedIdentifierSpec{"RDB$INDICES", "RDB$FOREIGN_KEY", "i.RDB$FOREIGN_KEY", "RDB$FOREIGN_KEY"},
+		extendedIdentifierSpec{"RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "rc.RDB$CONSTRAINT_NAME", "RDB$CONSTRAINT_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build index query: %w", err)
+	}
+	query += "\nWHERE COALESCE(i.RDB$SYSTEM_FLAG, 0) = 0"
 	args := make([]any, 0, 2)
 	if name != "" {
 		query += "\n  AND i.RDB$INDEX_NAME = ?"
@@ -495,7 +545,14 @@ func (c *Catalog) IndexSegments(ctx context.Context, indexName string) ([]IndexS
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	rows, err := c.query(ctx, indexSegmentsQuery, indexName)
+	query, err := c.extendedProjectionQuery(ctx, indexSegmentsQueryTemplate,
+		extendedIdentifierSpec{"RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME", "s.RDB$INDEX_NAME", "RDB$INDEX_NAME"},
+		extendedIdentifierSpec{"RDB$INDEX_SEGMENTS", "RDB$FIELD_NAME", "s.RDB$FIELD_NAME", "RDB$FIELD_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build index segment query for %q: %w", indexName, err)
+	}
+	rows, err := c.query(ctx, query, indexName)
 	if err != nil {
 		return nil, fmt.Errorf("schema: query index segments for %q: %w", indexName, err)
 	}
@@ -550,7 +607,21 @@ func (c *Catalog) constraints(ctx context.Context, constraintName, relationName 
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := constraintQuery + "\nWHERE COALESCE(cr.RDB$SYSTEM_FLAG, 0) = 0"
+	query, err := c.extendedProjectionQuery(ctx, constraintQueryTemplate,
+		extendedIdentifierSpec{"RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", "c.RDB$CONSTRAINT_NAME", "RDB$CONSTRAINT_NAME"},
+		extendedIdentifierSpec{"RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME", "c.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+		extendedIdentifierSpec{"RDB$RELATION_CONSTRAINTS", "RDB$INDEX_NAME", "c.RDB$INDEX_NAME", "RDB$INDEX_NAME"},
+		extendedIdentifierSpec{"RDB$CHECK_CONSTRAINTS", "RDB$TRIGGER_NAME", "k.RDB$TRIGGER_NAME", "RDB$TRIGGER_NAME"},
+		extendedIdentifierSpec{"RDB$REF_CONSTRAINTS", "RDB$CONST_NAME_UQ", "r.RDB$CONST_NAME_UQ", "RDB$CONST_NAME_UQ"},
+		// The same check-trigger field is selected twice in the established layout.
+		extendedIdentifierSpec{"RDB$CHECK_CONSTRAINTS", "RDB$TRIGGER_NAME", "k.RDB$TRIGGER_NAME", "RDB$TRIGGER_NAME"},
+		extendedIdentifierSpec{"RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME", "pc.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+		extendedIdentifierSpec{"RDB$RELATION_CONSTRAINTS", "RDB$INDEX_NAME", "pc.RDB$INDEX_NAME", "RDB$INDEX_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build constraint query: %w", err)
+	}
+	query += "\nWHERE COALESCE(cr.RDB$SYSTEM_FLAG, 0) = 0"
 	args := make([]any, 0, 2)
 	if constraintName != "" {
 		query += "\n  AND c.RDB$CONSTRAINT_NAME = ?"
@@ -696,7 +767,14 @@ func (c *Catalog) triggers(ctx context.Context, name, relationName string) ([]Tr
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := triggerQuery + "\nWHERE COALESCE(t.RDB$SYSTEM_FLAG, 0) = 0"
+	query, err := c.extendedProjectionQuery(ctx, triggerQueryTemplate,
+		extendedIdentifierSpec{"RDB$TRIGGERS", "RDB$TRIGGER_NAME", "t.RDB$TRIGGER_NAME", "RDB$TRIGGER_NAME"},
+		extendedIdentifierSpec{"RDB$TRIGGERS", "RDB$RELATION_NAME", "t.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build trigger query: %w", err)
+	}
+	query += "\nWHERE COALESCE(t.RDB$SYSTEM_FLAG, 0) = 0"
 	args := make([]any, 0, 2)
 	if name != "" {
 		query += "\n  AND t.RDB$TRIGGER_NAME = ?"
@@ -749,7 +827,12 @@ func (c *Catalog) Roles(ctx context.Context, name string) ([]Role, error) {
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := roleQuery
+	query, err := c.extendedProjectionQuery(ctx, roleQueryTemplate,
+		extendedIdentifierSpec{"RDB$ROLES", "RDB$ROLE_NAME", "RDB$ROLE_NAME", "RDB$ROLE_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build role query: %w", err)
+	}
 	args := make([]any, 0, 1)
 	if name != "" {
 		query += "\nWHERE RDB$ROLE_NAME = ?"
@@ -805,7 +888,14 @@ func (c *Catalog) Dependencies(ctx context.Context, dependentName string) ([]Dep
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := dependencyQuery
+	query, err := c.extendedProjectionQuery(ctx, dependencyQueryTemplate,
+		extendedIdentifierSpec{"RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME", "d.RDB$DEPENDENT_NAME", "RDB$DEPENDENT_NAME"},
+		extendedIdentifierSpec{"RDB$DEPENDENCIES", "RDB$FIELD_NAME", "d.RDB$FIELD_NAME", "RDB$FIELD_NAME"},
+		extendedIdentifierSpec{"RDB$DEPENDENCIES", "RDB$DEPENDED_ON_NAME", "d.RDB$DEPENDED_ON_NAME", "RDB$DEPENDED_ON_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build dependency query: %w", err)
+	}
 	args := make([]any, 0, 1)
 	if dependentName != "" {
 		query += "\nWHERE d.RDB$DEPENDENT_NAME = ?"
@@ -856,7 +946,13 @@ func (c *Catalog) Functions(ctx context.Context, name string) ([]Function, error
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := functionQuery + "\nWHERE COALESCE(f.RDB$SYSTEM_FLAG, 0) = 0"
+	query, err := c.extendedProjectionQuery(ctx, functionQueryTemplate,
+		extendedIdentifierSpec{"RDB$FUNCTIONS", "RDB$FUNCTION_NAME", "f.RDB$FUNCTION_NAME", "RDB$FUNCTION_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build function query: %w", err)
+	}
+	query += "\nWHERE COALESCE(f.RDB$SYSTEM_FLAG, 0) = 0"
 	args := make([]any, 0, 1)
 	if name != "" {
 		query += "\n  AND f.RDB$FUNCTION_NAME = ?"
@@ -907,7 +1003,13 @@ func (c *Catalog) Function(ctx context.Context, name string) (*Function, error) 
 }
 
 func (c *Catalog) functionArguments(ctx context.Context, functionName string) ([]FunctionArgument, error) {
-	rows, err := c.query(ctx, functionArgumentsQuery, functionName)
+	query, err := c.extendedProjectionQuery(ctx, functionArgumentsQueryTemplate,
+		extendedIdentifierSpec{"RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME", "a.RDB$FUNCTION_NAME", "RDB$FUNCTION_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build function argument query for %q: %w", functionName, err)
+	}
+	rows, err := c.query(ctx, query, functionName)
 	if err != nil {
 		return nil, fmt.Errorf("schema: query function arguments for %q: %w", functionName, err)
 	}
@@ -1021,7 +1123,13 @@ func (c *Catalog) Privileges(ctx context.Context, grantee string) ([]Privilege, 
 	if err := c.ready(ctx); err != nil {
 		return nil, err
 	}
-	query := privilegeQuery
+	query, err := c.extendedProjectionQuery(ctx, privilegeQueryTemplate,
+		extendedIdentifierSpec{"RDB$USER_PRIVILEGES", "RDB$RELATION_NAME", "p.RDB$RELATION_NAME", "RDB$RELATION_NAME"},
+		extendedIdentifierSpec{"RDB$USER_PRIVILEGES", "RDB$FIELD_NAME", "p.RDB$FIELD_NAME", "RDB$FIELD_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build privilege query: %w", err)
+	}
 	args := make([]any, 0, 1)
 	if grantee != "" {
 		query += "\nWHERE p.RDB$USER = ?"
