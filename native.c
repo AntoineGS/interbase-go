@@ -386,6 +386,10 @@ static int ib_charset_id(const char *value, size_t length, short *charset)
 		*charset = IB_CHARSET_UTF8;
 		return 0;
 	}
+	if (ib_charset_name_matches(value, length, "NONE")) {
+		*charset = 0;
+		return 0;
+	}
 	if (ib_charset_name_matches(value, length, "WIN1250")) {
 		*charset = IB_CHARSET_WIN1250;
 		return 0;
@@ -408,6 +412,8 @@ static int ib_charset_id(const char *value, size_t length, short *charset)
 static const char *ib_charset_name(short charset)
 {
 	switch (charset) {
+	case 0:
+		return "NONE";
 	case IB_CHARSET_UTF8:
 		return "UTF8";
 	case IB_CHARSET_WIN1250:
@@ -7993,6 +7999,52 @@ int ib_statement_num_input(const ib_statement *statement)
 		return 0;
 	}
 	return (int) statement->input->sqld;
+}
+
+int ib_statement_summary(const ib_statement *statement, int *kind,
+	int *returns_rows, int *input_count, char **error)
+{
+	int prepared_kind = IB_STATEMENT_UNSUPPORTED;
+	int has_rows = 0;
+
+	if (statement == NULL || statement->connection == NULL ||
+		statement->connection->database == NULL || statement->statement == NULL ||
+		statement->input == NULL || statement->input->sqld < 0 ||
+		kind == NULL || returns_rows == NULL || input_count == NULL) {
+		return ib_fail(error, "invalid prepared statement summary");
+	}
+	switch (statement->statement_type) {
+	case isc_info_sql_stmt_select:
+		prepared_kind = IB_STATEMENT_SELECT;
+		has_rows = 1;
+		break;
+	case isc_info_sql_stmt_select_for_upd:
+		prepared_kind = IB_STATEMENT_SELECT_FOR_UPDATE;
+		has_rows = 1;
+		break;
+	case isc_info_sql_stmt_insert:
+		prepared_kind = IB_STATEMENT_INSERT;
+		break;
+	case isc_info_sql_stmt_update:
+		prepared_kind = IB_STATEMENT_UPDATE;
+		break;
+	case isc_info_sql_stmt_delete:
+		prepared_kind = IB_STATEMENT_DELETE;
+		break;
+	case isc_info_sql_stmt_ddl:
+		prepared_kind = IB_STATEMENT_DDL;
+		break;
+	case isc_info_sql_stmt_exec_procedure:
+		prepared_kind = IB_STATEMENT_PROCEDURE;
+		has_rows = statement->output != NULL && statement->output->sqld > 0;
+		break;
+	default:
+		break;
+	}
+	*kind = prepared_kind;
+	*returns_rows = has_rows;
+	*input_count = ib_statement_num_input(statement);
+	return 0;
 }
 
 int ib_statement_input_metadata(const ib_statement *statement, size_t index,

@@ -1882,6 +1882,81 @@ static void test_prepared_input_metadata_accessor(void)
 	free(connection);
 }
 
+/* A metadata lookup must never execute the prepared statement or change its
+ * transaction; it only reports the state retained by prepare. */
+static void test_prepared_statement_summary(void)
+{
+	static const struct {
+		int sdk_type;
+		int kind;
+		int returns_rows;
+	} cases[] = {
+		{isc_info_sql_stmt_select, IB_STATEMENT_SELECT, 1},
+		{isc_info_sql_stmt_select_for_upd, IB_STATEMENT_SELECT_FOR_UPDATE, 1},
+		{isc_info_sql_stmt_insert, IB_STATEMENT_INSERT, 0},
+		{isc_info_sql_stmt_update, IB_STATEMENT_UPDATE, 0},
+		{isc_info_sql_stmt_delete, IB_STATEMENT_DELETE, 0},
+		{isc_info_sql_stmt_ddl, IB_STATEMENT_DDL, 0},
+		{isc_info_sql_stmt_exec_procedure, IB_STATEMENT_PROCEDURE, 1},
+		{isc_info_sql_stmt_commit, IB_STATEMENT_UNSUPPORTED, 0}
+	};
+	size_t index;
+	int kind = -1;
+	int returns_rows = -1;
+	int input_count = -1;
+	char *error = NULL;
+
+	check(ib_statement_summary(NULL, &kind, &returns_rows, &input_count,
+		&error) != 0 && error != NULL,
+		"statement summary accepted a null statement");
+	ib_error_free(error);
+	for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); index++) {
+		ib_connection *connection;
+		struct ib_statement *statement;
+		int before_commit;
+		int before_start;
+
+		reset_mocks();
+		connection = new_connection();
+		statement = prepare_statement(connection, cases[index].sdk_type);
+		if (statement == NULL) {
+			free(connection);
+			continue;
+		}
+		before_commit = commit_calls;
+		before_start = start_calls;
+		error = NULL;
+		kind = returns_rows = input_count = -1;
+		check(ib_statement_summary(statement, &kind, &returns_rows,
+			&input_count, &error) == 0 && error == NULL &&
+			kind == cases[index].kind &&
+			returns_rows == cases[index].returns_rows && input_count == 1 &&
+			execute_calls == 0 && execute2_calls == 0 &&
+			start_calls == before_start && commit_calls == before_commit,
+			"statement summary misclassified or performed an operation");
+		ib_error_free(error);
+		if (cases[index].sdk_type == isc_info_sql_stmt_exec_procedure &&
+			statement->output != NULL) {
+			statement->output->sqld = 0;
+			error = NULL;
+			check(ib_statement_summary(statement, &kind, &returns_rows,
+				&input_count, &error) == 0 && error == NULL &&
+				kind == IB_STATEMENT_PROCEDURE && returns_rows == 0,
+				"procedure without output was marked as returning rows");
+			ib_error_free(error);
+		}
+		error = NULL;
+		check(ib_statement_summary(statement, NULL, &returns_rows,
+			&input_count, &error) != 0 && error != NULL,
+			"statement summary accepted a null output pointer");
+		ib_error_free(error);
+		error = NULL;
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+		free(connection);
+	}
+}
+
 static void test_failed_implicit_execution_keeps_handle(void)
 {
 	ib_connection *connection;
@@ -3681,6 +3756,7 @@ int main(void)
 	test_catalog_drop_failure_stops_user_execution();
 	test_prepare_once_execute_repeated();
 	test_prepared_input_metadata_accessor();
+	test_prepared_statement_summary();
 	test_failed_implicit_execution_keeps_handle();
 	test_prepare_failure_releases_handle_and_transaction();
 	test_failed_prepare_rollback_marks_connection_broken();

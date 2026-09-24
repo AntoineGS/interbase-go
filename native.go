@@ -772,6 +772,7 @@ type nativeStatement struct {
 	numInputOverride          func() int
 	inputMetadataOverride     func(int) (nativeInputMetadata, error)
 	planOverride              func() (string, error)
+	descriptionOverride       func() (StatementDescriptor, error)
 }
 
 type nativeInputMetadata struct {
@@ -1597,6 +1598,46 @@ func (s *nativeStatement) plan() (string, error) {
 		return "", errors.New("native statement plan is too long")
 	}
 	return string(C.GoBytes(unsafe.Pointer(planPointer), C.int(planLength))), nil
+}
+
+func (s *nativeStatement) description() (StatementDescriptor, error) {
+	release := nativegate.Global.Enter()
+	defer release()
+	if s != nil && s.descriptionOverride != nil {
+		return s.descriptionOverride()
+	}
+	if s == nil || s.ptr == nil {
+		return StatementDescriptor{}, errors.New("interbase: native statement is unavailable")
+	}
+	var kind, returnsRows, inputCount C.int
+	var errorPointer *C.char
+	if C.ib_statement_summary(s.ptr, &kind, &returnsRows, &inputCount, &errorPointer) != 0 {
+		return StatementDescriptor{}, takeNativeError(errorPointer)
+	}
+	var name string
+	switch kind {
+	case C.IB_STATEMENT_SELECT:
+		name = "select"
+	case C.IB_STATEMENT_SELECT_FOR_UPDATE:
+		name = "select-for-update"
+	case C.IB_STATEMENT_INSERT:
+		name = "insert"
+	case C.IB_STATEMENT_UPDATE:
+		name = "update"
+	case C.IB_STATEMENT_DELETE:
+		name = "delete"
+	case C.IB_STATEMENT_DDL:
+		name = "ddl"
+	case C.IB_STATEMENT_PROCEDURE:
+		name = "procedure"
+	default:
+		name = "unsupported"
+	}
+	return StatementDescriptor{
+		Kind: name, ReturnsRows: returnsRows != 0,
+		Mutating:   name != "select" && name != "unsupported",
+		InputCount: int(inputCount),
+	}, nil
 }
 
 func (c *nativeConnection) query(ctx context.Context, query string, args []argument,

@@ -59,6 +59,7 @@ func TestConfigCharsetNormalizesSupportedValues(t *testing.T) {
 	}{
 		{name: "empty defaults to UTF8", input: "", want: "UTF8"},
 		{name: "UTF8", input: "utf8", want: "UTF8"},
+		{name: "NONE", input: "none", want: "NONE"},
 		{name: "WIN1250", input: "win1250", want: "WIN1250"},
 		{name: "WIN1252", input: "win1252", want: "WIN1252"},
 		{name: "ISO8859_1", input: "iso8859_1", want: "ISO8859_1"},

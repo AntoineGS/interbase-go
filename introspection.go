@@ -29,8 +29,23 @@ type InputDescriber interface {
 	DescribeInputs(ctx context.Context, query string) ([]InputDescriptor, error)
 }
 
+// StatementDescriptor classifies a prepared statement without running it.
+// The application must reject Kind "unsupported" before attempting execution.
+type StatementDescriptor struct {
+	Kind        string
+	ReturnsRows bool
+	Mutating    bool
+	InputCount  int
+}
+
+// StatementDescriber is an optional extension for driver connections.
+type StatementDescriber interface {
+	DescribeStatement(ctx context.Context, query string) (StatementDescriptor, error)
+}
+
 var _ Introspector = (*conn)(nil)
 var _ InputDescriber = (*conn)(nil)
+var _ StatementDescriber = (*conn)(nil)
 
 // ErrNotInterBaseConn reports a connection that does not belong to this driver.
 var ErrNotInterBaseConn = errors.New("interbase: connection is not an InterBase connection")
@@ -230,6 +245,28 @@ func DescribeInputs(ctx context.Context, conn *sql.Conn, query string) ([]InputD
 	return result, nil
 }
 
+// DescribeStatement inspects a statement on the supplied pinned connection.
+// It never executes the SQL, changes the caller's transaction, or keeps the
+// driver connection beyond the Raw callback.
+func DescribeStatement(ctx context.Context, conn *sql.Conn, query string) (StatementDescriptor, error) {
+	if conn == nil {
+		return StatementDescriptor{}, ErrNotInterBaseConn
+	}
+	var result StatementDescriptor
+	if err := conn.Raw(func(driverConn any) error {
+		describer, ok := driverConn.(StatementDescriber)
+		if !ok {
+			return ErrNotInterBaseConn
+		}
+		var err error
+		result, err = describer.DescribeStatement(ctx, query)
+		return err
+	}); err != nil {
+		return StatementDescriptor{}, err
+	}
+	return result, nil
+}
+
 // Plan prepares query and returns its server-generated plan without executing
 // it, using the attachment behind this connection. The prepared statement is
 // never registered with the connection and is always closed before returning.
@@ -303,6 +340,39 @@ func (c *conn) DescribeInputs(ctx context.Context, query string) ([]InputDescrip
 		return nil, err
 	}
 	return descriptors, nil
+}
+
+// DescribeStatement uses the shared prepare/inspect/close lifecycle while
+// retaining any caller-owned explicit transaction on this connection.
+func (c *conn) DescribeStatement(ctx context.Context, query string) (StatementDescriptor, error) {
+	if err := contextError(ctx); err != nil {
+		return StatementDescriptor{}, err
+	}
+	if err := validateDatabaseSQLQuery(query); err != nil {
+		return StatementDescriptor{}, err
+	}
+	c.lockDirect()
+	defer c.mu.Unlock()
+	// Distributed attachments are only used through explicit Attachment
+	// participants, but retain Plan's guard on this shared connection method.
+	if c.distributed != nil {
+		return StatementDescriptor{}, ErrDistributedParticipantManaged
+	}
+	if c.closed || c.native == nil || c.native.broken() {
+		return StatementDescriptor{}, driver.ErrBadConn
+	}
+	if err := contextError(ctx); err != nil {
+		return StatementDescriptor{}, err
+	}
+	var description StatementDescriptor
+	if err := c.inspectPreparedStatementLocked(ctx, query, "describe statement", func(statement *nativeStatement) error {
+		var inspectErr error
+		description, inspectErr = statement.description()
+		return inspectErr
+	}); err != nil {
+		return StatementDescriptor{}, err
+	}
+	return description, nil
 }
 
 // inspectPreparedStatementLocked shares Plan's prepare, cancellation, error

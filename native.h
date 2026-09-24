@@ -56,6 +56,18 @@ enum ib_write_outcome_state {
 	IB_WRITE_OUTCOME_EXPLICIT_USABLE = 2
 };
 
+/* Stable, SDK-independent statement kinds returned by preparation metadata. */
+enum ib_statement_kind {
+	IB_STATEMENT_UNSUPPORTED = 0,
+	IB_STATEMENT_SELECT = 1,
+	IB_STATEMENT_SELECT_FOR_UPDATE = 2,
+	IB_STATEMENT_INSERT = 3,
+	IB_STATEMENT_UPDATE = 4,
+	IB_STATEMENT_DELETE = 5,
+	IB_STATEMENT_DDL = 6,
+	IB_STATEMENT_PROCEDURE = 7
+};
+
 enum ib_array_element_kind {
 	IB_ARRAY_ELEMENT_STRING = 1,
 	IB_ARRAY_ELEMENT_INT64 = 2,
@@ -284,6 +296,8 @@ ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
 	size_t query_length, ib_cancel_slot *cancel, uint64_t generation,
 	char **error);
 int ib_statement_num_input(const ib_statement *statement);
+int ib_statement_summary(const ib_statement *statement, int *kind,
+	int *returns_rows, int *input_count, char **error);
 int ib_statement_input_metadata(const ib_statement *statement, size_t index,
 	ib_input_metadata *metadata, char **error);
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,

@@ -81,8 +81,10 @@ type TransactionOptions struct {
 // Dialect selects the SQL dialect for the attachment. Zero selects Dialect 3;
 // Dialects 1 and 3 are supported. Set Dialect to 1 to opt into Dialect 1.
 // Charset is the InterBase attachment character set; an empty value selects
-// UTF8. Passwords are sent only while opening an attachment (and are retained
-// only for error redaction); they are never included in driver errors.
+// UTF8. NONE disables server-side charset translation and returns text bytes
+// without a declared encoding. Passwords are sent only while opening an
+// attachment (and are retained only for error redaction); they are never
+// included in driver errors.
 type Config struct {
 	Database                 string
 	Host                     string
@@ -395,7 +397,7 @@ func normalizeCharset(charset string) (string, error) {
 	switch strings.ToUpper(charset) {
 	case "":
 		return "UTF8", nil
-	case "UTF8", "WIN1250", "WIN1252", "ISO8859_1", "ASCII":
+	case "UTF8", "NONE", "WIN1250", "WIN1252", "ISO8859_1", "ASCII":
 		return strings.ToUpper(charset), nil
 	default:
 		return "", fmt.Errorf("interbase: unsupported character set %q", charset)
