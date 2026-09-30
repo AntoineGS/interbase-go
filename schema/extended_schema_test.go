@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -1705,5 +1706,201 @@ func TestFunctionReturnTypeResolvesByArgumentPosition(t *testing.T) {
 	}
 	if got, err := text[0].ReturnType(); err != nil || got != "CSTRING(80)" {
 		t.Fatalf("scanned CSTRING ReturnType = (%q, %v), want (\"CSTRING(80)\", nil)", got, err)
+	}
+}
+
+func TestCatalogExceptionsPreserveExactNamesAndNullableMessages(t *testing.T) {
+	db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+	defer db.Close()
+	catalog := New(db)
+	ctx := context.Background()
+
+	got, err := catalog.Exceptions(ctx, "")
+	if err != nil {
+		t.Fatalf("Exceptions returned error: %v", err)
+	}
+	if len(got) != 3 || got[0].Name != "EMPTY_EXCEPTION" || got[1].Name != "MiXeD_Exception" || got[2].Name != "NULL_EXCEPTION" {
+		t.Fatalf("Exceptions = %#v, want catalog names with exact mixed case", got)
+	}
+	if !got[0].Message.Valid || got[0].Message.String != "" {
+		t.Fatalf("empty exception message = %#v, want valid empty string", got[0].Message)
+	}
+	wantMessage := "MDE L'Caf" + string([]byte{0xe9}) + ` "ok"`
+	if !got[1].Message.Valid || got[1].Message.String != wantMessage {
+		t.Fatalf("legacy exception message = %#v, want exact apostrophe/quote/CP1252 bytes %q", got[1].Message, wantMessage)
+	}
+	if got[2].Message.Valid {
+		t.Fatalf("NULL exception message = %#v, want invalid NullString", got[2].Message)
+	}
+	if !got[1].Number.Valid || got[1].Number.Int64 != 42 {
+		t.Fatalf("exception number = %#v, want 42", got[1].Number)
+	}
+
+	selected, err := catalog.Exceptions(ctx, "MiXeD_Exception")
+	if err != nil || len(selected) != 1 || selected[0].Name != "MiXeD_Exception" {
+		t.Fatalf("exact Exceptions lookup = (%#v, %v), want one exact-case match", selected, err)
+	}
+	missing, err := catalog.Exceptions(ctx, "mixed_exception")
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("case-mismatched Exceptions lookup = (%#v, %v), want empty", missing, err)
+	}
+	calls := state.callsSnapshot()
+	call := calls[len(calls)-1]
+	if fixtureQueryKind(call.query) != "exceptions" {
+		t.Fatalf("last catalog query = %q, want exact-name exception query", call.query)
+	}
+	if len(call.args) != 1 || call.args[0].Value != "mixed_exception" {
+		t.Fatalf("exception filter args = %#v, want exact supplied name bound once", call.args)
+	}
+	if strings.Contains(call.query, "mixed_exception") {
+		t.Fatalf("exception name filter was interpolated into query: %q", call.query)
+	}
+}
+
+func TestCatalogGeneratorValueUsesExactQuotedIdentifierAndZeroIncrement(t *testing.T) {
+	db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+	defer db.Close()
+	const name = `MiXeD"Generator`
+	got, err := New(db).GeneratorValue(context.Background(), name)
+	if err != nil {
+		t.Fatalf("GeneratorValue returned error: %v", err)
+	}
+	const wantValue int64 = -9007199254740993
+	if got != wantValue {
+		t.Fatalf("GeneratorValue = %d, want signed int64 %d", got, wantValue)
+	}
+	call := fixtureCallForKind(t, state.callsSnapshot(), "generator_value")
+	wantQuery := `SELECT GEN_ID("MiXeD""Generator", 0) FROM RDB$DATABASE`
+	if normalizeFixtureSQL(call.query) != normalizeFixtureSQL(wantQuery) {
+		t.Fatalf("generator query = %q, want %q", call.query, wantQuery)
+	}
+	if len(call.args) != 0 {
+		t.Fatalf("generator query args = %#v, want safely quoted identifier and no interpolation parameters", call.args)
+	}
+	if strings.Contains(strings.ToUpper(call.query), `, 1)`) {
+		t.Fatalf("generator query increments instead of reading: %q", call.query)
+	}
+}
+
+func TestCatalogGeneratorValuePropagatesReadScanAndCancellationErrors(t *testing.T) {
+	queryErr := errors.New("generator read failed")
+	t.Run("query error", func(t *testing.T) {
+		db, _ := openFixtureDBWithOptions(t, fixtureOptions{queryErrorFor: "generator_value", queryError: queryErr})
+		defer db.Close()
+		if _, err := New(db).GeneratorValue(context.Background(), "GENERATOR"); !errors.Is(err, queryErr) {
+			t.Fatalf("GeneratorValue query error = %v, want wrapped %v", err, queryErr)
+		}
+	})
+	t.Run("scan error", func(t *testing.T) {
+		db, _ := openFixtureDBWithOptions(t, fixtureOptions{scanErrorFor: "generator_value"})
+		defer db.Close()
+		if _, err := New(db).GeneratorValue(context.Background(), "GENERATOR"); err == nil || !strings.Contains(err.Error(), "not an integer") {
+			t.Fatalf("GeneratorValue scan error = %v, want conversion failure", err)
+		}
+	})
+	t.Run("pre-canceled", func(t *testing.T) {
+		db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+		defer db.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := New(db).GeneratorValue(ctx, "GENERATOR"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("GeneratorValue canceled error = %v, want context.Canceled", err)
+		}
+		if len(state.callsSnapshot()) != 0 {
+			t.Fatalf("pre-canceled generator reads = %d, want none", len(state.callsSnapshot()))
+		}
+	})
+	t.Run("canceled while closing scalar read", func(t *testing.T) {
+		db, state := openFixtureDBWithOptions(t, fixtureOptions{cancelOnCloseFor: "generator_value"})
+		defer db.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		state.cancel = cancel
+		if _, err := New(db).GeneratorValue(ctx, "GENERATOR"); !errors.Is(err, context.Canceled) {
+			t.Fatalf("GeneratorValue close cancellation error = %v, want context.Canceled", err)
+		}
+	})
+}
+
+func TestFunctionGenerateDDLRequiresCompleteUnambiguousFacts(t *testing.T) {
+	function := renderableExternalFunction()
+	got, err := function.GenerateDDL()
+	if err != nil {
+		t.Fatalf("Function.GenerateDDL returned error: %v", err)
+	}
+	want := `DECLARE EXTERNAL FUNCTION "MiXeD""Function" SMALLINT, INTEGER BY DESCRIPTOR RETURNS INTEGER BY VALUE ENTRY_POINT 'entry''point' MODULE_NAME 'module''name'`
+	if got != want {
+		t.Fatalf("Function.GenerateDDL = %q, want %q", got, want)
+	}
+
+	parameterReturn := Function{
+		Name:           "PARAMETER_RETURN",
+		ModuleName:     sql.NullString{String: "module", Valid: true},
+		EntryPoint:     sql.NullString{String: "entry", Valid: true},
+		ReturnArgument: sql.NullInt64{Int64: 2, Valid: true},
+		Arguments: []FunctionArgument{
+			functionArgument("PARAMETER_RETURN", 1, 1, fieldTypeInteger),
+			functionArgument("PARAMETER_RETURN", 2, 1, fieldTypeSmallint),
+		},
+	}
+	if got, err := parameterReturn.GenerateDDL(); err != nil || !strings.Contains(got, "RETURNS PARAMETER 2") {
+		t.Fatalf("parameter return declaration = (%q, %v), want RETURNS PARAMETER 2", got, err)
+	}
+
+	unsupported := []struct {
+		name   string
+		mutate func(*Function)
+	}{
+		{name: "missing return position", mutate: func(f *Function) { f.ReturnArgument = sql.NullInt64{} }},
+		{name: "missing return argument", mutate: func(f *Function) { f.ReturnArgument = sql.NullInt64{Int64: 8, Valid: true} }},
+		{name: "no arguments", mutate: func(f *Function) { f.Arguments = nil }},
+		{name: "missing argument type", mutate: func(f *Function) { f.Arguments[1].FieldType = sql.NullInt64{} }},
+		{name: "missing argument mechanism", mutate: func(f *Function) { f.Arguments[1].Mechanism = sql.NullInt64{} }},
+		{name: "missing module", mutate: func(f *Function) { f.ModuleName = sql.NullString{} }},
+		{name: "missing entry point", mutate: func(f *Function) { f.EntryPoint = sql.NullString{} }},
+		{name: "out of order arguments", mutate: func(f *Function) { f.Arguments[1], f.Arguments[2] = f.Arguments[2], f.Arguments[1] }},
+		{name: "ambiguous duplicate position", mutate: func(f *Function) { f.Arguments = append(f.Arguments, f.Arguments[2]) }},
+		{name: "ambiguous CSTRING FREE_IT fact", mutate: func(f *Function) {
+			f.Arguments[0].FieldType = sql.NullInt64{Int64: fieldTypeCString, Valid: true}
+			f.Arguments[0].FieldLength = sql.NullInt64{Int64: 80, Valid: true}
+			f.Arguments[0].Mechanism = sql.NullInt64{Int64: 1, Valid: true}
+		}},
+	}
+	for _, test := range unsupported {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := function
+			candidate.Arguments = append([]FunctionArgument(nil), function.Arguments...)
+			test.mutate(&candidate)
+			if ddl, err := candidate.GenerateDDL(); !errors.Is(err, ErrUnsupportedDDL) || ddl != "" {
+				t.Fatalf("Function.GenerateDDL = (%q, %v), want empty DDL and ErrUnsupportedDDL", ddl, err)
+			}
+		})
+	}
+}
+
+func renderableExternalFunction() Function {
+	const name = `MiXeD"Function`
+	return Function{
+		Name:           name,
+		ModuleName:     sql.NullString{String: "module'name", Valid: true},
+		EntryPoint:     sql.NullString{String: "entry'point", Valid: true},
+		ReturnArgument: sql.NullInt64{Int64: 0, Valid: true},
+		Arguments: []FunctionArgument{
+			functionArgument(name, 0, 0, fieldTypeInteger),
+			functionArgument(name, 1, 1, fieldTypeSmallint),
+			functionArgument(name, 2, 2, fieldTypeInteger),
+		},
+	}
+}
+
+func functionArgument(functionName string, position, mechanism, fieldType int64) FunctionArgument {
+	return FunctionArgument{
+		Name:         functionName + "_" + strconv.FormatInt(position, 10),
+		FunctionName: functionName,
+		Position:     sql.NullInt64{Int64: position, Valid: true},
+		Mechanism:    sql.NullInt64{Int64: mechanism, Valid: true},
+		FieldType:    sql.NullInt64{Int64: fieldType, Valid: true},
+		FieldScale:   sql.NullInt64{Int64: 0, Valid: true},
+		FieldSubType: sql.NullInt64{Int64: 0, Valid: true},
 	}
 }

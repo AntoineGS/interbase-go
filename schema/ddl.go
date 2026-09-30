@@ -1534,11 +1534,176 @@ func (f Function) ReturnTypeWithOptions(options DDLOptions) (string, error) {
 	return "", unsupportedDDL("external function", f.Name, fmt.Sprintf("no argument at return position %d", f.ReturnArgument.Int64))
 }
 
-// GenerateDDL is intentionally unsupported: external function declarations
-// can contain platform-specific calling conventions that this read-only
-// metadata projection does not fully capture.
+// GenerateDDL reconstructs an external-function declaration only when the
+// catalog facts completely identify its ordered inputs, return convention and
+// library entry point. It never loads or invokes the external function.
 func (f Function) GenerateDDL() (string, error) {
-	return "", unsupportedDDL("external function", f.Name, "external calling convention metadata is read-only")
+	unsupported := func(feature string) (string, error) {
+		return "", unsupportedDDL("external function", f.Name, feature)
+	}
+	if !f.ReturnArgument.Valid || f.ReturnArgument.Int64 < 0 {
+		return unsupported("return argument position is unavailable or invalid")
+	}
+	if len(f.Arguments) == 0 {
+		return unsupported("function arguments are unavailable")
+	}
+	if !f.ModuleName.Valid || f.ModuleName.String == "" || strings.IndexByte(f.ModuleName.String, 0) >= 0 {
+		return unsupported("module name is unavailable or invalid")
+	}
+	if !f.EntryPoint.Valid || f.EntryPoint.String == "" || strings.IndexByte(f.EntryPoint.String, 0) >= 0 {
+		return unsupported("entry point is unavailable or invalid")
+	}
+
+	renderer, err := newDDLRenderer(DDLOptions{})
+	if err != nil {
+		return "", err
+	}
+	name, err := renderer.identifier(f.Name, "external function name")
+	if err != nil {
+		return unsupported(err.Error())
+	}
+	entryPoint, err := externalFunctionStringLiteral(f.EntryPoint.String, "entry point")
+	if err != nil {
+		return unsupported(err.Error())
+	}
+	moduleName, err := externalFunctionStringLiteral(f.ModuleName.String, "module name")
+	if err != nil {
+		return unsupported(err.Error())
+	}
+
+	arguments := make([]FunctionArgument, len(f.Arguments))
+	copy(arguments, f.Arguments)
+	for i, argument := range arguments {
+		if !argument.Position.Valid || argument.Position.Int64 < 0 {
+			return unsupported(fmt.Sprintf("argument %d position is unavailable or invalid", i+1))
+		}
+		if argument.FunctionName != f.Name {
+			return unsupported(fmt.Sprintf("argument %d does not identify this function", i+1))
+		}
+		if !argument.Mechanism.Valid {
+			return unsupported(fmt.Sprintf("argument at position %d mechanism is unavailable", argument.Position.Int64))
+		}
+		if i > 0 && arguments[i-1].Position.Int64 >= argument.Position.Int64 {
+			return unsupported("argument positions are duplicated or out of order")
+		}
+	}
+
+	returnPosition := f.ReturnArgument.Int64
+	var returnArgument *FunctionArgument
+	for i := range arguments {
+		if arguments[i].Position.Int64 == returnPosition {
+			returnArgument = &arguments[i]
+			break
+		}
+	}
+	if returnArgument == nil {
+		return unsupported(fmt.Sprintf("no argument at return position %d", returnPosition))
+	}
+	if returnArgument.FieldType.Valid && returnArgument.FieldType.Int64 == fieldTypeCString {
+		// The catalog does not preserve FREE_IT, so a CSTRING return cannot be
+		// declared without guessing a memory-management convention.
+		return unsupported("CSTRING return does not preserve the FREE_IT convention")
+	}
+
+	var inputArguments []FunctionArgument
+	returnClause := ""
+	if returnPosition == 0 {
+		if arguments[0].Position.Int64 != 0 {
+			return unsupported("arguments do not include the separate return value at position 0")
+		}
+		for i, argument := range arguments {
+			if argument.Position.Int64 != int64(i) {
+				return unsupported("argument positions are not contiguous from the return value")
+			}
+		}
+		inputArguments = arguments[1:]
+		returnType, err := returnArgument.SQLTypeWithOptions(DDLOptions{})
+		if err != nil {
+			return unsupported(err.Error())
+		}
+		returnClause = "RETURNS " + returnType
+		mechanismClause, err := externalReturnMechanism(returnArgument.Mechanism.Int64)
+		if err != nil {
+			return unsupported(err.Error())
+		}
+		returnClause += mechanismClause
+	} else {
+		if arguments[0].Position.Int64 != 1 {
+			return unsupported("parameter return has an ambiguous zero-based argument")
+		}
+		for i, argument := range arguments {
+			if argument.Position.Int64 != int64(i+1) {
+				return unsupported("parameter positions are not contiguous from 1")
+			}
+		}
+		if returnPosition > int64(len(arguments)) {
+			return unsupported(fmt.Sprintf("return parameter %d is outside the ordered input arguments", returnPosition))
+		}
+		inputArguments = arguments
+		returnClause = fmt.Sprintf("RETURNS PARAMETER %d", returnPosition)
+	}
+
+	inputDeclarations := make([]string, 0, len(inputArguments))
+	for _, argument := range inputArguments {
+		typeName, err := argument.SQLTypeWithOptions(DDLOptions{})
+		if err != nil {
+			return unsupported(err.Error())
+		}
+		mechanism, err := externalInputMechanism(argument.Mechanism.Int64)
+		if err != nil {
+			return unsupported(fmt.Sprintf("argument at position %d: %s", argument.Position.Int64, err.Error()))
+		}
+		inputDeclarations = append(inputDeclarations, typeName+mechanism)
+	}
+
+	var builder strings.Builder
+	builder.WriteString("DECLARE EXTERNAL FUNCTION ")
+	builder.WriteString(name)
+	if len(inputDeclarations) != 0 {
+		builder.WriteByte(' ')
+		builder.WriteString(strings.Join(inputDeclarations, ", "))
+	}
+	builder.WriteByte(' ')
+	builder.WriteString(returnClause)
+	builder.WriteString(" ENTRY_POINT ")
+	builder.WriteString(entryPoint)
+	builder.WriteString(" MODULE_NAME ")
+	builder.WriteString(moduleName)
+	return builder.String(), nil
+}
+
+func externalInputMechanism(mechanism int64) (string, error) {
+	switch mechanism {
+	case 1: // BY REFERENCE is the declaration default.
+		return "", nil
+	case 2:
+		return " BY DESCRIPTOR", nil
+	default:
+		return "", fmt.Errorf("unsupported input mechanism %d", mechanism)
+	}
+}
+
+func externalReturnMechanism(mechanism int64) (string, error) {
+	switch mechanism {
+	case 0:
+		return " BY VALUE", nil
+	case 1: // BY REFERENCE is the declaration default.
+		return "", nil
+	case 2:
+		return " BY DESCRIPTOR", nil
+	default:
+		return "", fmt.Errorf("unsupported return mechanism %d", mechanism)
+	}
+}
+
+func externalFunctionStringLiteral(value, label string) (string, error) {
+	if value == "" {
+		return "", fmt.Errorf("%s is empty", label)
+	}
+	if strings.IndexByte(value, 0) >= 0 {
+		return "", fmt.Errorf("%s contains NUL", label)
+	}
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'", nil
 }
 
 // GenerateDDL is intentionally unsupported for database extension files.

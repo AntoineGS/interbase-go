@@ -383,6 +383,102 @@ func (c *Catalog) Relations(ctx context.Context, name string) ([]Relation, error
 	return c.relations(ctx, name, "")
 }
 
+// SystemRelations returns relations whose RDB$SYSTEM_FLAG is nonzero and whose
+// name matches exactly. An empty name lists all system relations in catalog
+// order. The returned relations are summaries; their columns and DDL metadata
+// are not loaded.
+func (c *Catalog) SystemRelations(ctx context.Context, name string) ([]Relation, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	if c == nil || c.queryer == nil {
+		return nil, ErrNilQueryer
+	}
+
+	projection, err := c.relationProjection(ctx)
+	if err != nil {
+		return nil, err
+	}
+	query := projection + "\nWHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) <> 0"
+	args := make([]any, 0, 1)
+	if name != "" {
+		query += "\n  AND r.RDB$RELATION_NAME = ?"
+		args = append(args, name)
+	}
+	query += "\nORDER BY r.RDB$RELATION_NAME"
+
+	rows, err := c.query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("schema: query system relations: %w", err)
+	}
+	result := make([]Relation, 0)
+	for rows.Next() {
+		var (
+			nameValue sql.NullString
+			relation  Relation
+			kindValue sql.NullInt64
+		)
+		if err := rows.Scan(
+			&nameValue, &relation.ID, &relation.ViewSource,
+			&relation.Description, &relation.SecurityClass, &relation.OwnerName,
+			&relation.DefaultClass, &relation.DBKeyLength, &relation.Format,
+			&relation.ExternalFile, &relation.Flags, &relation.RelationType,
+			&relation.SystemFlag, &kindValue,
+		); err != nil {
+			return nil, fmt.Errorf("schema: scan system relation: %w", closeRows(rows, err))
+		}
+		relation.Name, err = requiredIdentifier(nameValue, "system relation name")
+		if err != nil {
+			return nil, fmt.Errorf("schema: scan system relation: %w", closeRows(rows, err))
+		}
+		switch {
+		case kindValue.Valid && kindValue.Int64 == 0:
+			relation.Kind = RelationTable
+		case kindValue.Valid && kindValue.Int64 == 1:
+			relation.Kind = RelationView
+		default:
+			return nil, fmt.Errorf("schema: scan system relation: %w", closeRows(rows, errors.New("relation kind is invalid")))
+		}
+		relation.SecurityClass = trimIdentifier(relation.SecurityClass)
+		relation.OwnerName = trimIdentifier(relation.OwnerName)
+		relation.DefaultClass = trimIdentifier(relation.DefaultClass)
+		relation.RelationType = trimIdentifier(relation.RelationType)
+		result = append(result, relation)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("schema: iterate system relations: %w", closeRows(rows, err))
+	}
+	if err := closeRows(rows, nil); err != nil {
+		return nil, fmt.Errorf("schema: close system relations: %w", err)
+	}
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// SystemRelation returns the exact system relation and its ordered columns, or
+// nil when no relation with that exact name has a nonzero system flag. It does
+// not load constraints, indexes, triggers, or generated DDL.
+func (c *Catalog) SystemRelation(ctx context.Context, name string) (*Relation, error) {
+	if name == "" {
+		return nil, errors.New("schema: system relation name is required")
+	}
+	relations, err := c.SystemRelations(ctx, name)
+	if err != nil || len(relations) == 0 {
+		return nil, err
+	}
+	if len(relations) != 1 {
+		return nil, fmt.Errorf("schema: system relation %q returned multiple catalog rows", name)
+	}
+	columns, err := c.Columns(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("schema: load columns for system relation %q: %w", name, err)
+	}
+	relations[0].Columns = columns
+	return &relations[0], nil
+}
+
 // Table returns the matching table, or nil when no such user table exists.
 func (c *Catalog) Table(ctx context.Context, name string) (*Relation, error) {
 	if name == "" {

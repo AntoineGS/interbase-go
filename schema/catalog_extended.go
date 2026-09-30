@@ -126,6 +126,13 @@ type Function struct {
 	Arguments      []FunctionArgument
 }
 
+// Exception describes one user-defined exception and its nullable message.
+type Exception struct {
+	Name    string
+	Number  sql.NullInt64
+	Message sql.NullString
+}
+
 // ExternalFunction is a descriptive alias for Function.
 type ExternalFunction = Function
 
@@ -195,6 +202,10 @@ LEFT JOIN RDB$COLLATIONS co
 const sequenceQueryTemplate = `
 SELECT %s, g.RDB$GENERATOR_ID, g.RDB$SYSTEM_FLAG
 FROM RDB$GENERATORS g`
+
+const exceptionQueryTemplate = `
+SELECT %s, e.RDB$EXCEPTION_NUMBER, e.RDB$MESSAGE
+FROM RDB$EXCEPTIONS e`
 
 const indexQueryTemplate = `
 SELECT %s, %s, i.RDB$INDEX_ID,
@@ -452,6 +463,104 @@ func (c *Catalog) Sequence(ctx context.Context, name string) (*Sequence, error) 
 // Generator is an alias for Sequence.
 func (c *Catalog) Generator(ctx context.Context, name string) (*Sequence, error) {
 	return c.Sequence(ctx, name)
+}
+
+// GeneratorValue returns a generator's current signed value without changing
+// it. The query uses the exact quoted identifier and GEN_ID increment zero;
+// transaction ownership remains with the supplied queryer.
+func (c *Catalog) GeneratorValue(ctx context.Context, name string) (int64, error) {
+	if name == "" {
+		return 0, errors.New("schema: generator name is required")
+	}
+	if err := c.ready(ctx); err != nil {
+		return 0, err
+	}
+	quotedName, err := quoteIdentifier(name)
+	if err != nil {
+		return 0, fmt.Errorf("schema: quote generator name: %w", err)
+	}
+	query := "SELECT GEN_ID(" + quotedName + ", 0) FROM RDB$DATABASE"
+	rows, err := c.query(ctx, query)
+	if err != nil {
+		return 0, fmt.Errorf("schema: read generator value for %q: %w", name, err)
+	}
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, fmt.Errorf("schema: read generator value for %q: %w", name, closeRows(rows, err))
+		}
+		if err := closeRows(rows, nil); err != nil {
+			return 0, fmt.Errorf("schema: close generator value for %q: %w", name, err)
+		}
+		return 0, fmt.Errorf("schema: read generator value for %q: %w", name, sql.ErrNoRows)
+	}
+	var value int64
+	if err := rows.Scan(&value); err != nil {
+		return 0, fmt.Errorf("schema: scan generator value for %q: %w", name, closeRows(rows, err))
+	}
+	if rows.Next() {
+		return 0, fmt.Errorf("schema: read generator value for %q: %w", name, closeRows(rows, errors.New("multiple scalar rows returned")))
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("schema: read generator value for %q: %w", name, closeRows(rows, err))
+	}
+	if err := closeRows(rows, nil); err != nil {
+		return 0, fmt.Errorf("schema: close generator value for %q: %w", name, err)
+	}
+	if err := contextErr(ctx); err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+// Exceptions returns user-defined exceptions matching name exactly. An empty
+// name lists all exceptions in catalog order. Message preserves NULL
+// separately from an empty string.
+func (c *Catalog) Exceptions(ctx context.Context, name string) ([]Exception, error) {
+	if err := c.ready(ctx); err != nil {
+		return nil, err
+	}
+	query, err := c.extendedProjectionQuery(ctx, exceptionQueryTemplate,
+		extendedIdentifierSpec{"RDB$EXCEPTIONS", "RDB$EXCEPTION_NAME", "e.RDB$EXCEPTION_NAME", "RDB$EXCEPTION_NAME"},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("schema: build exception query: %w", err)
+	}
+	args := make([]any, 0, 1)
+	if name != "" {
+		query += "\nWHERE e.RDB$EXCEPTION_NAME = ?"
+		args = append(args, name)
+	}
+	query += "\nORDER BY e.RDB$EXCEPTION_NAME"
+	rows, err := c.query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("schema: query exceptions: %w", err)
+	}
+	result := make([]Exception, 0)
+	for rows.Next() {
+		var raw struct {
+			name    sql.NullString
+			number  sql.NullInt64
+			message sql.NullString
+		}
+		if err := rows.Scan(&raw.name, &raw.number, &raw.message); err != nil {
+			return nil, fmt.Errorf("schema: scan exception: %w", closeRows(rows, err))
+		}
+		exceptionName, err := requiredIdentifier(raw.name, "exception name")
+		if err != nil {
+			return nil, fmt.Errorf("schema: scan exception: %w", closeRows(rows, err))
+		}
+		result = append(result, Exception{Name: exceptionName, Number: raw.number, Message: raw.message})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("schema: iterate exceptions: %w", closeRows(rows, err))
+	}
+	if err := closeRows(rows, nil); err != nil {
+		return nil, fmt.Errorf("schema: close exceptions: %w", err)
+	}
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // Indexes returns user indexes matching name exactly. An empty name returns

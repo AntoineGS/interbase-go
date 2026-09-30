@@ -71,7 +71,7 @@ func TestRelationsAndViewsPreserveMetadataAndReturnCatalogOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Relations returned error: %v", err)
 	}
-	if names := relationNames(relations); !reflect.DeepEqual(names, []string{"AUDIT", "CUSTOMER_VIEW", "ORDERS", "OTHER_VIEW"}) {
+	if names := relationNames(relations); !reflect.DeepEqual(names, []string{"AUDIT", "CUSTOMER_VIEW", "ORDERS", "OTHER_VIEW", "RDB$USER_TABLE"}) {
 		t.Fatalf("relation names = %#v, want catalog order", names)
 	}
 	if relations[1].Kind != RelationView {
@@ -86,7 +86,7 @@ func TestRelationsAndViewsPreserveMetadataAndReturnCatalogOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tables returned error: %v", err)
 	}
-	if names := relationNames(tables); !reflect.DeepEqual(names, []string{"AUDIT", "ORDERS"}) {
+	if names := relationNames(tables); !reflect.DeepEqual(names, []string{"AUDIT", "ORDERS", "RDB$USER_TABLE"}) {
 		t.Fatalf("table names = %#v, want user tables only", names)
 	}
 
@@ -131,6 +131,91 @@ func TestRelationsAndViewsPreserveMetadataAndReturnCatalogOrder(t *testing.T) {
 				t.Fatalf("view column query lacks name/context join constraint: %s", call.query)
 			}
 		}
+	}
+}
+
+func TestCatalogSystemRelationsAndSystemRelation(t *testing.T) {
+	db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+	defer db.Close()
+	catalog := New(db)
+	ctx := context.Background()
+
+	userRelations, err := catalog.Relations(ctx, "")
+	if err != nil {
+		t.Fatalf("Relations returned error: %v", err)
+	}
+	if names := relationNames(userRelations); !reflect.DeepEqual(names, []string{"AUDIT", "CUSTOMER_VIEW", "ORDERS", "OTHER_VIEW", "RDB$USER_TABLE"}) {
+		t.Fatalf("Relations names = %#v, want zero/NULL system flags including the RDB$-prefixed user relation", names)
+	}
+	if userRelations[len(userRelations)-1].SystemFlag.Valid {
+		t.Fatalf("RDB$-prefixed user relation system flag = %#v, want NULL", userRelations[len(userRelations)-1].SystemFlag)
+	}
+
+	before := len(state.callsSnapshot())
+	systemRelations, err := catalog.SystemRelations(ctx, "")
+	if err != nil {
+		t.Fatalf("SystemRelations returned error: %v", err)
+	}
+	if len(systemRelations) != 1 || systemRelations[0].Name != "MiXeD_System" || !systemRelations[0].SystemFlag.Valid || systemRelations[0].SystemFlag.Int64 != 1 {
+		t.Fatalf("SystemRelations = %#v, want only the exact non-prefixed relation with nonzero system flag", systemRelations)
+	}
+	if len(systemRelations[0].Columns) != 0 || systemRelations[0].ConstraintsLoaded || systemRelations[0].IndexesLoaded || systemRelations[0].TriggersLoaded {
+		t.Fatalf("SystemRelations loaded detail metadata: %#v, want summary only", systemRelations[0])
+	}
+	for _, call := range state.callsSnapshot()[before:] {
+		if fixtureQueryKind(call.query) == "columns" {
+			t.Fatalf("SystemRelations bulk-loaded columns with query %q", call.query)
+		}
+	}
+	systemQuery := ""
+	for _, call := range state.callsSnapshot() {
+		if fixtureQueryKind(call.query) == "relations" && strings.Contains(strings.ToUpper(call.query), "COALESCE(R.RDB$SYSTEM_FLAG, 0) <> 0") {
+			systemQuery = call.query
+			break
+		}
+	}
+	if !strings.Contains(strings.ToUpper(systemQuery), "COALESCE(R.RDB$SYSTEM_FLAG, 0) <> 0") {
+		t.Fatalf("SystemRelations query = %q, want the nonzero system-flag predicate", systemQuery)
+	}
+
+	selected, err := catalog.SystemRelations(ctx, "MiXeD_System")
+	if err != nil || len(selected) != 1 || selected[0].Name != "MiXeD_System" {
+		t.Fatalf("exact SystemRelations lookup = (%#v, %v), want exact-case match", selected, err)
+	}
+	caseMismatch, err := catalog.SystemRelations(ctx, "mixed_system")
+	if err != nil || len(caseMismatch) != 0 {
+		t.Fatalf("case-mismatched SystemRelations lookup = (%#v, %v), want empty", caseMismatch, err)
+	}
+	missing, err := catalog.SystemRelations(ctx, "MISSING_SYSTEM")
+	if err != nil || len(missing) != 0 {
+		t.Fatalf("missing SystemRelations lookup = (%#v, %v), want empty", missing, err)
+	}
+
+	selectedRelation, err := catalog.SystemRelation(ctx, "MiXeD_System")
+	if err != nil {
+		t.Fatalf("SystemRelation returned error: %v", err)
+	}
+	if selectedRelation == nil || selectedRelation.Name != "MiXeD_System" {
+		t.Fatalf("SystemRelation = %#v, want exact selected system relation", selectedRelation)
+	}
+	if names := columnNames(selectedRelation.Columns); !reflect.DeepEqual(names, []string{"Z_FIRST", "A_SECOND"}) {
+		t.Fatalf("SystemRelation column names = %#v, want RDB$FIELD_POSITION order, not alphabetical order", names)
+	}
+	if selectedRelation.ConstraintsLoaded || selectedRelation.IndexesLoaded || selectedRelation.TriggersLoaded {
+		t.Fatalf("SystemRelation loaded non-column detail metadata: %#v", selectedRelation)
+	}
+	columnQuery := fixtureCallQuery(t, state.callsSnapshot(), "columns")
+	if !strings.Contains(strings.ToUpper(columnQuery), "ORDER BY RF.RDB$FIELD_POSITION") {
+		t.Fatalf("SystemRelation column query = %q, want field-position ordering", columnQuery)
+	}
+
+	missingRelation, err := catalog.SystemRelation(ctx, "MISSING_SYSTEM")
+	if err != nil || missingRelation != nil {
+		t.Fatalf("missing SystemRelation = (%#v, %v), want nil", missingRelation, err)
+	}
+	userRelation, err := catalog.SystemRelation(ctx, "RDB$USER_TABLE")
+	if err != nil || userRelation != nil {
+		t.Fatalf("RDB$-prefixed user SystemRelation = (%#v, %v), want nil", userRelation, err)
 	}
 }
 
@@ -857,6 +942,14 @@ func relationNames(relations []Relation) []string {
 	return names
 }
 
+func columnNames(columns []Column) []string {
+	names := make([]string, 0, len(columns))
+	for _, column := range columns {
+		names = append(names, column.Name)
+	}
+	return names
+}
+
 func parameterNames(parameters []ProcedureParameter) []string {
 	names := make([]string, 0, len(parameters))
 	for _, parameter := range parameters {
@@ -1179,12 +1272,16 @@ func fixtureQueryKind(query string) string {
 	upper := strings.ToUpper(query)
 	normalized := normalizeFixtureSQL(query)
 	switch {
+	case strings.Contains(upper, "GEN_ID("):
+		return "generator_value"
 	case strings.HasPrefix(normalized, "SELECT CAST(RF.RDB$RELATION_NAME AS VARCHAR("):
 		return "identifier_widths"
 	case strings.Contains(upper, "FROM RDB$RELATION_FIELDS RF") && strings.Contains(upper, "SELECT F.RDB$FIELD_LENGTH"):
 		return "identifier_width_bootstrap"
 	case strings.Contains(upper, "FROM RDB$FIELDS"):
 		return "domains"
+	case strings.Contains(upper, "FROM RDB$EXCEPTIONS"):
+		return "exceptions"
 	case strings.Contains(upper, "FROM RDB$GENERATORS"):
 		return "sequences"
 	case strings.Contains(upper, "FROM RDB$INDEX_SEGMENTS"):
@@ -1239,6 +1336,8 @@ func fixtureResult(kind, query string, args []driver.NamedValue) ([]string, [][]
 	switch kind {
 	case "relations":
 		upper := strings.ToUpper(query)
+		userOnly := strings.Contains(upper, "COALESCE(R.RDB$SYSTEM_FLAG, 0) = 0")
+		systemOnly := strings.Contains(upper, "COALESCE(R.RDB$SYSTEM_FLAG, 0) <> 0")
 		wantKind := RelationKind("")
 		if strings.Contains(upper, "AND R.RDB$VIEW_BLR IS NULL") {
 			wantKind = RelationTable
@@ -1251,6 +1350,11 @@ func fixtureResult(kind, query string, args []driver.NamedValue) ([]string, [][]
 			relations = fixtureFullIdentifierRelations()
 		}
 		for _, relation := range relations {
+			flag, isInt64 := relation.values[12].(int64)
+			isSystem := isInt64 && flag != 0
+			if userOnly && isSystem || systemOnly && !isSystem {
+				continue
+			}
 			if wantKind != "" && relation.kind != wantKind {
 				continue
 			}
@@ -1293,6 +1397,16 @@ func fixtureResult(kind, query string, args []driver.NamedValue) ([]string, [][]
 			}
 		}
 		return relationColumnsResult, nil, nil
+	case "exceptions":
+		values := make([][]driver.Value, 0)
+		for _, exception := range fixtureExceptions() {
+			if filter == "" || exception.name == filter {
+				values = append(values, exception.values)
+			}
+		}
+		return exceptionResultColumns, values, nil
+	case "generator_value":
+		return []string{"GENERATOR_VALUE"}, [][]driver.Value{{int64(-9007199254740993)}}, nil
 	case "domains":
 		values := make([][]driver.Value, 0)
 		excludeImplicitNames := strings.Contains(strings.ToUpper(query), "RDB$FIELD_NAME NOT STARTING WITH 'RDB$'")
@@ -1548,6 +1662,7 @@ JOIN RDB$FIELDS f ON rf.RDB$FIELD_SOURCE = f.RDB$FIELD_NAME`)
 		{"RDB$DEPENDENCIES      ", "RDB$DEPENDED_ON_NAME     ", int64(67)},
 		{"RDB$FUNCTIONS      ", "RDB$FUNCTION_NAME     ", int64(67)},
 		{"RDB$FUNCTION_ARGUMENTS      ", "RDB$FUNCTION_NAME     ", int64(67)},
+		{"RDB$EXCEPTIONS      ", "RDB$EXCEPTION_NAME     ", int64(31)},
 		{"RDB$USER_PRIVILEGES      ", "RDB$RELATION_NAME     ", int64(67)},
 		{"RDB$USER_PRIVILEGES      ", "RDB$FIELD_NAME     ", int64(67)},
 	}, nil
@@ -1589,6 +1704,8 @@ func fixtureScanFailureValues(kind string, values [][]driver.Value) [][]driver.V
 	switch kind {
 	case "relations", "procedures":
 		result[0][1] = "not an integer"
+	case "generator_value":
+		result[0][0] = "not an integer"
 	case "columns":
 		result[0][3] = "not an integer"
 	case "parameters":
@@ -1670,6 +1787,11 @@ type fixtureSequence struct {
 	values []driver.Value
 }
 
+type fixtureException struct {
+	name   string
+	values []driver.Value
+}
+
 type fixtureIndex struct {
 	name         string
 	relationName string
@@ -1729,6 +1851,8 @@ var domainResultColumns = []string{
 
 var sequenceResultColumns = []string{"GENERATOR_NAME", "GENERATOR_ID", "SYSTEM_FLAG"}
 
+var exceptionResultColumns = []string{"EXCEPTION_NAME", "EXCEPTION_NUMBER", "MESSAGE"}
+
 var indexResultColumns = []string{
 	"INDEX_NAME", "RELATION_NAME", "INDEX_ID", "UNIQUE_FLAG", "DESCRIPTION", "SEGMENT_COUNT", "INDEX_INACTIVE", "INDEX_TYPE", "FOREIGN_KEY", "SYSTEM_FLAG", "EXPRESSION_SOURCE", "STATISTICS", "CONSTRAINT_NAME",
 }
@@ -1785,6 +1909,14 @@ func fixtureSequences() []fixtureSequence {
 		name:   "GO_SEQUENCE",
 		values: []driver.Value{"GO_SEQUENCE       ", int64(7), int64(0)},
 	}}
+}
+
+func fixtureExceptions() []fixtureException {
+	return []fixtureException{
+		{name: "EMPTY_EXCEPTION", values: []driver.Value{"EMPTY_EXCEPTION               ", int64(40), ""}},
+		{name: "MiXeD_Exception", values: []driver.Value{"MiXeD_Exception              ", int64(42), "MDE L'Caf" + string([]byte{0xe9}) + ` "ok"`}},
+		{name: "NULL_EXCEPTION", values: []driver.Value{"NULL_EXCEPTION                ", int64(43), nil}},
+	}
 }
 
 func fixtureIndexes() []fixtureIndex {
@@ -1907,7 +2039,36 @@ func fixtureRelations() []fixtureRelation {
 			values:  []driver.Value{"OTHER_VIEW    ", int64(10), "SELECT  OTHER_ID  FROM SECOND_ORDERS\n", nil, "SQL$VIEW", "SYSDBA", nil, int64(8), int64(5), nil, int64(0), "VIEW                          ", int64(0), int64(1)},
 			columns: [][]driver.Value{fixtureOtherViewColumn()},
 		},
+		{
+			name: "RDB$USER_TABLE", kind: RelationTable,
+			values: []driver.Value{"RDB$USER_TABLE" + strings.Repeat(" ", 67-len("RDB$USER_TABLE")), int64(11), nil, nil, nil, "SYSDBA", nil, int64(8), int64(6), nil, int64(0), "PERSISTENT                     ", nil, int64(0)},
+		},
+		fixtureSystemRelation(),
 	}
+}
+
+func fixtureSystemRelation() fixtureRelation {
+	const name = "MiXeD_System"
+	return fixtureRelation{
+		name:   name,
+		kind:   RelationTable,
+		values: []driver.Value{name + strings.Repeat(" ", 67-len(name)), int64(12), nil, nil, nil, "SYSDBA", nil, int64(8), int64(7), nil, int64(0), "PERSISTENT                     ", int64(1), int64(0)},
+		columns: [][]driver.Value{
+			fixtureSystemColumn(name, "Z_FIRST", 0),
+			fixtureSystemColumn(name, "A_SECOND", 1),
+		},
+	}
+}
+
+func fixtureSystemColumn(relationName, columnName string, position int64) []driver.Value {
+	column := append([]driver.Value(nil), fixtureOrderIDColumn()...)
+	column[0] = columnName + strings.Repeat(" ", 31-len(columnName))
+	column[1] = relationName + strings.Repeat(" ", 31-len(relationName))
+	domainName := "RDB$SYS_" + columnName
+	column[2] = domainName + strings.Repeat(" ", 31-len(domainName))
+	column[3] = position
+	column[14] = column[2]
+	return column
 }
 
 func fixtureFullIdentifierRelations() []fixtureRelation {
