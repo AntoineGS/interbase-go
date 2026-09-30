@@ -466,20 +466,32 @@ func (c *Catalog) Generator(ctx context.Context, name string) (*Sequence, error)
 }
 
 // GeneratorValue returns a generator's current signed value without changing
-// it. The query uses the exact quoted identifier and GEN_ID increment zero;
-// transaction ownership remains with the supplied queryer.
+// it. Dialect 3 identifier quoting is used by default; transaction ownership
+// remains with the supplied queryer.
 func (c *Catalog) GeneratorValue(ctx context.Context, name string) (int64, error) {
+	return c.GeneratorValueWithOptions(ctx, name, DDLOptions{})
+}
+
+// GeneratorValueWithOptions returns a generator's current signed value using
+// an identifier representation valid for the requested SQL dialect. The
+// query uses GEN_ID increment zero and transaction ownership remains with the
+// supplied queryer.
+func (c *Catalog) GeneratorValueWithOptions(ctx context.Context, name string, options DDLOptions) (int64, error) {
 	if name == "" {
 		return 0, errors.New("schema: generator name is required")
 	}
 	if err := c.ready(ctx); err != nil {
 		return 0, err
 	}
-	quotedName, err := quoteIdentifier(name)
+	renderer, err := newDDLRenderer(options)
 	if err != nil {
-		return 0, fmt.Errorf("schema: quote generator name: %w", err)
+		return 0, err
 	}
-	query := "SELECT GEN_ID(" + quotedName + ", 0) FROM RDB$DATABASE"
+	identifier, err := renderer.identifier(name, "generator name")
+	if err != nil {
+		return 0, err
+	}
+	query := "SELECT GEN_ID(" + identifier + ", 0) FROM RDB$DATABASE"
 	rows, err := c.query(ctx, query)
 	if err != nil {
 		return 0, fmt.Errorf("schema: read generator value for %q: %w", name, err)

@@ -1782,6 +1782,51 @@ func TestCatalogGeneratorValueUsesExactQuotedIdentifierAndZeroIncrement(t *testi
 	}
 }
 
+func TestCatalogGeneratorValueWithOptionsUsesDialectIdentifiers(t *testing.T) {
+	t.Run("dialect 1 regular identifier", func(t *testing.T) {
+		db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+		defer db.Close()
+		got, err := New(db).GeneratorValueWithOptions(context.Background(), "GENERATOR_1$", DDLOptions{Dialect: Dialect1})
+		if err != nil {
+			t.Fatalf("GeneratorValueWithOptions returned error: %v", err)
+		}
+		if got != -9007199254740993 {
+			t.Fatalf("GeneratorValueWithOptions = %d, want signed value -9007199254740993", got)
+		}
+		call := fixtureCallForKind(t, state.callsSnapshot(), "generator_value")
+		wantQuery := `SELECT GEN_ID(GENERATOR_1$, 0) FROM RDB$DATABASE`
+		if normalizeFixtureSQL(call.query) != normalizeFixtureSQL(wantQuery) {
+			t.Fatalf("dialect 1 generator query = %q, want unquoted regular identifier query %q", call.query, wantQuery)
+		}
+	})
+
+	for _, name := range []string{"MiXeD_GENERATOR", "GENERATOR-NAME", "1GENERATOR"} {
+		t.Run("dialect 1 rejects "+name, func(t *testing.T) {
+			db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+			defer db.Close()
+			_, err := New(db).GeneratorValueWithOptions(context.Background(), name, DDLOptions{Dialect: Dialect1})
+			if err == nil || !strings.Contains(err.Error(), "cannot be represented in SQL dialect 1") {
+				t.Fatalf("GeneratorValueWithOptions error = %v, want explicit dialect 1 identifier error", err)
+			}
+			if calls := state.callsSnapshot(); len(calls) != 0 {
+				t.Fatalf("invalid dialect 1 identifier issued database calls: %#v", calls)
+			}
+		})
+	}
+
+	t.Run("invalid dialect", func(t *testing.T) {
+		db, state := openFixtureDBWithOptions(t, fixtureOptions{})
+		defer db.Close()
+		_, err := New(db).GeneratorValueWithOptions(context.Background(), "GENERATOR", DDLOptions{Dialect: 9})
+		if err == nil || !strings.Contains(err.Error(), "unsupported SQL dialect 9") {
+			t.Fatalf("GeneratorValueWithOptions error = %v, want unsupported dialect error", err)
+		}
+		if calls := state.callsSnapshot(); len(calls) != 0 {
+			t.Fatalf("unsupported dialect issued database calls: %#v", calls)
+		}
+	})
+}
+
 func TestCatalogGeneratorValuePropagatesReadScanAndCancellationErrors(t *testing.T) {
 	queryErr := errors.New("generator read failed")
 	t.Run("query error", func(t *testing.T) {
@@ -1860,10 +1905,10 @@ func TestFunctionGenerateDDLRequiresCompleteUnambiguousFacts(t *testing.T) {
 		{name: "missing entry point", mutate: func(f *Function) { f.EntryPoint = sql.NullString{} }},
 		{name: "out of order arguments", mutate: func(f *Function) { f.Arguments[1], f.Arguments[2] = f.Arguments[2], f.Arguments[1] }},
 		{name: "ambiguous duplicate position", mutate: func(f *Function) { f.Arguments = append(f.Arguments, f.Arguments[2]) }},
-		{name: "ambiguous CSTRING FREE_IT fact", mutate: func(f *Function) {
+		{name: "missing CSTRING return mechanism", mutate: func(f *Function) {
 			f.Arguments[0].FieldType = sql.NullInt64{Int64: fieldTypeCString, Valid: true}
 			f.Arguments[0].FieldLength = sql.NullInt64{Int64: 80, Valid: true}
-			f.Arguments[0].Mechanism = sql.NullInt64{Int64: 1, Valid: true}
+			f.Arguments[0].Mechanism = sql.NullInt64{}
 		}},
 	}
 	for _, test := range unsupported {
@@ -1875,6 +1920,77 @@ func TestFunctionGenerateDDLRequiresCompleteUnambiguousFacts(t *testing.T) {
 				t.Fatalf("Function.GenerateDDL = (%q, %v), want empty DDL and ErrUnsupportedDDL", ddl, err)
 			}
 		})
+	}
+}
+
+func TestFunctionGenerateDDLPreservesSignedFreeItReturnMechanisms(t *testing.T) {
+	makeReturn := func(name string, mechanism, fieldType int64) Function {
+		argument := functionArgument(name, 0, mechanism, fieldType)
+		if fieldType == fieldTypeCString {
+			argument.FieldLength = sql.NullInt64{Int64: 80, Valid: true}
+		}
+		return Function{
+			Name:           name,
+			ModuleName:     sql.NullString{String: "ib_udf", Valid: true},
+			EntryPoint:     sql.NullString{String: "Left", Valid: true},
+			ReturnArgument: sql.NullInt64{Int64: 0, Valid: true},
+			Arguments:      []FunctionArgument{argument},
+		}
+	}
+	tests := []struct {
+		name     string
+		function Function
+		want     string
+	}{
+		{
+			name:     "ib_udf CSTRING return with FREE_IT",
+			function: makeReturn("IB_UDF_LEFT", -1, fieldTypeCString),
+			want:     `DECLARE EXTERNAL FUNCTION "IB_UDF_LEFT" RETURNS CSTRING(80) FREE_IT ENTRY_POINT 'Left' MODULE_NAME 'ib_udf'`,
+		},
+		{
+			name:     "CSTRING return without FREE_IT",
+			function: makeReturn("F_CSTRING", 1, fieldTypeCString),
+			want:     `DECLARE EXTERNAL FUNCTION "F_CSTRING" RETURNS CSTRING(80) ENTRY_POINT 'Left' MODULE_NAME 'ib_udf'`,
+		},
+		{
+			name:     "descriptor return with FREE_IT",
+			function: makeReturn("F_DESCRIPTOR", -2, fieldTypeInteger),
+			want:     `DECLARE EXTERNAL FUNCTION "F_DESCRIPTOR" RETURNS INTEGER BY DESCRIPTOR FREE_IT ENTRY_POINT 'Left' MODULE_NAME 'ib_udf'`,
+		},
+		{
+			name:     "reference non-CSTRING return with FREE_IT",
+			function: makeReturn("F_REFERENCE", -1, fieldTypeInteger),
+			want:     `DECLARE EXTERNAL FUNCTION "F_REFERENCE" RETURNS INTEGER FREE_IT ENTRY_POINT 'Left' MODULE_NAME 'ib_udf'`,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.function.GenerateDDL()
+			if err != nil || got != test.want {
+				t.Fatalf("GenerateDDL = (%q, %v), want (%q, nil)", got, err, test.want)
+			}
+		})
+	}
+}
+
+func TestCatalogDecodedCStringReturnRendersFreeIt(t *testing.T) {
+	db := openFixtureDB(t)
+	defer db.Close()
+
+	function, err := New(db).Function(context.Background(), "GO_IB_UDF_LEFT")
+	if err != nil {
+		t.Fatalf("Function returned error: %v", err)
+	}
+	if function == nil || len(function.Arguments) != 1 {
+		t.Fatalf("Function = %#v, want decoded CSTRING return argument", function)
+	}
+	if !function.Arguments[0].Mechanism.Valid || function.Arguments[0].Mechanism.Int64 != -1 {
+		t.Fatalf("decoded return mechanism = %#v, want signed -1 retaining FREE_IT", function.Arguments[0].Mechanism)
+	}
+	got, err := function.GenerateDDL()
+	want := `DECLARE EXTERNAL FUNCTION "GO_IB_UDF_LEFT" RETURNS CSTRING(80) FREE_IT ENTRY_POINT 'Left' MODULE_NAME 'ib_udf'`
+	if err != nil || got != want {
+		t.Fatalf("decoded Function.GenerateDDL = (%q, %v), want (%q, nil)", got, err, want)
 	}
 }
 

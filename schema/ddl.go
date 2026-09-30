@@ -1599,12 +1599,6 @@ func (f Function) GenerateDDL() (string, error) {
 	if returnArgument == nil {
 		return unsupported(fmt.Sprintf("no argument at return position %d", returnPosition))
 	}
-	if returnArgument.FieldType.Valid && returnArgument.FieldType.Int64 == fieldTypeCString {
-		// The catalog does not preserve FREE_IT, so a CSTRING return cannot be
-		// declared without guessing a memory-management convention.
-		return unsupported("CSTRING return does not preserve the FREE_IT convention")
-	}
-
 	var inputArguments []FunctionArgument
 	returnClause := ""
 	if returnPosition == 0 {
@@ -1691,6 +1685,10 @@ func externalReturnMechanism(mechanism int64) (string, error) {
 		return "", nil
 	case 2:
 		return " BY DESCRIPTOR", nil
+	case -1: // Signed catalog mechanism preserves FREE_IT on reference returns.
+		return " FREE_IT", nil
+	case -2:
+		return " BY DESCRIPTOR FREE_IT", nil
 	default:
 		return "", fmt.Errorf("unsupported return mechanism %d", mechanism)
 	}

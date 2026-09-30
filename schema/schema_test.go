@@ -2002,6 +2002,12 @@ func fixtureFunctions() []fixtureFunction {
 			values:    []driver.Value{"GO_EXTERNAL_TEXT ", int64(0), nil, "go_udf.so       ", "go_external_text", int64(0), int64(0)},
 			arguments: [][]driver.Value{{"GO_EXTERNAL_TEXT ", int64(0), int64(1), int64(80), int64(0), int64(40), nil, nil, nil, nil}},
 		},
+		{
+			// ib_udf-style CSTRING return with signed mechanism -1 preserving FREE_IT.
+			name:      "GO_IB_UDF_LEFT",
+			values:    []driver.Value{"GO_IB_UDF_LEFT ", int64(0), nil, "ib_udf          ", "Left            ", int64(0), int64(0)},
+			arguments: [][]driver.Value{{"GO_IB_UDF_LEFT ", int64(0), int64(-1), int64(80), int64(0), int64(40), nil, nil, nil, nil}},
+		},
 	}
 }
 
