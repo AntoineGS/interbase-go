@@ -249,5 +249,6 @@ long-running call, and sustained ordinary traffic can delay lifecycle work. No
 server power-loss durability or additional platform/client-version guarantee
 is implied.
 
-Deferred feature requests are tracked in [TODO.md](TODO.md). The vendor TLS
+Deferred feature requests are tracked as deferred issues in Beads
+(`bd list --status deferred`). The vendor TLS
 hostname-verification defect is outside this hardening scope.

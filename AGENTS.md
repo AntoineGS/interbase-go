@@ -1,51 +1,38 @@
-# Agent Instructions
+# interbase-go
 
-This project uses **bd** (beads) for issue tracking. Run `bd prime` for full workflow context.
+See `README.md` for prerequisites, build and test commands, and
+`docs/production-hardening.md` for the execution contract and repeatable
+checks.
 
-> **Architecture in one line:** Issues live in a local Dolt database
-> (`.beads/dolt/`); cross-machine sync uses `bd dolt push/pull` (a
-> git-compatible protocol), stored under `refs/dolt/data` on your git
-> remote — separate from `refs/heads/*` where your code lives.
-> `.beads/issues.jsonl` is a passive export, not the wire protocol.
->
-> See [sync-concepts](https://github.com/gastownhall/beads/blob/main/docs/core-concepts/sync-concepts.md)
-> for the one-screen overview and anti-patterns (don't treat JSONL as the
-> source of truth; don't `bd import` during normal operation; don't
-> reach for third-party Dolt hosting before trying the default).
+## Work tracking — Beads (required)
 
-## Quick Reference
+Tracked work lives in Beads (`bd`, issue prefix `ibg`); run `bd prime` for
+the command reference. The database lives on the shared Dolt server at
+`~/.beads/shared-server/`, not in the repo, so issue updates never create
+commits. Issue history syncs to `refs/dolt/data` on `origin`: writes
+auto-push (`dolt.auto-push`), and `bd dolt pull` fetches changes made
+elsewhere.
 
-```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work atomically
-bd close <id>         # Complete work
-bd dolt push          # Push beads data to remote
-```
-
-## Non-Interactive Shell Commands
-
-**ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
-
-Shell commands like `cp`, `mv`, and `rm` may be aliased to include `-i` (interactive) mode on some systems, causing the agent to hang indefinitely waiting for y/n input.
-
-**Use these forms instead:**
-```bash
-# Force overwrite without prompting
-cp -f source dest           # NOT: cp source dest
-mv -f source dest           # NOT: mv source dest
-rm -f file                  # NOT: rm file
-
-# For recursive operations
-rm -rf directory            # NOT: rm -r directory
-cp -rf source dest          # NOT: cp -r source dest
-```
-
-**Other commands that may prompt:**
-- `scp` - use `-o BatchMode=yes` for non-interactive
-- `ssh` - use `-o BatchMode=yes` to fail instead of prompting
-- `apt-get` - use `-y` flag
-- `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
+- **History:** `docs/TODO.md` is historical; its last state is commit
+  `a6151db` (`git show a6151db:docs/TODO.md`), and its items are deferred
+  issues. Specs and plans in `docs/superpowers/` are reference/evidence
+  documents, not live checklists. Do not recreate a TODO file.
+- **Find work:** `bd ready`, `bd list` (filter by `--status`, `--label`),
+  `bd search`, `bd show`. Respect dependencies.
+- **Start:** `bd update <id> --claim` (sets `in_progress`) and record the plan
+  with `--design` before writing code.
+- **Complete:** only after the acceptance criteria are verified (tests, vet,
+  native harnesses as applicable). Check each one (`[x]`) with
+  `bd update <id> --acceptance`, then `bd close <id> --reason` with the final
+  summary (what changed, commits, how it was verified).
+- **Defer or put off:** `bd update <id> --status deferred --append-notes`
+  with the reason, what was done so far, and what would unblock it. A
+  deferred issue must never be left `in_progress`.
+- **Partial work or new findings:** record progress with `--append-notes`;
+  create new issues (`bd create`) for follow-ups or bugs discovered, linked
+  with `--deps discovered-from:<id>` or `bd dep add`.
+- Name the issue in the commit message of code done for it. Do not commit
+  merely to synchronize tracking.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:46cd31e7 -->
 ## Beads Issue Tracker

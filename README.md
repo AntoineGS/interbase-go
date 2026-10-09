@@ -599,7 +599,7 @@ do not run untrusted SQL. The supplied probe/tests never call them.
 
 Production-hardening commands and execution semantics are documented in
 [docs/production-hardening.md](docs/production-hardening.md). Deferred feature
-requests are tracked in [docs/TODO.md](docs/TODO.md).
+requests are tracked as deferred issues in Beads (`bd list --status deferred`).
 
 On 2026-09-18, the complete serial DSQL-cancellation verification passed with
 the Linux/amd64 InterBase 15.1 client: `make test` (eight Go packages and eleven
