@@ -179,6 +179,7 @@ const (
 )
 
 type nativeConnection struct {
+	transactionStateOverride  func() nativeHandleState
 	ptr                       *C.ib_connection
 	dialect                   int
 	brokenOverride            func() bool
@@ -813,16 +814,18 @@ func (s *nativeStatement) queryMutating() bool {
 }
 
 type nativeCursor struct {
-	ptr                 *C.ib_cursor
-	nextOverride        func() (bool, error)
-	nextContextOverride func(*nativeCancelOperation) (bool, error)
-	cancelSlotOverride  nativeCancelSlotBackend
-	closeOverride       func() error
-	abortOverride       func() error
-	statement           *nativeStatement
-	explicitTransaction bool
-	directTransaction   *Transaction
-	metadata            []columnMetadata
+	fingerprintValueOverride func(int) (any, error)
+	indicatorOverride        func(int) (uint16, error)
+	ptr                      *C.ib_cursor
+	nextOverride             func() (bool, error)
+	nextContextOverride      func(*nativeCancelOperation) (bool, error)
+	cancelSlotOverride       nativeCancelSlotBackend
+	closeOverride            func() error
+	abortOverride            func() error
+	statement                *nativeStatement
+	explicitTransaction      bool
+	directTransaction        *Transaction
+	metadata                 []columnMetadata
 }
 
 type nativeBlobValue struct {
@@ -1832,6 +1835,9 @@ func (c *nativeConnection) rollbackCleanup() (error, nativeHandleState) {
 }
 
 func (c *nativeConnection) transactionState() nativeHandleState {
+	if c != nil && c.transactionStateOverride != nil {
+		return c.transactionStateOverride()
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if c == nil || c.ptr == nil {
@@ -2325,6 +2331,9 @@ func (c *nativeCursor) setName(name string) error {
 }
 
 func (c *nativeCursor) indicator(index int) (uint16, error) {
+	if c != nil && c.indicatorOverride != nil {
+		return c.indicatorOverride(index)
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if c == nil || c.ptr == nil {
@@ -2370,6 +2379,38 @@ func (c *nativeCursor) value(index int) (driver.Value, error) {
 		}, nil
 	}
 	return value, nil
+}
+
+func (c *nativeCursor) fingerprintValue(index int) (any, error) {
+	if c != nil && c.fingerprintValueOverride != nil {
+		return c.fingerprintValueOverride(index)
+	}
+	release := nativegate.Global.Enter()
+	defer release()
+	if c == nil || c.ptr == nil {
+		return nil, errors.New("native cursor is unavailable")
+	}
+	var view C.ib_value_view
+	var errorPointer *C.char
+	if C.ib_cursor_fingerprint_column(c.ptr, C.size_t(index), &view, &errorPointer) != 0 {
+		return nil, takeNativeError(errorPointer)
+	}
+	value, err := nativeValueView(&view)
+	if blob, ok := value.(nativeBlobValue); ok {
+		return BlobIdentity{High: blob.high, Low: blob.low}, err
+	}
+	return value, err
+}
+
+func (c *nativeCursor) blobReadStats() (int64, int64) {
+	release := nativegate.Global.Enter()
+	defer release()
+	if c == nil || c.ptr == nil {
+		return 0, 0
+	}
+	var opens, bytes C.int64_t
+	C.ib_cursor_blob_read_stats(c.ptr, &opens, &bytes)
+	return int64(opens), int64(bytes)
 }
 
 func nativeValueView(view *C.ib_value_view) (driver.Value, error) {

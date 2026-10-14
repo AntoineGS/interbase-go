@@ -50,6 +50,21 @@ type BlobRef struct {
 	charset    int16
 }
 
+// BlobIdentity is a copied native BLOB ID, not a stream or a content hash.
+// It is meaningful only within the database that produced it.
+type BlobIdentity struct {
+	High int32
+	Low  uint32
+}
+
+// Identity copies the ID without native I/O, even after transaction completion.
+func (r BlobRef) Identity() (BlobIdentity, bool) {
+	if r.attachment == nil || r.tx == nil {
+		return BlobIdentity{}, false
+	}
+	return BlobIdentity{High: r.high, Low: r.low}, true
+}
+
 var (
 	errDirectAttachmentClosed = errors.New("interbase: direct attachment is closed")
 	ErrAttachmentBusy         = errors.New("interbase: direct attachment has active resources")
