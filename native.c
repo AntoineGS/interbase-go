@@ -175,6 +175,8 @@ struct ib_statement {
 };
 
 struct ib_cursor {
+	int64_t blob_opens;
+	int64_t source_bytes;
 	ib_connection *connection;
 	ib_statement *prepared;
 	isc_tr_handle transaction;
@@ -9290,6 +9292,7 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	data = NULL;
 	data_length = 0U;
 	capacity = 0U;
+	cursor->blob_opens++;
 	for (;;) {
 		unsigned short segment_length;
 
@@ -9313,6 +9316,7 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 			ib_give_error(error, first_error);
 			return NULL;
 		}
+		cursor->source_bytes += (int64_t) segment_length;
 		first_error = NULL;
 		if (ib_append_blob_data(&data, &data_length, &capacity, segment,
 			(size_t) segment_length, &first_error) != 0) {
@@ -9376,6 +9380,51 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	}
 	*length = data_length;
 	return data;
+}
+
+void ib_cursor_blob_read_stats(const ib_cursor *cursor, int64_t *opens,
+	int64_t *source_bytes)
+{
+	if (opens != NULL) { *opens = cursor == NULL ? 0 : cursor->blob_opens; }
+	if (source_bytes != NULL) { *source_bytes = cursor == NULL ? 0 : cursor->source_bytes; }
+}
+
+int ib_cursor_fingerprint_column(const ib_cursor *cursor, size_t index,
+	ib_value_view *view, char **error)
+{
+	const XSQLVAR *variable;
+	ISC_QUAD blob_id;
+
+	if (cursor == NULL || cursor->output == NULL || !cursor->fetched ||
+		index >= (size_t) cursor->output->sqld || view == NULL) {
+		return ib_fail(error, "result column is unavailable");
+	}
+	variable = &cursor->output->sqlvar[index];
+	/* Reject even NULL arrays before any array descriptor/slice access. */
+	if (ib_sql_type(variable) == SQL_ARRAY) {
+		return ib_fail(error, "fingerprint rows do not support arrays");
+	}
+	if (!cursor->allow_arrays) {
+		return ib_fail(error, "fingerprint rows require native identity mode");
+	}
+	if (ib_sql_type(variable) == SQL_BLOB) {
+		if (variable->sqldata == NULL ||
+			((variable->sqltype & 1) != 0 && variable->sqlind == NULL)) {
+			return ib_fail(error, "result column storage is unavailable");
+		}
+		memset(view, 0, sizeof(*view));
+		if (variable->sqlind != NULL && *variable->sqlind < 0) {
+			view->kind = IB_VALUE_NULL;
+			return 0;
+		}
+		/* A copied ID needs no stream charset/subtype descriptor lookup. */
+		memcpy(&blob_id, variable->sqldata, sizeof(blob_id));
+		view->kind = IB_VALUE_BLOB_REF;
+		view->blob_high = (int32_t) blob_id.gds_quad_high;
+		view->blob_low = (uint32_t) blob_id.gds_quad_low;
+		return 0;
+	}
+	return ib_cursor_column(cursor, index, view, error);
 }
 
 int ib_cursor_column(const ib_cursor *cursor, size_t index,

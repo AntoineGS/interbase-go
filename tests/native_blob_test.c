@@ -257,6 +257,9 @@ static void test_large_segment_materialization(void)
 	check(data != NULL && error == NULL, "large segmented BLOB read failed");
 	check(open_calls == 1 && close_calls == 1, "large segmented BLOB handle lifecycle is wrong");
 	check(length == 90000U, "large segmented BLOB length changed");
+	int64_t opens, bytes;
+	ib_cursor_blob_read_stats(&cursor, &opens, &bytes);
+	check(opens == 1 && bytes == 90000, "materialization counters changed");
 	for (size_t index = 0U; index < length; index++) {
 		check((unsigned char) data[index] == (unsigned char) (index & 0xffU),
 			"large segmented BLOB data changed");
@@ -920,6 +923,19 @@ static void test_catalog_binary_and_direct_blob_ref_are_unchanged(void)
 	check(open_calls == 0 && open_blob2_calls == 0 && close_calls == 0 &&
 		lookup_desc_calls == 1 && blob_gen_bpb2_calls == 0,
 		"direct BlobRef was materialized or filtered");
+	check(ib_cursor_fingerprint_column(&cursor, 0U, &view, &error) == 0 &&
+		view.kind == IB_VALUE_BLOB_REF && view.blob_high == 17 && view.blob_low == 29U,
+		"fingerprint identity changed");
+	check(lookup_desc_calls == 1, "copied fingerprint ID performed descriptor I/O");
+	int64_t opens, bytes;
+	ib_cursor_blob_read_stats(&cursor, &opens, &bytes);
+	check(opens == 0 && bytes == 0, "identity opened source BLOB");
+	output->sqlvar[0].sqltype = SQL_ARRAY | 1;
+	indicator = -1;
+	check(ib_cursor_fingerprint_column(&cursor, 0U, &view, &error) != 0 && error != NULL,
+		"NULL fingerprint array accessed before rejection");
+	ib_error_free(error);
+	error = NULL;
 	free(output);
 	ib_error_free(error);
 }

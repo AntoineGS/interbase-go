@@ -384,6 +384,36 @@ transaction and become unusable when it completes; cursor, transaction, and
 attachment cleanup closes any remaining native BLOB handles. The standard
 `database/sql` path continues to materialize text and binary BLOBs.
 
+### Catalog fingerprint row reads
+
+`ReadFingerprintRows(ctx, pooled, queries, visitor)` borrows an existing
+`*sql.Conn` through `Raw`; it opens no second attachment. It rejects nil or
+non-driver connections, a nil visitor, active ordinary/distributed transactions,
+arrays, and server classifications other than read-only SELECT. Statements are
+prepared for classification before execution through the direct identity path.
+Use only trusted catalog SQL: SELECT/read-only is not a sandbox for external UDFs.
+
+Each call owns a READ COMMITTED/READ ONLY, record-version transaction, committed
+after successful reads or rolled back on failure. All statements/cursors are
+closed before completion; cleanup failures are joined and invalidate the
+connection. No caller transaction is completed. Cancellation is cooperative
+with the existing native DSQL semantics, not a guaranteed wall-clock limit.
+
+The visitor receives copied columns and `Cell` values, one row at a time; BLOBs
+are copied `BlobIdentity{High int32, Low uint32}` IDs, never opened streams or
+materialized source. NULLs and change indicators are preserved. IDs are scoped
+to the originating database, not content hashes. `BlobRef.Identity()` also
+copies the ID without I/O or exposing attachment/transaction pointers. The
+visitor **must be I/O-free and must not recursively use the borrowed connection**:
+both `Raw` and the driver connection lock remain held. Rows may be retained by
+the caller, which owns any total-memory bound.
+
+`FingerprintReadStats` reports executed queries, visited rows (including a row
+whose visitor fails), actual native BLOB opens, and source bytes read before
+charset conversion, including partial work on errors. Native counters also
+cover ordinary materialization; identity reads report zero opens/bytes. The
+ordinary SQL/direct BLOB behavior and charset policies are unchanged.
+
 ## Supported Boundary
 
 - Client SQL Dialect 3 by default, or Dialect 1 when selected with

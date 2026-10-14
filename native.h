@@ -327,6 +327,10 @@ int ib_cursor_column_indicator(const ib_cursor *cursor, size_t index,
 	uint16_t *indicator, char **error);
 int ib_cursor_column(const ib_cursor *cursor, size_t index,
 	ib_value_view *view, char **error);
+int ib_cursor_fingerprint_column(const ib_cursor *cursor, size_t index,
+	ib_value_view *view, char **error);
+void ib_cursor_blob_read_stats(const ib_cursor *cursor, int64_t *opens,
+	int64_t *source_bytes);
 int ib_array_view_dimensions(const ib_array_view *array);
 size_t ib_array_view_element_count(const ib_array_view *array);
 int ib_array_view_bound(const ib_array_view *array, size_t index,

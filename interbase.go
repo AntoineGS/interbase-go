@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"interbase-go/txcontext"
 )
 
 // TLSConfig contains the InterBase native client TLS attachment options.
@@ -1171,7 +1173,10 @@ func (c *conn) Begin() (driver.Tx, error) {
 }
 
 func (c *conn) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx, error) {
-	if err := contextError(ctx); err != nil {
+	// Only callers opting into explicit ending separate native admission from
+	// database/sql's transaction lifetime. All ordinary contexts are unchanged.
+	admission := txcontext.BeginAdmission(ctx)
+	if err := contextError(admission); err != nil {
 		return nil, err
 	}
 	if err := validateTxOptions(options); err != nil {
@@ -1186,14 +1191,14 @@ func (c *conn) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx
 	if c.closed || c.native == nil || c.native.broken() {
 		return nil, driver.ErrBadConn
 	}
-	if err := contextError(ctx); err != nil {
+	if err := contextError(admission); err != nil {
 		return nil, err
 	}
 	tpb, err := buildTPB(options, c.transactionOptions)
 	if err != nil {
 		return nil, err
 	}
-	releaseNative, err := enterNativeContext(ctx)
+	releaseNative, err := enterNativeContext(admission)
 	if err != nil {
 		return nil, err
 	}
