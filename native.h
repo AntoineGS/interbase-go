@@ -300,6 +300,10 @@ int ib_statement_summary(const ib_statement *statement, int *kind,
 	int *returns_rows, int *input_count, char **error);
 int ib_statement_input_metadata(const ib_statement *statement, size_t index,
 	ib_input_metadata *metadata, char **error);
+int ib_statement_num_output(const ib_statement *statement);
+int ib_statement_output_origin(const ib_statement *statement, size_t index,
+	const char **relation, size_t *relation_length,
+	const char **field, size_t *field_length, char **error);
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,
 	char **error);

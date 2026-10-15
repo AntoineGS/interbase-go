@@ -3,6 +3,7 @@
 package integration_test
 
 import (
+	"reflect"
 	"testing"
 
 	interbase "interbase-go"
@@ -62,6 +63,41 @@ func TestStatementDescriptionClassifiesWithoutExecuting(t *testing.T) {
 	}
 	if name != "USA" {
 		t.Fatalf("description modified sentinel: %q", name)
+	}
+}
+
+func TestStatementDescriptionReportsColumnOrigins(t *testing.T) {
+	db := newDatabaseWithDialect(t, 3)
+	ctx := readContext(t)
+	pooled, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pooled.Close()
+	cases := []struct {
+		query string
+		want  []interbase.ColumnOrigin
+	}{
+		{"SELECT c.ID, c.COUNTRY AS NAME, c.ID + 1, w.LABEL FROM GO_COUNTRY c JOIN GO_WRITE w ON w.ID = c.ID",
+			[]interbase.ColumnOrigin{{"GO_COUNTRY", "ID"}, {"GO_COUNTRY", "COUNTRY"}, {}, {"GO_WRITE", "LABEL"}}},
+		{"SELECT * FROM GO_COUNTRY",
+			[]interbase.ColumnOrigin{{"GO_COUNTRY", "ID"}, {"GO_COUNTRY", "COUNTRY"}, {"GO_COUNTRY", "CURRENCY"}}},
+		{"SELECT a.ID, b.ID FROM GO_COUNTRY a JOIN GO_COUNTRY b ON b.ID = a.ID",
+			[]interbase.ColumnOrigin{{"GO_COUNTRY", "ID"}, {"GO_COUNTRY", "ID"}}},
+		{"SELECT COUNT(*) FROM GO_COUNTRY", []interbase.ColumnOrigin{{}}},
+	}
+	for _, tc := range cases {
+		got, err := interbase.DescribeStatement(ctx, pooled, tc.query)
+		if err != nil {
+			t.Fatalf("DescribeStatement(%q): %v", tc.query, err)
+		}
+		if !reflect.DeepEqual(got.Columns, tc.want) {
+			t.Fatalf("DescribeStatement(%q).Columns = %+v, want %+v", tc.query, got.Columns, tc.want)
+		}
+	}
+	update, err := interbase.DescribeStatement(ctx, pooled, "UPDATE GO_COUNTRY SET COUNTRY = 'x' WHERE ID = 1")
+	if err != nil || update.Columns != nil {
+		t.Fatalf("update columns = %+v, %v", update.Columns, err)
 	}
 }
 

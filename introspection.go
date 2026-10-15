@@ -29,6 +29,13 @@ type InputDescriber interface {
 	DescribeInputs(ctx context.Context, query string) ([]InputDescriptor, error)
 }
 
+// ColumnOrigin is the base relation and field an output column reads, as the
+// server reports it in the output SQLDA. Both are empty for expressions.
+type ColumnOrigin struct {
+	Relation string
+	Field    string
+}
+
 // StatementDescriptor classifies a prepared statement without running it.
 // The application must reject Kind "unsupported" before attempting execution.
 type StatementDescriptor struct {
@@ -36,6 +43,8 @@ type StatementDescriptor struct {
 	ReturnsRows bool
 	Mutating    bool
 	InputCount  int
+	// Columns has one entry per output column, in output order.
+	Columns []ColumnOrigin
 }
 
 // StatementDescriber is an optional extension for driver connections.
