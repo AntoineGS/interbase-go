@@ -62,6 +62,51 @@ func TestWithTransactionReportsCommitFailure(t *testing.T) {
 	}
 }
 
+func TestWithTransactionRollsBackBeforeRepanicking(t *testing.T) {
+	pooled, calls := pooledTransactionTestConn(t, nil)
+	want := errors.New("callback panic")
+	var got any
+	func() {
+		defer func() { got = recover() }()
+		_ = WithTransaction(context.Background(), pooled, TransactionOptions{}, func(*Transaction) error {
+			panic(want)
+		})
+	}()
+	if got != want {
+		t.Fatalf("recovered panic = %v, want %v", got, want)
+	}
+	if len(*calls) != 2 || (*calls)[0] != "begin" || (*calls)[1] != "rollback" {
+		t.Fatalf("calls = %v, want begin then rollback", *calls)
+	}
+}
+
+func TestWithTransactionRollsBackOnDirectCursorCleanupFailure(t *testing.T) {
+	closeErr := errors.New("cursor close failed")
+	pooled, calls := pooledTransactionTestConn(t, nil)
+	var transaction *Transaction
+	err := WithTransaction(context.Background(), pooled, TransactionOptions{}, func(tx *Transaction) error {
+		transaction = tx
+		cursor := &Cursor{
+			tx:     tx,
+			native: &nativeCursor{closeOverride: func() error { return closeErr }},
+		}
+		tx.cursors[cursor] = struct{}{}
+		return nil
+	})
+	if !errors.Is(err, closeErr) || errors.Is(err, ErrTransactionCommit) {
+		t.Fatalf("err = %v, want cursor cleanup error without ErrTransactionCommit", err)
+	}
+	if len(*calls) != 2 || (*calls)[0] != "begin" || (*calls)[1] != "rollback" {
+		t.Fatalf("calls = %v, want begin then rollback", *calls)
+	}
+	if transaction == nil || !transaction.done || transaction.native != nil || len(transaction.attachment.transactions) != 0 {
+		t.Fatalf("transaction after cleanup failure = %#v, want completed with no retained native owner", transaction)
+	}
+	if transaction.attachment.conn.closed || transaction.attachment.conn.native == nil {
+		t.Fatal("cursor cleanup failure invalidated the pooled attachment")
+	}
+}
+
 func TestWithTransactionRejectsForeignConnections(t *testing.T) {
 	if err := WithTransaction(context.Background(), nil, TransactionOptions{}, func(*Transaction) error { return nil }); !errors.Is(err, ErrNotInterBaseConn) {
 		t.Fatalf("nil conn: %v", err)
