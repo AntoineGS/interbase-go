@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"reflect"
 	"testing"
 )
 
@@ -75,6 +76,32 @@ func TestDescribeStatementPropagatesPrepareError(t *testing.T) {
 	native.prepareOverride = func(string) (*nativeStatement, error) { return nil, want }
 	if _, err := (&conn{native: native}).DescribeStatement(context.Background(), "SELECT 1 FROM RDB$DATABASE"); !errors.Is(err, want) {
 		t.Fatalf("prepare: %v", err)
+	}
+}
+
+func TestDescribeStatementReturnsColumnOrigins(t *testing.T) {
+	native := introspectionTestNative(3)
+	want := []ColumnOrigin{{Relation: "GO_COUNTRY", Field: "ID"}, {}}
+	native.prepareOverride = func(string) (*nativeStatement, error) {
+		return &nativeStatement{
+			descriptionOverride: func() (StatementDescriptor, error) {
+				return StatementDescriptor{Kind: "select", ReturnsRows: true, Columns: want}, nil
+			},
+			closeOverride: func() error { return nil },
+		}, nil
+	}
+	got, err := (&conn{native: native}).DescribeStatement(context.Background(), "SELECT ID, 1 FROM GO_COUNTRY")
+	if err != nil || !reflect.DeepEqual(got.Columns, want) {
+		t.Fatalf("columns = %+v, %v", got.Columns, err)
+	}
+}
+
+func TestTrimColumnOriginName(t *testing.T) {
+	if got := trimColumnOriginName([]byte("GO_COUNTRY   ")); got != "GO_COUNTRY" {
+		t.Fatalf("trimmed = %q", got)
+	}
+	if got := trimColumnOriginName(nil); got != "" {
+		t.Fatalf("empty = %q", got)
 	}
 }
 

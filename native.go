@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -1636,11 +1637,39 @@ func (s *nativeStatement) description() (StatementDescriptor, error) {
 	default:
 		name = "unsupported"
 	}
-	return StatementDescriptor{
+	descriptor := StatementDescriptor{
 		Kind: name, ReturnsRows: returnsRows != 0,
 		Mutating:   name != "select" && name != "unsupported",
 		InputCount: int(inputCount),
-	}, nil
+	}
+	count := int(C.ib_statement_num_output(s.ptr))
+	if count > 0 {
+		descriptor.Columns = make([]ColumnOrigin, count)
+		for index := range descriptor.Columns {
+			var relation, field *C.char
+			var relationLength, fieldLength C.size_t
+			var errorPointer *C.char
+			if C.ib_statement_output_origin(s.ptr, C.size_t(index), &relation, &relationLength,
+				&field, &fieldLength, &errorPointer) != 0 {
+				return StatementDescriptor{}, takeNativeError(errorPointer)
+			}
+			origin := ColumnOrigin{
+				Relation: trimColumnOriginName(C.GoBytes(unsafe.Pointer(relation), C.int(relationLength))),
+				Field:    trimColumnOriginName(C.GoBytes(unsafe.Pointer(field), C.int(fieldLength))),
+			}
+			if origin.Relation == "" {
+				origin = ColumnOrigin{} // an expression's sqlname is not a field
+			}
+			descriptor.Columns[index] = origin
+		}
+	}
+	return descriptor, nil
+}
+
+// trimColumnOriginName drops the blank padding some servers leave after
+// SQLDA names. Names are returned as raw catalog bytes.
+func trimColumnOriginName(raw []byte) string {
+	return strings.TrimRight(string(raw), " ")
 }
 
 func (c *nativeConnection) query(ctx context.Context, query string, args []argument,

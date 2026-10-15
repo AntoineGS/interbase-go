@@ -8067,6 +8067,36 @@ int ib_statement_input_metadata(const ib_statement *statement, size_t index,
 	return 0;
 }
 
+int ib_statement_num_output(const ib_statement *statement)
+{
+	if (statement == NULL || statement->output == NULL || statement->output->sqld < 0) {
+		return 0;
+	}
+	return (int) statement->output->sqld;
+}
+
+int ib_statement_output_origin(const ib_statement *statement, size_t index,
+	const char **relation, size_t *relation_length,
+	const char **field, size_t *field_length, char **error)
+{
+	const XSQLVAR *variable;
+
+	if (statement == NULL || statement->output == NULL || relation == NULL ||
+		relation_length == NULL || field == NULL || field_length == NULL ||
+		statement->output->sqld < 0 || index >= (size_t) statement->output->sqld) {
+		return ib_fail(error, "invalid prepared output metadata index");
+	}
+	variable = &statement->output->sqlvar[index];
+	*relation = variable->relname;
+	*relation_length = variable->relname_length > 0 ? (size_t) variable->relname_length : 0U;
+	*field = variable->sqlname;
+	*field_length = variable->sqlname_length > 0 ? (size_t) variable->sqlname_length : 0U;
+	if (*relation_length > METADATALENGTH || *field_length > METADATALENGTH) {
+		return ib_fail(error, "prepared output metadata name is too long");
+	}
+	return 0;
+}
+
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,
 	char **error)
