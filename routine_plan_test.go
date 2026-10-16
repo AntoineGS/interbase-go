@@ -59,6 +59,12 @@ func TestResolveRelations(t *testing.T) {
 			aliases:   map[string]string{"V": "CUSTOMER"},
 			relations: map[string]bool{"CUSTOMER": true},
 		},
+		{
+			name:    "CP1252 alias keeps high byte during lookup",
+			node:    &planparse.Node{Kind: "table", Labels: []string{"caf\xe9"}},
+			aliases: map[string]string{"CAF\xe9": "CUSTOMER"},
+			want:    "CUSTOMER",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -79,6 +85,7 @@ func TestLookupNameVariantsPreservesQuotedNames(t *testing.T) {
 	}{
 		{name: "quoted is exact", in: lookupName{name: "customer", quoted: true}, want: []string{"customer"}},
 		{name: "unquoted is canonicalized", in: lookupName{name: "customer"}, want: []string{"CUSTOMER"}},
+		{name: "CP1252 bytes are preserved", in: lookupName{name: "caf\xe9"}, want: []string{"CAF\xe9"}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -86,6 +93,15 @@ func TestLookupNameVariantsPreservesQuotedNames(t *testing.T) {
 				t.Fatalf("lookupNameVariants(%+v) = %v, want %v", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestCatalogNameKeyAndLookupIgnoreCaseOnlyForASCII(t *testing.T) {
+	if got, want := catalogNameKey("caf\xe9 "), "CAF\xe9"; got != want {
+		t.Fatalf("catalogNameKey() = %q, want %q", got, want)
+	}
+	if sameLookupName("caf\xe9", "caf\xea", false) {
+		t.Fatal("sameLookupName() equated distinct invalid UTF-8 identifier bytes")
 	}
 }
 

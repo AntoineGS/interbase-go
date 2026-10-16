@@ -2,8 +2,6 @@ package psql
 
 import (
 	"strings"
-	"unicode"
-	"unicode/utf8"
 )
 
 type tokenKind uint8
@@ -53,10 +51,9 @@ func lex(input string) []token {
 			continue
 		}
 
-		r, size := utf8.DecodeRuneInString(input[i:])
-		if unicode.IsSpace(r) {
+		if isASCIIWhitespace(input[i]) {
 			start := i
-			i += size
+			i++
 			line = countLines(input, start, i, line)
 			continue
 		}
@@ -105,10 +102,7 @@ func lex(input string) []token {
 				}
 				tokens = append(tokens, token{kind: tokenNumber, text: input[start:i], start: start, end: i, line: tokenLine, depth: depth})
 			} else {
-				i += size
-				if size == 0 {
-					i++
-				}
+				i++
 				tokens = append(tokens, token{kind: tokenPunctuation, text: input[start:i], start: start, end: i, line: tokenLine, depth: depth})
 			}
 		}
@@ -144,24 +138,16 @@ func readDelimited(input string, start int, delimiter byte) (string, int) {
 			}
 			return value.String(), i + 1
 		}
-		_, size := utf8.DecodeRuneInString(input[i:])
-		if size == 0 {
-			break
-		}
-		value.WriteString(input[i : i+size])
-		i += size
+		value.WriteByte(input[i])
+		i++
 	}
 	return value.String(), len(input)
 }
 
 func scanIdentifier(input string, start int) int {
 	i := start
-	for i < len(input) {
-		r, size := utf8.DecodeRuneInString(input[i:])
-		if size == 0 || !isIdentifierContinue(r) {
-			break
-		}
-		i += size
+	for i < len(input) && isIdentifierContinue(input[i]) {
+		i++
 	}
 	return i
 }
@@ -170,12 +156,24 @@ func isIdentifierStartAt(input string, i int) bool {
 	if i >= len(input) {
 		return false
 	}
-	r, _ := utf8.DecodeRuneInString(input[i:])
-	return r == '_' || r == '$' || unicode.IsLetter(r)
+	return isIdentifierStartByte(input[i])
 }
 
-func isIdentifierContinue(r rune) bool {
-	return r == '_' || r == '$' || unicode.IsLetter(r) || unicode.IsDigit(r)
+func isIdentifierContinue(b byte) bool {
+	return isIdentifierStartByte(b) || b >= '0' && b <= '9'
+}
+
+func isIdentifierStartByte(b byte) bool {
+	return b >= 0x80 || b == '_' || b == '$' || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z'
+}
+
+func isASCIIWhitespace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
 }
 
 func isNameToken(t token) bool {
@@ -183,14 +181,43 @@ func isNameToken(t token) bool {
 }
 
 func keyword(t token, value string) bool {
-	return t.kind == tokenIdentifier && strings.EqualFold(t.text, value)
+	return t.kind == tokenIdentifier && asciiEqualFold(t.text, value)
 }
 
 func normalizedName(t token) string {
 	if t.kind == tokenQuotedIdentifier {
 		return t.text
 	}
-	return strings.ToUpper(t.text)
+	return asciiUpper(t.text)
+}
+
+func asciiUpper(value string) string {
+	bytes := []byte(value)
+	for i, b := range bytes {
+		if b >= 'a' && b <= 'z' {
+			bytes[i] = b - ('a' - 'A')
+		}
+	}
+	return string(bytes)
+}
+
+func asciiEqualFold(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := 0; i < len(left); i++ {
+		l, r := left[i], right[i]
+		if l >= 'a' && l <= 'z' {
+			l -= 'a' - 'A'
+		}
+		if r >= 'a' && r <= 'z' {
+			r -= 'a' - 'A'
+		}
+		if l != r {
+			return false
+		}
+	}
+	return true
 }
 
 func countLines(input string, start, end, line int) int {

@@ -5,7 +5,6 @@ package psql
 import (
 	"sort"
 	"strings"
-	"unicode"
 )
 
 // Statement is one data statement found in a PSQL body or DSQL text.
@@ -134,7 +133,7 @@ func isStatementBoundary(t token) bool {
 	if t.kind != tokenIdentifier || t.depth != 0 {
 		return false
 	}
-	switch strings.ToUpper(t.text) {
+	switch asciiUpper(t.text) {
 	case "BEGIN", "THEN", "ELSE", "DO", "END", "AS":
 		return true
 	default:
@@ -229,16 +228,27 @@ func rewriteSQL(input string, tokens []token, start, end, endOffset int) string 
 		cursor = edit.end
 	}
 	output.WriteString(input[cursor:endOffset])
-	return strings.TrimSpace(output.String())
+	return trimASCIIWhitespace(output.String())
 }
 
 func onlyWhitespace(text string) bool {
-	for _, r := range text {
-		if !unicode.IsSpace(r) {
+	for i := 0; i < len(text); i++ {
+		if !isASCIIWhitespace(text[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+func trimASCIIWhitespace(text string) string {
+	start, end := 0, len(text)
+	for start < end && isASCIIWhitespace(text[start]) {
+		start++
+	}
+	for start < end && isASCIIWhitespace(text[end-1]) {
+		end--
+	}
+	return text[start:end]
 }
 
 func statementTarget(tokens []token, start, end int, kind string) string {
@@ -325,7 +335,7 @@ func collectSources(tokens []token, start, end int, skipDeleteTarget bool) ([]st
 }
 
 func isSourceListEnd(t token) bool {
-	switch strings.ToUpper(t.text) {
+	switch asciiUpper(t.text) {
 	case "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "PLAN", "ROWS", "INTO", "DO":
 		return true
 	default:

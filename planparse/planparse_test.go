@@ -23,6 +23,8 @@ func TestParsePlanShapes(t *testing.T) {
 		{"multiple procedure groups", "\nPLAN (CUNITS_VR NATURAL)(CUNITS_VR NATURAL)SORT ((A NATURAL))", "group(table[CUNITS_VR]natural) | group(table[CUNITS_VR]natural) | sort(group(table[A]natural))"},
 		{"whitespace only", "   ", ""},
 		{"quoted identifiers and keyword case", `plan join ("VaL" Alias natural, "CaSe" index ("Ix Name", second$), "T" order "Ord Name" index ("I_X"))`, `join(table[VaL Alias]natural,table[CaSe]index(Ix Name,second$),table[T]order(Ord Name)index(I_X))`},
+		{"CP1252 identifier bytes", "PLAN (T\xe9 INDEX (IX_\xe9))", "group(table[T\xe9]index(IX_\xe9))"},
+		{"UTF-8 identifier", "PLAN (Té NATURAL)", "group(table[Té]natural)"},
 	}
 
 	for _, tc := range cases {

@@ -4,8 +4,6 @@ package planparse
 import (
 	"fmt"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 )
 
 // Node is one element of an InterBase plan. Kind is "join", "sort", "merge",
@@ -77,27 +75,23 @@ type token struct {
 func tokenize(input string) ([]token, error) {
 	tokens := make([]token, 0)
 	for i := 0; i < len(input); {
-		r, size := utf8.DecodeRuneInString(input[i:])
-		if r == utf8.RuneError && size == 1 {
-			return nil, fmt.Errorf("invalid UTF-8 at byte %d", i)
-		}
-		if unicode.IsSpace(r) {
-			i += size
+		if isASCIIWhitespace(input[i]) {
+			i++
 			continue
 		}
 
-		switch r {
+		switch input[i] {
 		case '(':
 			tokens = append(tokens, token{kind: tokenLeftParen, text: "("})
-			i += size
+			i++
 		case ')':
 			tokens = append(tokens, token{kind: tokenRightParen, text: ")"})
-			i += size
+			i++
 		case ',':
 			tokens = append(tokens, token{kind: tokenComma, text: ","})
-			i += size
+			i++
 		case '"':
-			value, next, err := quotedIdentifier(input, i+size)
+			value, next, err := quotedIdentifier(input, i+1)
 			if err != nil {
 				return nil, err
 			}
@@ -107,20 +101,12 @@ func tokenize(input string) ([]token, error) {
 			tokens = append(tokens, token{kind: tokenIdentifier, text: value, quoted: true})
 			i = next
 		default:
-			if !identifierStart(r) {
-				return nil, fmt.Errorf("unexpected character %q at byte %d", r, i)
+			if !identifierStart(input[i]) {
+				return nil, fmt.Errorf("unexpected byte 0x%02x at byte %d", input[i], i)
 			}
 			start := i
-			i += size
-			for i < len(input) {
-				next, nextSize := utf8.DecodeRuneInString(input[i:])
-				if next == utf8.RuneError && nextSize == 1 {
-					return nil, fmt.Errorf("invalid UTF-8 at byte %d", i)
-				}
-				if !identifierContinue(next) {
-					break
-				}
-				i += nextSize
+			for i < len(input) && identifierContinue(input[i]) {
+				i++
 			}
 			tokens = append(tokens, token{kind: tokenIdentifier, text: input[start:i]})
 		}
@@ -130,31 +116,38 @@ func tokenize(input string) ([]token, error) {
 
 func quotedIdentifier(input string, i int) (string, int, error) {
 	var value strings.Builder
+	segment := i
 	for i < len(input) {
-		r, size := utf8.DecodeRuneInString(input[i:])
-		if r == utf8.RuneError && size == 1 {
-			return "", 0, fmt.Errorf("invalid UTF-8 in quoted identifier at byte %d", i)
-		}
-		if r == '"' {
-			if i+size < len(input) && input[i+size] == '"' {
+		if input[i] == '"' {
+			value.WriteString(input[segment:i])
+			if i+1 < len(input) && input[i+1] == '"' {
 				value.WriteByte('"')
-				i += size + 1
+				i += 2
+				segment = i
 				continue
 			}
-			return value.String(), i + size, nil
+			return value.String(), i + 1, nil
 		}
-		value.WriteRune(r)
-		i += size
+		i++
 	}
 	return "", 0, fmt.Errorf("unterminated quoted identifier")
 }
 
-func identifierStart(r rune) bool {
-	return r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r == '_' || r == '$'
+func identifierStart(b byte) bool {
+	return b >= 0x80 || b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b == '_' || b == '$'
 }
 
-func identifierContinue(r rune) bool {
-	return identifierStart(r) || r >= '0' && r <= '9'
+func identifierContinue(b byte) bool {
+	return identifierStart(b) || b >= '0' && b <= '9'
+}
+
+func isASCIIWhitespace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
 }
 
 type parser struct {
@@ -182,7 +175,26 @@ func (p *parser) keywordAt(pos int, value string) bool {
 		return false
 	}
 	t := p.tokens[pos]
-	return t.kind == tokenIdentifier && !t.quoted && strings.EqualFold(t.text, value)
+	return t.kind == tokenIdentifier && !t.quoted && asciiEqualFold(t.text, value)
+}
+
+func asciiEqualFold(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := 0; i < len(left); i++ {
+		l, r := left[i], right[i]
+		if l >= 'a' && l <= 'z' {
+			l -= 'a' - 'A'
+		}
+		if r >= 'a' && r <= 'z' {
+			r -= 'a' - 'A'
+		}
+		if l != r {
+			return false
+		}
+	}
+	return true
 }
 
 func (p *parser) parseExpr() (*Node, error) {

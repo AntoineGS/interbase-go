@@ -67,7 +67,7 @@ type RoutinePlan struct {
 // using a short read-only transaction. It never executes query.
 func DescribePlan(ctx context.Context, conn *sql.Conn, query, raw string) (PlanDescription, error) {
 	description := PlanDescription{Raw: raw, Indexes: make(map[string]PlanIndex)}
-	if strings.TrimSpace(raw) == "" {
+	if isASCIIWhitespaceOnly(raw) {
 		return description, nil
 	}
 	tree, err := planparse.Parse(raw)
@@ -193,7 +193,7 @@ func describePlanTx(ctx context.Context, tx *Transaction, query, raw string) (Pl
 			_, ok := relationNames[name]
 			return ok
 		}
-		_, ok := relationNames[strings.ToUpper(name)]
+		_, ok := relationNames[asciiUpperName(name)]
 		return ok
 	}, quotedNames)
 	return description, nil
@@ -243,7 +243,7 @@ func lookupAliasForName(aliases map[string]string, label string, quoted bool) (s
 		return trimCatalogName(relation), true
 	}
 	if !quoted {
-		if relation, ok := aliases[strings.ToUpper(label)]; ok {
+		if relation, ok := aliases[asciiUpperName(label)]; ok {
 			return trimCatalogName(relation), true
 		}
 	}
@@ -254,7 +254,7 @@ func sameLookupName(left, right string, quoted bool) bool {
 	if quoted {
 		return left == right
 	}
-	return strings.EqualFold(left, right)
+	return asciiEqualFoldName(left, right)
 }
 
 func planRelationLabels(tree *planparse.Tree, quotedNames map[string]struct{}) []lookupName {
@@ -725,7 +725,7 @@ func lookupNameVariants(names []lookupName) []string {
 		if candidate.quoted {
 			add(name)
 		} else {
-			add(strings.ToUpper(name))
+			add(asciiUpperName(name))
 		}
 	}
 	return result
@@ -801,7 +801,39 @@ func trimCatalogName(name string) string {
 }
 
 func catalogNameKey(name string) string {
-	return strings.ToUpper(trimCatalogName(name))
+	return asciiUpperName(trimCatalogName(name))
+}
+
+func asciiUpperName(name string) string {
+	bytes := []byte(name)
+	for i, b := range bytes {
+		if b >= 'a' && b <= 'z' {
+			bytes[i] = b - ('a' - 'A')
+		}
+	}
+	return string(bytes)
+}
+
+func asciiEqualFoldName(left, right string) bool {
+	return asciiUpperName(left) == asciiUpperName(right)
+}
+
+func isASCIIWhitespaceOnly(text string) bool {
+	for i := 0; i < len(text); i++ {
+		if !isASCIIWhitespaceByte(text[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIWhitespaceByte(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\r', '\v', '\f':
+		return true
+	default:
+		return false
+	}
 }
 
 func prepareFailureMessage(err error) string {

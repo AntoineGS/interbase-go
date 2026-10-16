@@ -1,7 +1,5 @@
 package psql
 
-import "strings"
-
 // Aliases returns a relation's self mapping and any aliases found in FROM
 // lists. Unquoted names are normalized to upper case; quoted names retain
 // their exact contents.
@@ -76,7 +74,7 @@ func isAliasKeyword(t token) bool {
 	if t.kind != tokenIdentifier {
 		return false
 	}
-	switch strings.ToUpper(t.text) {
+	switch asciiUpper(t.text) {
 	case "WHERE", "ON", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER", "FULL", "CROSS", "GROUP", "ORDER", "HAVING", "UNION", "PLAN", "ROWS", "INTO", "FOR", "NATURAL":
 		return true
 	default:

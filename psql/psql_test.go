@@ -36,6 +36,26 @@ func TestExtractPSQLBody(t *testing.T) {
 	}
 }
 
+func TestExtractPreservesCP1252IdentifierBytes(t *testing.T) {
+	body := "begin\n select x from caf\xe9 where a = :p into :v;\nend"
+	want := []Statement{{
+		Line: 2, Kind: "select", SQL: "select x from caf\xe9 where a = ?", Sources: []string{"CAF\xe9"},
+	}}
+	if got := Extract(body); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Extract() = %#v, want %#v", got, want)
+	}
+}
+
+func TestExtractDoesNotTrimHighBytesFromIdentifier(t *testing.T) {
+	body := "begin\n select x from caf\xc2\xa0;\nend"
+	want := []Statement{{
+		Line: 2, Kind: "select", SQL: "select x from caf\xc2\xa0", Sources: []string{"CAF\xc2\xa0"},
+	}}
+	if got := Extract(body); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Extract() = %#v, want %#v", got, want)
+	}
+}
+
 func TestExtractTriggerAndNestedSources(t *testing.T) {
 	t.Run("trigger OLD and NEW references", func(t *testing.T) {
 		body := "AS\nBEGIN\n  IF (NEW.QTY <> OLD.QTY) THEN\n    UPDATE STOCK SET QTY = QTY + NEW.QTY - OLD.QTY WHERE ID = NEW.ID;\nEND"
@@ -176,6 +196,14 @@ func TestAliases(t *testing.T) {
 	t.Run("quoted identifiers keep case", func(t *testing.T) {
 		got := Aliases(`SELECT * FROM "MixedTable" AS "TableAlias"`)
 		want := map[string]string{"MixedTable": "MixedTable", "TableAlias": "MixedTable"}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("Aliases() = %#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("CP1252 alias bytes are preserved", func(t *testing.T) {
+		got := Aliases("SELECT * FROM table caf\xe9")
+		want := map[string]string{"TABLE": "TABLE", "CAF\xe9": "TABLE"}
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("Aliases() = %#v, want %#v", got, want)
 		}
