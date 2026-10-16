@@ -16,6 +16,16 @@
 #define IB_STATUS_VECTOR_LENGTH 20
 #define IB_MAX_SQLDA_BUFFER (1024U * 1024U)
 #define IB_SQL_MESSAGE_LENGTH 256U
+#define IB_STATUS_TEXT_LIMIT 2048U
+#define IB_STATUS_ARGUMENT_LIMIT 255U
+#define IB_STATUS_ARGUMENTS_LIMIT 768U
+/* gds__msg_format substitutes at most five arguments into a template. */
+#define IB_STATUS_TEMPLATE_ARGUMENTS 5U
+#define IB_STATUS_COPY_LENGTH \
+	(IB_STATUS_VECTOR_LENGTH * (1U + IB_STATUS_TEMPLATE_ARGUMENTS) + 1U)
+/* One interpreted line: a template, or the message-file-missing fallback and
+ * its path, plus the clamped arguments. */
+#define IB_STATUS_LINE_LENGTH (1024U + 4096U + IB_STATUS_ARGUMENTS_LIMIT)
 #define IB_BLOB_SEGMENT_LENGTH 32767U
 #define IB_BLOB_BPB_LENGTH 64U
 #define IB_MAX_BLOB_BUFFER (64U * 1024U * 1024U)
@@ -1198,11 +1208,183 @@ static int ib_primary_status(const ISC_STATUS *status, ISC_STATUS *value)
 	return 0;
 }
 
+/*
+ * isc_interprete has no output length, and the client's own formatter
+ * overflows its internal buffer for long string arguments and reads
+ * uninitialized slots for arguments a code's template needs but the vector
+ * lacks. It therefore only ever sees a private copy of the vector in which
+ * string arguments are clamped, each to IB_STATUS_ARGUMENT_LIMIT bytes and all
+ * to IB_STATUS_ARGUMENTS_LIMIT (a clamped argument ends in "..."), and every
+ * message code carries at least IB_STATUS_TEMPLATE_ARGUMENTS arguments, padded
+ * with empty strings. Returns 0 for a vector without an end marker within its
+ * fixed length. copy holds IB_STATUS_COPY_LENGTH entries.
+ */
+static int ib_status_clamped_copy(const ISC_STATUS *status, ISC_STATUS *copy,
+	char *storage)
+{
+	static const char marker[] = "...";
+	static const char empty[] = "";
+	size_t index;
+	size_t out;
+	size_t used;
+	size_t length;
+	size_t allowed;
+	size_t arguments;
+	int in_message;
+	ISC_STATUS argument;
+	const char *text;
+
+	if (status == NULL) {
+		return 0;
+	}
+	out = 0U;
+	used = 0U;
+	arguments = 0U;
+	in_message = 0;
+	for (index = 0U; index < IB_STATUS_VECTOR_LENGTH;) {
+		argument = status[index];
+		if (in_message && argument != isc_arg_string &&
+			argument != isc_arg_cstring && argument != isc_arg_number) {
+			for (; arguments < IB_STATUS_TEMPLATE_ARGUMENTS; ++arguments) {
+				copy[out++] = isc_arg_string;
+				copy[out++] = (ISC_STATUS) (uintptr_t) empty;
+			}
+			in_message = 0;
+		}
+		if (argument == isc_arg_end) {
+			copy[out] = isc_arg_end;
+			return 1;
+		}
+		if (index + 1U >= IB_STATUS_VECTOR_LENGTH) {
+			return 0;
+		}
+		if (argument == isc_arg_gds || argument == isc_arg_warning) {
+			in_message = 1;
+			arguments = 0U;
+		} else if (argument == isc_arg_number) {
+			++arguments;
+		}
+		if (argument != isc_arg_string && argument != isc_arg_cstring &&
+			argument != isc_arg_interpreted) {
+			copy[out++] = argument;
+			copy[out++] = status[index + 1U];
+			index += 2U;
+			continue;
+		}
+		if (argument == isc_arg_cstring) {
+			if (index + 2U >= IB_STATUS_VECTOR_LENGTH ||
+				status[index + 1U] < 0) {
+				return 0;
+			}
+			text = (const char *) (uintptr_t) status[index + 2U];
+			length = (size_t) status[index + 1U];
+		} else {
+			text = (const char *) (uintptr_t) status[index + 1U];
+			/* Only whether it exceeds the clamp matters past this length. */
+			for (length = 0U; text != NULL &&
+				length <= IB_STATUS_ARGUMENT_LIMIT && text[length] != '\0'; ++length) {
+			}
+		}
+		if (text == NULL) {
+			length = 0U;
+		}
+		allowed = IB_STATUS_ARGUMENTS_LIMIT - used;
+		if (allowed > IB_STATUS_ARGUMENT_LIMIT) {
+			allowed = IB_STATUS_ARGUMENT_LIMIT;
+		}
+		if (length > allowed && allowed < sizeof(marker) - 1U) {
+			length = 0U;
+		} else if (length > allowed) {
+			length = allowed - (sizeof(marker) - 1U);
+			memcpy(storage, text, length);
+			memcpy(storage + length, marker, sizeof(marker) - 1U);
+			length = allowed;
+		} else if (length > 0U) {
+			memcpy(storage, text, length);
+		}
+		storage[length] = '\0';
+		/* A counted string becomes an ordinary terminated one. */
+		copy[out++] = argument == isc_arg_interpreted ? isc_arg_interpreted : isc_arg_string;
+		copy[out++] = (ISC_STATUS) (uintptr_t) storage;
+		index += argument == isc_arg_cstring ? 3U : 2U;
+		if (argument != isc_arg_interpreted) {
+			++arguments;
+		}
+		storage += length + 1U;
+		used += length;
+	}
+	return 0;
+}
+
+/*
+ * Render the status vector as isc_interprete lines joined by '\n', at most
+ * IB_STATUS_TEXT_LIMIT bytes; longer text ends with "...". Leaves text empty
+ * when the vector has no end marker or yields nothing.
+ */
+static void ib_status_text(const ISC_STATUS *status, char *text)
+{
+	static const char marker[] = "...";
+	const size_t room = IB_STATUS_TEXT_LIMIT - (sizeof(marker) - 1U);
+	ISC_STATUS copy[IB_STATUS_COPY_LENGTH];
+	char storage[IB_STATUS_ARGUMENTS_LIMIT + IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS *cursor;
+	size_t used;
+	size_t length;
+	size_t calls;
+	int truncated;
+	char *line;
+
+	text[0] = '\0';
+	if (!ib_status_clamped_copy(status, copy, storage)) {
+		return;
+	}
+	line = malloc(IB_STATUS_LINE_LENGTH);
+	if (line == NULL) {
+		return;
+	}
+	cursor = copy;
+	used = 0U;
+	truncated = 0;
+	for (calls = 0U; calls < IB_STATUS_VECTOR_LENGTH; ++calls) {
+		line[0] = '\0';
+		if (isc_interprete(line, &cursor) <= 0) {
+			break;
+		}
+		line[IB_STATUS_LINE_LENGTH - 1U] = '\0';
+		length = strlen(line);
+		if (length == 0U) {
+			continue;
+		}
+		if (used > 0U) {
+			if (used + 1U > room) {
+				truncated = 1;
+				break;
+			}
+			text[used++] = '\n';
+		}
+		if (length > room - used) {
+			memcpy(text + used, line, room - used);
+			used = room;
+			truncated = 1;
+			break;
+		}
+		memcpy(text + used, line, length);
+		used += length;
+	}
+	free(line);
+	if (truncated) {
+		memcpy(text + used, marker, sizeof(marker) - 1U);
+		used += sizeof(marker) - 1U;
+	}
+	text[used] = '\0';
+}
+
 static int ib_fail_status(char **error, const char *operation,
 	ISC_STATUS *status)
 {
 	char sql_message[IB_SQL_MESSAGE_LENGTH];
-	char message[2560];
+	char status_text[IB_STATUS_TEXT_LIMIT + 1U];
+	char message[IB_STATUS_TEXT_LIMIT + 512U];
 	ISC_STATUS primary_status;
 	ISC_LONG sqlcode;
 	int has_primary_status;
@@ -1210,6 +1392,21 @@ static int ib_fail_status(char **error, const char *operation,
 	has_primary_status = ib_primary_status(status, &primary_status);
 	sqlcode = 0;
 	sql_message[0] = '\0';
+	ib_status_text(status, status_text);
+	if (status_text[0] != '\0' && has_primary_status) {
+		sqlcode = isc_sqlcode(status);
+		(void) snprintf(message, sizeof(message),
+			"%s failed (SQLCODE %" PRIdMAX ", native status %" PRIdPTR "): %s",
+			operation, (intmax_t) sqlcode, (intptr_t) primary_status,
+			status_text);
+		return ib_fail(error, message);
+	}
+	if (status_text[0] != '\0') {
+		(void) snprintf(message, sizeof(message),
+			"%s failed (SQLCODE 0, native status unavailable): %s",
+			operation, status_text);
+		return ib_fail(error, message);
+	}
 	if (has_primary_status) {
 		sqlcode = isc_sqlcode(status);
 		if (sqlcode >= (ISC_LONG) SHRT_MIN &&
