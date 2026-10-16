@@ -44,6 +44,29 @@ type testServiceConfig struct {
 	password string
 }
 
+func TestServicesAttachFailureCarriesStatusText(t *testing.T) {
+	_, fixtureCfg, _ := createFixture(t, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	manager, err := services.Open(ctx, services.Config{
+		Host:     fixtureCfg.Server,
+		User:     fixtureCfg.User,
+		Password: uniqueIntegrationPassword(),
+	})
+	if err == nil {
+		_ = manager.Close()
+		t.Fatal("services attach with a wrong password unexpectedly succeeded")
+	}
+	if manager != nil {
+		_ = manager.Close()
+	}
+	nativeErr := requireNativeError(t, err)
+	if !strings.Contains(strings.ToLower(nativeErr.Message), "user name and password") {
+		t.Fatalf("message = %q, want the interpreted login failure", nativeErr.Message)
+	}
+	t.Logf("services attach failure: %q", nativeErr.Message)
+}
+
 func TestServicesManagerInfoAndLog(t *testing.T) {
 	fixture, fixtureCfg, cleanup := createFixture(t, 3)
 	manager := openServices(t, cleanup, testServiceConfig{

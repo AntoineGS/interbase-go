@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	interbase "interbase-go"
 )
 
 func TestEncodeBackupRequestUsesOfficialServiceParameterLayout(t *testing.T) {
@@ -1179,6 +1181,19 @@ func TestServiceErrorsRedactOverlappingCredentials(t *testing.T) {
 	message := err.Error()
 	if strings.Contains(message, "supersecret") || strings.Contains(message, "secret") {
 		t.Fatalf("service error leaked credentials: %q", message)
+	}
+}
+
+func TestServiceErrorKeepsMultilineStatusText(t *testing.T) {
+	err := newServiceError("start backup", errors.New(
+		"start backup failed (SQLCODE -902, native status 335544344): I/O error during \"open\" operation for file \"/data/secret.ib\"\nError while trying to open file"),
+		"/data/secret.ib")
+	var native *interbase.Error
+	if !errors.As(err, &native) || native.SQLCode != -902 || native.NativeCode != 335544344 {
+		t.Fatalf("error = %#v, want a parsed native error", err)
+	}
+	if !strings.Contains(native.Message, "\nError while trying to open file") || strings.Contains(native.Message, "/data/secret.ib") {
+		t.Fatalf("message = %q, want every line with the database path redacted", native.Message)
 	}
 }
 

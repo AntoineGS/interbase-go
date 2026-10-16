@@ -51,6 +51,9 @@ void ib_event_error_free(char *error);
 
 int ib_event_test_build_dpb(uint32_t connect_timeout, unsigned char *buffer,
 	size_t buffer_length, size_t *encoded_length, char **error);
+/* Formats a native failure from a synthetic status vector, as event_fail_status does. */
+int ib_event_test_fail_status(const char *operation, const intptr_t *status,
+	size_t status_length, char **error);
 
 /* Deterministic callback harness used by the native lifecycle tests. */
 ib_event_subscription *ib_event_test_new(const char *const *event_names,

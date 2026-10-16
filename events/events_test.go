@@ -27,6 +27,19 @@ func TestPublicSubscriptionSurface(t *testing.T) {
 	}
 }
 
+func TestNativeErrorKeepsMultilineStatusText(t *testing.T) {
+	err := wrapNativeError("attach event database", errors.New(
+		"attach event database failed (SQLCODE -902, native status 335544344): I/O error during \"open\" operation for file \"/data/secret.ib\"\nError while trying to open file"),
+		Config{Database: "/data/secret.ib"})
+	var native *interbase.Error
+	if !errors.As(err, &native) || native.SQLCode != -902 || native.NativeCode != 335544344 {
+		t.Fatalf("error = %#v, want a parsed native error", err)
+	}
+	if !strings.Contains(native.Message, "\nError while trying to open file") || strings.Contains(native.Message, "/data/secret.ib") {
+		t.Fatalf("message = %q, want every line with the database path redacted", native.Message)
+	}
+}
+
 func TestSubscribeRejectsNilContextBeforeNativeAttach(t *testing.T) {
 	_, err := Subscribe(nil, Config{}, "event_a")
 	if err == nil {
