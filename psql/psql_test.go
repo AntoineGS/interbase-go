@@ -103,13 +103,46 @@ func TestExtractRemovesDMLReturningInto(t *testing.T) {
 func TestExtractQuotedIdentifiersKeepCase(t *testing.T) {
 	got := ExtractStatementRefs(`SELECT * FROM "MixedTable" "Alias" JOIN lower_name L ON 1=1`)
 	want := Statement{
-		Line:    1,
-		Kind:    "select",
-		SQL:     `SELECT * FROM "MixedTable" "Alias" JOIN lower_name L ON 1=1`,
-		Sources: []string{"MixedTable", "LOWER_NAME"},
+		Line:          1,
+		Kind:          "select",
+		SQL:           `SELECT * FROM "MixedTable" "Alias" JOIN lower_name L ON 1=1`,
+		Sources:       []string{"MixedTable", "LOWER_NAME"},
+		QuotedSources: []string{"MixedTable"},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ExtractStatementRefs() = %#v, want %#v", got, want)
+	}
+}
+
+func TestExtractPreservesQuotedIdentifierMetadata(t *testing.T) {
+	body := `AS BEGIN SELECT * FROM "mixedTable"() JOIN lower_name L ON 1=1; END`
+	got := Extract(body)
+	if len(got) != 1 {
+		t.Fatalf("Extract() returned %d statements, want 1", len(got))
+	}
+	if want := []string{"mixedTable", "LOWER_NAME"}; !reflect.DeepEqual(got[0].Sources, want) {
+		t.Fatalf("Sources = %v, want %v", got[0].Sources, want)
+	}
+	if want := []string{"mixedTable"}; !reflect.DeepEqual(got[0].QuotedSources, want) {
+		t.Fatalf("QuotedSources = %v, want %v", got[0].QuotedSources, want)
+	}
+	if want := []string{"mixedTable"}; !reflect.DeepEqual(got[0].QuotedCalls, want) {
+		t.Fatalf("QuotedCalls = %v, want %v", got[0].QuotedCalls, want)
+	}
+}
+
+func TestExtractStatementRefsMarksQuotedProcedure(t *testing.T) {
+	got := ExtractStatementRefs(`EXECUTE PROCEDURE "MixedProc"`)
+	if got.Procedure != "MixedProc" || !got.ProcedureQuoted {
+		t.Fatalf("quoted procedure = (%q, %t), want (MixedProc, true)", got.Procedure, got.ProcedureQuoted)
+	}
+}
+
+func TestQuotedIdentifiersIgnoresCommentsAndStringLiterals(t *testing.T) {
+	sql := `SELECT "MixedName" FROM "lowerTable" WHERE note = '"not an identifier"' /* "not one either" */`
+	want := []string{"MixedName", "lowerTable"}
+	if got := QuotedIdentifiers(sql); !reflect.DeepEqual(got, want) {
+		t.Fatalf("QuotedIdentifiers() = %v, want %v", got, want)
 	}
 }
 

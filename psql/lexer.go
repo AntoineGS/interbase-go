@@ -116,6 +116,23 @@ func lex(input string) []token {
 	return tokens
 }
 
+// QuotedIdentifiers returns the distinct contents of quoted identifiers in SQL.
+func QuotedIdentifiers(input string) []string {
+	seen := make(map[string]struct{})
+	var identifiers []string
+	for _, token := range lex(input) {
+		if token.kind != tokenQuotedIdentifier {
+			continue
+		}
+		if _, ok := seen[token.text]; ok {
+			continue
+		}
+		seen[token.text] = struct{}{}
+		identifiers = append(identifiers, token.text)
+	}
+	return identifiers
+}
+
 func readDelimited(input string, start int, delimiter byte) (string, int) {
 	var value strings.Builder
 	for i := start + 1; i < len(input); {

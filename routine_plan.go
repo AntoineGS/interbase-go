@@ -177,8 +177,9 @@ func describePlanTx(ctx context.Context, tx *Transaction, query, raw string) (Pl
 		return description, err
 	}
 
-	labels := planRelationLabels(tree)
-	indexNames := planIndexNames(tree)
+	quotedNames := quotedIdentifierSet(query, raw)
+	labels := planRelationLabels(tree, quotedNames)
+	indexNames := planIndexNames(tree, quotedNames)
 	relationNames, err := readPlanRelationsTx(ctx, tx, labels)
 	if err != nil {
 		return description, err
@@ -187,14 +188,23 @@ func describePlanTx(ctx context.Context, tx *Transaction, query, raw string) (Pl
 	if err != nil {
 		return description, err
 	}
-	resolveRelations(tree, psql.Aliases(query), func(name string) bool {
-		_, ok := relationNames[catalogNameKey(name)]
+	resolveRelationsWithQuotedNames(tree, psql.Aliases(query), func(name string) bool {
+		if _, quoted := quotedNames[name]; quoted {
+			_, ok := relationNames[name]
+			return ok
+		}
+		_, ok := relationNames[strings.ToUpper(name)]
 		return ok
-	})
+	}, quotedNames)
 	return description, nil
 }
 
 func resolveRelations(tree *planparse.Tree, aliases map[string]string, isRelation func(string) bool) {
+	resolveRelationsWithQuotedNames(tree, aliases, isRelation, nil)
+}
+
+func resolveRelationsWithQuotedNames(tree *planparse.Tree, aliases map[string]string, isRelation func(string) bool,
+	quotedNames map[string]struct{}) {
 	if tree == nil {
 		return
 	}
@@ -205,10 +215,14 @@ func resolveRelations(tree *planparse.Tree, aliases map[string]string, isRelatio
 		}
 		if node.Kind == "table" && len(node.Labels) != 0 {
 			label := trimCatalogName(node.Labels[len(node.Labels)-1])
-			if isRelation != nil && isRelation(label) {
+			_, quoted := quotedNames[label]
+			alias, hasAlias := lookupAliasForName(aliases, label, quoted)
+			if hasAlias && !sameLookupName(label, alias, quoted) {
+				node.Relation = alias
+			} else if isRelation != nil && isRelation(label) {
 				node.Relation = label
-			} else if relation, ok := lookupAlias(aliases, label); ok {
-				node.Relation = relation
+			} else if hasAlias {
+				node.Relation = alias
 			}
 		}
 		for _, child := range node.Children {
@@ -221,46 +235,39 @@ func resolveRelations(tree *planparse.Tree, aliases map[string]string, isRelatio
 }
 
 func lookupAlias(aliases map[string]string, label string) (string, bool) {
+	return lookupAliasForName(aliases, label, false)
+}
+
+func lookupAliasForName(aliases map[string]string, label string, quoted bool) (string, bool) {
 	if relation, ok := aliases[label]; ok {
 		return trimCatalogName(relation), true
 	}
-	if relation, ok := aliases[strings.ToUpper(label)]; ok {
-		return trimCatalogName(relation), true
+	if !quoted {
+		if relation, ok := aliases[strings.ToUpper(label)]; ok {
+			return trimCatalogName(relation), true
+		}
 	}
 	return "", false
 }
 
-func planRelationLabels(tree *planparse.Tree) []string {
-	var names []string
-	var visit func(*planparse.Node)
-	visit = func(node *planparse.Node) {
-		if node == nil {
-			return
-		}
-		if node.Kind == "table" {
-			names = append(names, node.Labels...)
-		}
-		for _, child := range node.Children {
-			visit(child)
-		}
+func sameLookupName(left, right string, quoted bool) bool {
+	if quoted {
+		return left == right
 	}
-	for _, root := range tree.Roots {
-		visit(root)
-	}
-	return lookupNameVariants(names)
+	return strings.EqualFold(left, right)
 }
 
-func planIndexNames(tree *planparse.Tree) []string {
-	var names []string
+func planRelationLabels(tree *planparse.Tree, quotedNames map[string]struct{}) []lookupName {
+	var names []lookupName
 	var visit func(*planparse.Node)
 	visit = func(node *planparse.Node) {
 		if node == nil {
 			return
 		}
 		if node.Kind == "table" {
-			names = append(names, node.Indexes...)
-			if node.OrderIndex != "" {
-				names = append(names, node.OrderIndex)
+			for _, label := range node.Labels {
+				_, quoted := quotedNames[label]
+				names = append(names, lookupName{name: label, quoted: quoted})
 			}
 		}
 		for _, child := range node.Children {
@@ -270,11 +277,49 @@ func planIndexNames(tree *planparse.Tree) []string {
 	for _, root := range tree.Roots {
 		visit(root)
 	}
-	return lookupNameVariants(names)
+	return names
 }
 
-func readPlanRelationsTx(ctx context.Context, tx *Transaction, names []string) (map[string]string, error) {
+func planIndexNames(tree *planparse.Tree, quotedNames map[string]struct{}) []lookupName {
+	var names []lookupName
+	var visit func(*planparse.Node)
+	visit = func(node *planparse.Node) {
+		if node == nil {
+			return
+		}
+		if node.Kind == "table" {
+			for _, index := range node.Indexes {
+				_, quoted := quotedNames[index]
+				names = append(names, lookupName{name: index, quoted: quoted})
+			}
+			if node.OrderIndex != "" {
+				_, quoted := quotedNames[node.OrderIndex]
+				names = append(names, lookupName{name: node.OrderIndex, quoted: quoted})
+			}
+		}
+		for _, child := range node.Children {
+			visit(child)
+		}
+	}
+	for _, root := range tree.Roots {
+		visit(root)
+	}
+	return names
+}
+
+func quotedIdentifierSet(sql ...string) map[string]struct{} {
+	names := make(map[string]struct{})
+	for _, text := range sql {
+		for _, name := range psql.QuotedIdentifiers(text) {
+			names[name] = struct{}{}
+		}
+	}
+	return names
+}
+
+func readPlanRelationsTx(ctx context.Context, tx *Transaction, candidates []lookupName) (map[string]string, error) {
 	relations := make(map[string]string)
+	names := lookupNameVariants(candidates)
 	for start := 0; start < len(names); start += routinePlanChunkSize {
 		end := start + routinePlanChunkSize
 		if end > len(names) {
@@ -296,7 +341,7 @@ func readPlanRelationsTx(ctx context.Context, tx *Transaction, names []string) (
 				return fmt.Errorf("interbase: decode plan relation: %w", err)
 			}
 			name = trimCatalogName(name)
-			relations[catalogNameKey(name)] = name
+			relations[name] = name
 			return nil
 		})
 		if err != nil {
@@ -306,8 +351,9 @@ func readPlanRelationsTx(ctx context.Context, tx *Transaction, names []string) (
 	return relations, nil
 }
 
-func readPlanIndexesTx(ctx context.Context, tx *Transaction, names []string) (map[string]PlanIndex, error) {
+func readPlanIndexesTx(ctx context.Context, tx *Transaction, candidates []lookupName) (map[string]PlanIndex, error) {
 	indexes := make(map[string]PlanIndex)
+	names := lookupNameVariants(candidates)
 	for start := 0; start < len(names); start += routinePlanChunkSize {
 		end := start + routinePlanChunkSize
 		if end > len(names) {
@@ -336,7 +382,7 @@ func readPlanIndexesTx(ctx context.Context, tx *Transaction, names []string) (ma
 			}
 			name = trimCatalogName(name)
 			relation = trimCatalogName(relation)
-			key := catalogNameKey(name)
+			key := name
 			index, ok := indexes[key]
 			if !ok {
 				index = PlanIndex{Name: name, Relation: relation}
@@ -372,7 +418,7 @@ func readPlanIndexesTx(ctx context.Context, tx *Transaction, names []string) (ma
 	return indexes, nil
 }
 
-func routinesForStatementTx(ctx context.Context, tx *Transaction, statement psql.Statement, candidates []string) ([]RoutineRef, error) {
+func routinesForStatementTx(ctx context.Context, tx *Transaction, statement psql.Statement, candidates []lookupName) ([]RoutineRef, error) {
 	procedures, err := readProcedureRefsTx(ctx, tx, candidates)
 	if err != nil {
 		return nil, err
@@ -421,17 +467,30 @@ func routinesForStatementTx(ctx context.Context, tx *Transaction, statement psql
 	return deduplicateRoutineRefs(routines), nil
 }
 
-func statementRoutineCandidates(statement psql.Statement) []string {
-	candidates := []string{statement.Procedure}
-	return append(candidates, statement.Sources...)
+func statementRoutineCandidates(statement psql.Statement) []lookupName {
+	candidates := []lookupName{{name: statement.Procedure, quoted: statement.ProcedureQuoted}}
+	return append(candidates, psqlLookupNames(statement.Sources, statement.QuotedSources)...)
 }
 
-func planRoutineCandidates(statement psql.Statement) []string {
-	candidates := []string{statement.Procedure}
-	return append(candidates, statement.Calls...)
+func planRoutineCandidates(statement psql.Statement) []lookupName {
+	candidates := []lookupName{{name: statement.Procedure, quoted: statement.ProcedureQuoted}}
+	return append(candidates, psqlLookupNames(statement.Calls, statement.QuotedCalls)...)
 }
 
-func readProcedureRefsTx(ctx context.Context, tx *Transaction, candidates []string) ([]RoutineRef, error) {
+func psqlLookupNames(names, quotedNames []string) []lookupName {
+	quoted := make(map[string]struct{}, len(quotedNames))
+	for _, name := range quotedNames {
+		quoted[name] = struct{}{}
+	}
+	result := make([]lookupName, 0, len(names))
+	for _, name := range names {
+		_, isQuoted := quoted[name]
+		result = append(result, lookupName{name: name, quoted: isQuoted})
+	}
+	return result
+}
+
+func readProcedureRefsTx(ctx context.Context, tx *Transaction, candidates []lookupName) ([]RoutineRef, error) {
 	names := lookupNameVariants(candidates)
 	var routines []RoutineRef
 	for start := 0; start < len(names); start += routinePlanChunkSize {
@@ -470,81 +529,68 @@ func readRoutineSourceTx(ctx context.Context, tx *Transaction, ref RoutineRef) (
 	ref.Relation = trimCatalogName(ref.Relation)
 	switch ref.Kind {
 	case "procedure":
-		for _, candidate := range lookupNameVariants([]string{ref.Name}) {
-			cursor, err := tx.Query(ctx,
-				"SELECT RDB$PROCEDURE_NAME, RDB$PROCEDURE_SOURCE FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME = ?",
-				candidate)
-			if err != nil {
-				return RoutineRef{}, "", fmt.Errorf("interbase: read procedure source: %w", err)
-			}
-			row, found, err := firstCatalogRow(ctx, cursor, 2)
-			if err != nil {
-				return RoutineRef{}, "", fmt.Errorf("interbase: read procedure source: %w", err)
-			}
-			if !found {
-				continue
-			}
-			name, err := catalogText(row[0])
-			if err != nil {
-				return RoutineRef{}, "", fmt.Errorf("interbase: decode procedure name: %w", err)
-			}
-			source, err := catalogTextTx(ctx, tx, row[1])
-			if err != nil {
-				return RoutineRef{}, "", fmt.Errorf("interbase: decode procedure source: %w", err)
-			}
-			return RoutineRef{Kind: "procedure", Name: trimCatalogName(name)}, source, nil
+		cursor, err := tx.Query(ctx,
+			"SELECT RDB$PROCEDURE_NAME, RDB$PROCEDURE_SOURCE FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME = ?",
+			ref.Name)
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: read procedure source: %w", err)
 		}
-		return RoutineRef{}, "", ErrRoutineNotFound
+		row, found, err := firstCatalogRow(ctx, cursor, 2)
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: read procedure source: %w", err)
+		}
+		if !found {
+			return RoutineRef{}, "", ErrRoutineNotFound
+		}
+		name, err := catalogText(row[0])
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: decode procedure name: %w", err)
+		}
+		source, err := catalogTextTx(ctx, tx, row[1])
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: decode procedure source: %w", err)
+		}
+		return RoutineRef{Kind: "procedure", Name: trimCatalogName(name)}, source, nil
 	case "trigger":
-		nameCandidates := lookupNameVariants([]string{ref.Name})
-		relationCandidates := []string{ref.Relation}
+		query := "SELECT RDB$TRIGGER_NAME, RDB$TRIGGER_SOURCE, RDB$RELATION_NAME, RDB$TRIGGER_TYPE " +
+			"FROM RDB$TRIGGERS WHERE RDB$TRIGGER_NAME = ?"
+		args := []any{ref.Name}
 		if ref.Relation != "" {
-			relationCandidates = lookupNameVariants(relationCandidates)
+			query += " AND RDB$RELATION_NAME = ?"
+			args = append(args, ref.Relation)
 		}
-		for _, nameCandidate := range nameCandidates {
-			for _, relationCandidate := range relationCandidates {
-				query := "SELECT RDB$TRIGGER_NAME, RDB$TRIGGER_SOURCE, RDB$RELATION_NAME, RDB$TRIGGER_TYPE " +
-					"FROM RDB$TRIGGERS WHERE RDB$TRIGGER_NAME = ?"
-				args := []any{nameCandidate}
-				if relationCandidate != "" {
-					query += " AND RDB$RELATION_NAME = ?"
-					args = append(args, relationCandidate)
-				}
-				cursor, err := tx.Query(ctx, query, args...)
-				if err != nil {
-					return RoutineRef{}, "", fmt.Errorf("interbase: read trigger source: %w", err)
-				}
-				row, found, err := firstCatalogRow(ctx, cursor, 4)
-				if err != nil {
-					return RoutineRef{}, "", fmt.Errorf("interbase: read trigger source: %w", err)
-				}
-				if !found {
-					continue
-				}
-				name, err := catalogText(row[0])
-				if err != nil {
-					return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger name: %w", err)
-				}
-				source, err := catalogTextTx(ctx, tx, row[1])
-				if err != nil {
-					return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger source: %w", err)
-				}
-				relation, err := catalogText(row[2])
-				if err != nil {
-					return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger relation: %w", err)
-				}
-				typ, err := activityCellInt64(row[3])
-				if err != nil {
-					return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger type: %w", err)
-				}
-				event, _ := triggerEvent(int(typ))
-				return RoutineRef{
-					Kind: "trigger", Name: trimCatalogName(name),
-					Relation: trimCatalogName(relation), Event: event,
-				}, source, nil
-			}
+		cursor, err := tx.Query(ctx, query, args...)
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: read trigger source: %w", err)
 		}
-		return RoutineRef{}, "", ErrRoutineNotFound
+		row, found, err := firstCatalogRow(ctx, cursor, 4)
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: read trigger source: %w", err)
+		}
+		if !found {
+			return RoutineRef{}, "", ErrRoutineNotFound
+		}
+		name, err := catalogText(row[0])
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger name: %w", err)
+		}
+		source, err := catalogTextTx(ctx, tx, row[1])
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger source: %w", err)
+		}
+		relation, err := catalogText(row[2])
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger relation: %w", err)
+		}
+		typ, err := activityCellInt64(row[3])
+		if err != nil {
+			return RoutineRef{}, "", fmt.Errorf("interbase: decode trigger type: %w", err)
+		}
+		event, _ := triggerEvent(int(typ))
+		return RoutineRef{
+			Kind: "trigger", Name: trimCatalogName(name),
+			Relation: trimCatalogName(relation), Event: event,
+		}, source, nil
 	default:
 		return RoutineRef{}, "", fmt.Errorf("interbase: unsupported routine kind %q", ref.Kind)
 	}
@@ -655,9 +701,14 @@ func deduplicateRoutineRefs(refs []RoutineRef) []RoutineRef {
 	return result
 }
 
-func lookupNameVariants(names []string) []string {
-	seen := make(map[string]struct{}, len(names)*2)
-	result := make([]string, 0, len(names)*2)
+type lookupName struct {
+	name   string
+	quoted bool
+}
+
+func lookupNameVariants(names []lookupName) []string {
+	seen := make(map[string]struct{}, len(names))
+	result := make([]string, 0, len(names))
 	add := func(name string) {
 		name = trimCatalogName(name)
 		if name == "" {
@@ -669,10 +720,13 @@ func lookupNameVariants(names []string) []string {
 		seen[name] = struct{}{}
 		result = append(result, name)
 	}
-	for _, name := range names {
-		name = trimCatalogName(name)
-		add(name)
-		add(strings.ToUpper(name))
+	for _, candidate := range names {
+		name := trimCatalogName(candidate.name)
+		if candidate.quoted {
+			add(name)
+		} else {
+			add(strings.ToUpper(name))
+		}
 	}
 	return result
 }

@@ -10,13 +10,16 @@ import (
 
 // Statement is one data statement found in a PSQL body or DSQL text.
 type Statement struct {
-	Line      int
-	Kind      string
-	SQL       string
-	Target    string
-	Procedure string
-	Sources   []string
-	Calls     []string
+	Line            int
+	Kind            string
+	SQL             string
+	Target          string
+	Procedure       string
+	ProcedureQuoted bool
+	Sources         []string
+	Calls           []string
+	QuotedSources   []string
+	QuotedCalls     []string
 }
 
 // Extract finds standalone data statements in a PSQL body. It does not
@@ -34,11 +37,13 @@ func Extract(body string) []Statement {
 		statement := Statement{Line: tokens[i].line, Kind: kind}
 		if kind == "executeProcedure" {
 			statement.Procedure = procedure
+			statement.ProcedureQuoted = tokens[i+2].kind == tokenQuotedIdentifier
 		} else if kind != "executeStatement" {
 			endOffset := tokenRangeEnd(tokens, end, len(body))
 			statement.SQL = rewriteSQL(body, tokens, sqlStart, end, endOffset)
 			statement.Target = statementTarget(tokens, i, end, kind)
-			statement.Sources, statement.Calls = collectSources(tokens, sqlStart, end, kind == "delete")
+			statement.Sources, statement.Calls, statement.QuotedSources, statement.QuotedCalls =
+				collectSources(tokens, sqlStart, end, kind == "delete")
 		}
 		statements = append(statements, statement)
 		i = end
@@ -59,9 +64,11 @@ func ExtractStatementRefs(sql string) Statement {
 		statement := Statement{Line: tokens[i].line, Kind: kind, SQL: sql}
 		if kind == "executeProcedure" {
 			statement.Procedure = procedure
+			statement.ProcedureQuoted = tokens[i+2].kind == tokenQuotedIdentifier
 		} else if kind != "executeStatement" {
 			statement.Target = statementTarget(tokens, i, end, kind)
-			statement.Sources, statement.Calls = collectSources(tokens, sqlStart, end, kind == "delete")
+			statement.Sources, statement.Calls, statement.QuotedSources, statement.QuotedCalls =
+				collectSources(tokens, sqlStart, end, kind == "delete")
 		}
 		return statement
 	}
@@ -255,9 +262,11 @@ func statementTarget(tokens []token, start, end int, kind string) string {
 	return ""
 }
 
-func collectSources(tokens []token, start, end int, skipDeleteTarget bool) ([]string, []string) {
+func collectSources(tokens []token, start, end int, skipDeleteTarget bool) ([]string, []string, []string, []string) {
 	var sources []string
 	var calls []string
+	var quotedSources []string
+	var quotedCalls []string
 	seenSources := make(map[string]bool)
 	seenCalls := make(map[string]bool)
 	fromList := make(map[int]bool)
@@ -269,10 +278,16 @@ func collectSources(tokens []token, start, end int, skipDeleteTarget bool) ([]st
 		if !seenSources[name] {
 			seenSources[name] = true
 			sources = append(sources, name)
+			if tokens[index].kind == tokenQuotedIdentifier {
+				quotedSources = append(quotedSources, name)
+			}
 		}
 		if index+1 < end && tokens[index+1].kind == tokenPunctuation && tokens[index+1].text == "(" && !seenCalls[name] {
 			seenCalls[name] = true
 			calls = append(calls, name)
+			if tokens[index].kind == tokenQuotedIdentifier {
+				quotedCalls = append(quotedCalls, name)
+			}
 		}
 	}
 
@@ -306,7 +321,7 @@ func collectSources(tokens []token, start, end int, skipDeleteTarget bool) ([]st
 			addSource(i + 1)
 		}
 	}
-	return sources, calls
+	return sources, calls, quotedSources, quotedCalls
 }
 
 func isSourceListEnd(t token) bool {
