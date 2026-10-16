@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -162,6 +163,34 @@ func TestConstraintViolationReturnsTypedNativeError(t *testing.T) {
 	if nativeErr.Operation == "" {
 		t.Fatalf("constraint error has no operation: %#v", nativeErr)
 	}
+	if !strings.Contains(nativeErr.Message, "GO_WRITE") {
+		t.Fatalf("constraint message = %q, want the table name", nativeErr.Message)
+	}
+}
+
+func TestNativeErrorMessageNamesTheFailure(t *testing.T) {
+	db := newDatabase(t)
+	rows, err := db.QueryContext(readContext(t), "SELECT NO_SUCH_COLUMN FROM GO_WRITE")
+	if err == nil {
+		rows.Close()
+		t.Fatal("query on an unknown column unexpectedly succeeded")
+	}
+	nativeErr := requireNativeError(t, err)
+	if nativeErr.SQLCode != -206 || !strings.Contains(nativeErr.Message, "\nNO_SUCH_COLUMN") {
+		t.Fatalf("message = %q (SQLCODE %d), want the column name", nativeErr.Message, nativeErr.SQLCode)
+	}
+	t.Logf("unknown column message: %q", nativeErr.Message)
+
+	rows, err = db.QueryContext(readContext(t), "SELECT FROM GO_WRITE")
+	if err == nil {
+		rows.Close()
+		t.Fatal("invalid query unexpectedly succeeded")
+	}
+	nativeErr = requireNativeError(t, err)
+	if nativeErr.SQLCode != -104 || !strings.Contains(nativeErr.Message, "line 1") {
+		t.Fatalf("message = %q (SQLCODE %d), want the token position", nativeErr.Message, nativeErr.SQLCode)
+	}
+	t.Logf("syntax error message: %q", nativeErr.Message)
 }
 
 func TestTransactionSnapshotAndReadCommittedVisibility(t *testing.T) {

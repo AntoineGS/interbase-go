@@ -618,9 +618,17 @@ do not run untrusted SQL. The supplied probe/tests never call them.
   validated cross-version/platform matrix and no unsafe Go-side preflight
   workaround. Use the probe only on a trusted network unless transport security
   is independently configured and verified for the deployed native client.
-- Error reporting uses bounded SQLCODE messages plus a numeric native status.
-  It deliberately avoids the legacy unbounded `isc_interprete` function and
-  omits detailed server-provided strings.
+- `Error.Message` is the interpreted status vector, one `isc_interprete` line
+  per message (for example `Dynamic SQL Error`, `SQL error code = -206`,
+  `Column unknown`, `NO_SUCH_COLUMN`), joined by newlines, with the SQLCODE and
+  numeric native status alongside. The client's formatter overflows its own
+  buffer for string arguments over about 1 KiB and reads past the vector when a
+  code lacks arguments its template needs, so `isc_interprete` only sees a
+  private copy whose string arguments are clamped (255 bytes each, 768 in all,
+  marked `...`) and whose message codes are padded to five arguments. The
+  joined text is capped at 2 KiB; the generic SQLCODE message remains the
+  fallback. Secrets are still redacted on the Go side. The `events` and
+  `services` packages keep the generic SQLCODE message.
 - Race/ASan checks do not establish complete leak-freedom inside the proprietary
   client library, a universal DSQL cancellation latency/thread-safety guarantee,
   or production readiness.
