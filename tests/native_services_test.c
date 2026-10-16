@@ -299,8 +299,88 @@ static void test_consumed_failure_is_releasable(void)
 	manager_pointer = NULL;
 }
 
+static void test_status_text_names_the_failure(void)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	char *error = NULL;
+
+	memset(status, 0, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = isc_random;
+	status[2] = isc_arg_string;
+	status[3] = (ISC_STATUS) (uintptr_t) "backup file busy";
+	status[4] = isc_arg_end;
+	check(fail_status(&error, "start backup", status) == -1 && error != NULL,
+		"status text failure produced no error");
+	check(strstr(error, "SQLCODE") != NULL && strstr(error, "): backup file busy") != NULL,
+		"status-vector string argument is missing");
+	free(error);
+}
+
+static void test_status_text_is_bounded(void)
+{
+	enum { LONG_LENGTH = 16384 };
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	char *argument;
+	char *error = NULL;
+	size_t index;
+
+	argument = system_malloc(LONG_LENGTH + 1U);
+	check(argument != NULL, "argument allocation failed");
+	memset(argument, 'A', LONG_LENGTH);
+	argument[LONG_LENGTH] = '\0';
+	memset(status, 0, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = isc_random;
+	for (index = 2U; index + 2U < IB_STATUS_VECTOR_LENGTH; index += 2U) {
+		status[index] = isc_arg_string;
+		status[index + 1U] = (ISC_STATUS) (uintptr_t) argument;
+	}
+	status[index] = isc_arg_end;
+	(void) fail_status(&error, "synthetic long argument", status);
+	check(error != NULL && strstr(error, "AAA...") != NULL,
+		"long argument was not clamped with a marker");
+	check(strlen(error) < IB_STATUS_TEXT_LIMIT + 256U, "status error exceeds its bound");
+	free(error);
+	system_free(argument);
+
+	/* A code without the arguments its template needs is padded, not read past. */
+	memset(status, 0x5a, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = isc_network_error;
+	status[2] = isc_arg_end;
+	error = NULL;
+	(void) fail_status(&error, "synthetic missing arguments", status);
+	check(error != NULL && strstr(error, "SQLCODE") != NULL,
+		"vector without template arguments produced no error");
+	free(error);
+}
+
+static void test_unterminated_status_falls_back(void)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS copy[IB_STATUS_COPY_LENGTH];
+	char storage[IB_STATUS_ARGUMENTS_LIMIT + IB_STATUS_VECTOR_LENGTH];
+	char *error = NULL;
+	size_t index;
+
+	for (index = 0U; index + 1U < IB_STATUS_VECTOR_LENGTH; index += 2U) {
+		status[index] = isc_arg_gds;
+		status[index + 1U] = isc_dsql_error;
+	}
+	check(!clamped_status_copy(status, copy, storage),
+		"unterminated vector was accepted for interpretation");
+	(void) fail_status(&error, "synthetic unterminated", status);
+	check(error != NULL && strstr(error, "SQLCODE") != NULL,
+		"unterminated vector lost its numeric context");
+	free(error);
+}
+
 int main(void)
 {
+	test_status_text_names_the_failure();
+	test_status_text_is_bounded();
+	test_unterminated_status_falls_back();
 	test_attach_failure_cleanup_success_releases_wrapper();
 	test_attach_failure_cleanup_live_handle_is_recoverable();
 	test_attach_failure_cleanup_consumed_releases_wrapper();

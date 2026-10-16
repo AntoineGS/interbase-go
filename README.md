@@ -628,7 +628,8 @@ do not run untrusted SQL. The supplied probe/tests never call them.
   marked `...`) and whose message codes are padded to five arguments. The
   joined text is capped at 2 KiB; the generic SQLCODE message remains the
   fallback. Secrets are still redacted on the Go side. The `events` and
-  `services` packages keep the generic SQLCODE message.
+  `services` packages format their native errors the same way, each with its
+  own copy of the C.
 - Race/ASan checks do not establish complete leak-freedom inside the proprietary
   client library, a universal DSQL cancellation latency/thread-safety guarantee,
   or production readiness.

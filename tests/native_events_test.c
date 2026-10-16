@@ -808,6 +808,70 @@ static void test_token_overflow(void)
 	}
 }
 
+static void test_status_text(void)
+{
+	enum { LONG_LENGTH = 16384, VECTOR = 20 };
+	intptr_t status[VECTOR];
+	char *argument;
+	char *error = NULL;
+	size_t index;
+
+	memset(status, 0, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = isc_random;
+	status[2] = isc_arg_string;
+	status[3] = (intptr_t) "event queue busy";
+	status[4] = isc_arg_end;
+	check(ib_event_test_fail_status("queue database events", status, VECTOR, &error) == -1 &&
+		error != NULL && strstr(error, "SQLCODE") != NULL &&
+		strstr(error, "): event queue busy") != NULL,
+		"event status-vector string argument is missing");
+	ib_event_error_free(error);
+
+	argument = malloc(LONG_LENGTH + 1U);
+	check(argument != NULL, "argument allocation failed");
+	if (argument == NULL) {
+		return;
+	}
+	memset(argument, 'A', LONG_LENGTH);
+	argument[LONG_LENGTH] = '\0';
+	memset(status, 0, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = isc_random;
+	for (index = 2U; index + 2U < VECTOR; index += 2U) {
+		status[index] = isc_arg_string;
+		status[index + 1U] = (intptr_t) argument;
+	}
+	status[index] = isc_arg_end;
+	error = NULL;
+	(void) ib_event_test_fail_status("synthetic long argument", status, VECTOR, &error);
+	check(error != NULL && strstr(error, "AAA...") != NULL && strlen(error) < 2048U + 256U,
+		"long event argument was not clamped and bounded");
+	ib_event_error_free(error);
+	free(argument);
+
+	memset(status, 0x5a, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = isc_network_error;
+	status[2] = isc_arg_end;
+	error = NULL;
+	(void) ib_event_test_fail_status("synthetic missing arguments", status, VECTOR, &error);
+	check(error != NULL && strstr(error, "SQLCODE") != NULL,
+		"event vector without template arguments produced no error");
+	ib_event_error_free(error);
+
+	for (index = 0U; index + 1U < VECTOR; index += 2U) {
+		status[index] = isc_arg_gds;
+		status[index + 1U] = isc_dsql_error;
+	}
+	error = NULL;
+	(void) ib_event_test_fail_status("synthetic unterminated", status, VECTOR, &error);
+	check(error != NULL && strstr(error, "SQLCODE") != NULL &&
+		strstr(error, "Dynamic SQL Error") == NULL,
+		"unterminated event vector was interpreted or lost its numeric context");
+	ib_event_error_free(error);
+}
+
 int main(void)
 {
 	const char *names[16] = {
@@ -896,6 +960,7 @@ int main(void)
 	test_cleanup_retains_subscription_when_error_allocation_fails();
 	test_callback_pre_entry_after_destroy();
 	test_token_overflow();
+	test_status_text();
 
 	return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

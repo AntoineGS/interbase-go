@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,26 @@ END`, eventA, eventB))
 	if err != nil {
 		t.Fatalf("create event trigger: %v", err)
 	}
+}
+
+func TestEventsAttachFailureCarriesStatusText(t *testing.T) {
+	fixture, cfg, _ := createFixture(t, 3)
+	ctx := readContextWithTimeout(t, 30*time.Second)
+	subscription, err := events.Subscribe(ctx, interbase.Config{
+		Database: fixture.ConnectionString(),
+		User:     cfg.User,
+		Password: uniqueIntegrationPassword(),
+		Dialect:  3,
+	}, uniqueIntegrationIdentifier("EVENT_A"))
+	if err == nil {
+		_ = subscription.Close()
+		t.Fatal("subscription with a wrong password unexpectedly succeeded")
+	}
+	nativeErr := requireNativeError(t, err)
+	if !strings.Contains(strings.ToLower(nativeErr.Message), "user name and password") {
+		t.Fatalf("message = %q, want the interpreted login failure", nativeErr.Message)
+	}
+	t.Logf("event attach failure: %q", nativeErr.Message)
 }
 
 func TestEventsAccumulateNotifications(t *testing.T) {
