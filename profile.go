@@ -53,6 +53,54 @@ func finishProfile(result ProfileResult, before, after Activity) (ProfileResult,
 	return result, nil
 }
 
+func runProfileTransaction(rollback func() error, operation func() error, rolledBack *bool) (err error) {
+	rollbackAttempted := false
+	defer func() {
+		panicValue := recover()
+		if rollbackAttempted {
+			if panicValue != nil {
+				panic(panicValue)
+			}
+			return
+		}
+		rollbackAttempted = true
+		rollbackErr := rollback()
+		if rollbackErr == nil && rolledBack != nil {
+			*rolledBack = true
+		}
+		if panicValue != nil {
+			if rollbackErr != nil {
+				panic(profilePanicRollbackError(panicValue, rollbackErr))
+			}
+			panic(panicValue)
+		}
+		if rollbackErr != nil {
+			err = errors.Join(err, fmt.Errorf("%w: %w", ErrProfileRollback, rollbackErr))
+		}
+	}()
+
+	operationErr := operation()
+	rollbackAttempted = true
+	rollbackErr := rollback()
+	if rollbackErr == nil && rolledBack != nil {
+		*rolledBack = true
+	}
+	if rollbackErr != nil {
+		rollbackErr = fmt.Errorf("%w: %w", ErrProfileRollback, rollbackErr)
+	}
+	return errors.Join(operationErr, rollbackErr)
+}
+
+func profilePanicRollbackError(panicValue any, rollbackErr error) error {
+	var panicErr error
+	if originalErr, ok := panicValue.(error); ok {
+		panicErr = fmt.Errorf("profile panic: %w", originalErr)
+	} else {
+		panicErr = fmt.Errorf("profile panic: %v", panicValue)
+	}
+	return errors.Join(panicErr, fmt.Errorf("%w: %w", ErrProfileRollback, rollbackErr))
+}
+
 // Profile runs query once in its own read-committed transaction on the
 // attachment behind conn, discards every fetched row, and always rolls the
 // transaction back. Any caller transaction or cursor on conn is left
@@ -102,31 +150,12 @@ func Profile(ctx context.Context, pooled *sql.Conn, query string, options Profil
 			return err
 		}
 
-		rollbackAttempted := false
-		defer func() {
-			panicValue := recover()
-			if !rollbackAttempted {
-				rollbackAttempted = true
-				if rollbackErr := tx.Rollback(); rollbackErr == nil {
-					result.RolledBack = true
-				}
-			}
-			if panicValue != nil {
-				panic(panicValue)
-			}
-		}()
-
-		result.RawPlan, result.Prepare, result.Execute, result.Fetch,
-			result.ReturnsRows, result.Rows, result.Complete, err =
-			tx.profileStatement(ctx, query, options.MaxRows, options.FetchAll)
-		rollbackAttempted = true
-		rollbackErr := tx.Rollback()
-		if rollbackErr == nil {
-			result.RolledBack = true
-		} else {
-			rollbackErr = fmt.Errorf("%w: %w", ErrProfileRollback, rollbackErr)
-		}
-		return errors.Join(err, rollbackErr)
+		return runProfileTransaction(tx.Rollback, func() error {
+			result.RawPlan, result.Prepare, result.Execute, result.Fetch,
+				result.ReturnsRows, result.Rows, result.Complete, err =
+				tx.profileStatement(ctx, query, options.MaxRows, options.FetchAll)
+			return err
+		}, &result.RolledBack)
 	})
 	resultErr = errors.Join(resultErr, profileErr)
 

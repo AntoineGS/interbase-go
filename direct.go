@@ -988,6 +988,7 @@ func (t *Transaction) profileStatement(ctx context.Context, query string, maxRow
 			err = enterErr
 			return
 		}
+		defer releaseNative()
 		started := time.Now()
 		statement, err = t.native.prepare(ctx, query, true)
 		prep = time.Since(started)
@@ -1071,6 +1072,7 @@ func (t *Transaction) profileStatement(ctx context.Context, query string, maxRow
 			err = enterErr
 			return
 		}
+		defer releaseNative()
 		started := time.Now()
 		if returnsRows {
 			var nativeCursor *nativeCursor
