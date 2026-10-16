@@ -196,6 +196,23 @@ a caller that simply returns the error already lets the pool discard it. The
 `Introspector` value handed to a `Raw` callback must not be retained beyond
 that callback.
 
+### SQL and profiling helpers
+
+The profiling helpers reuse a borrowed `*sql.Conn`; they do not open a second
+attachment:
+
+- `planparse.Parse(raw)` parses a server-generated plan into a tree.
+- `psql.Extract(body)` splits stored procedure or trigger source into statements.
+- `psql.ExtractStatementRefs(sql)` extracts procedure and trigger references from SQL.
+- `psql.Aliases(sql)` maps SQL aliases to their relation names.
+- `ReadActivity(ctx, conn)` snapshots attachment-scoped table and page counters.
+- `RelationNames(ctx, conn, ids)` resolves relation IDs in a short read-only transaction.
+- `ReadRoutineActivity(ctx, conn)` snapshots database-wide procedure and trigger counters.
+- `DescribePlan(ctx, conn, query, raw)` parses plan text and looks up relation and index details.
+- `StatementRoutines(ctx, conn, query)` resolves referenced procedures and triggers.
+- `PlanRoutine(ctx, conn, ref)` derives prepare-only plans for stored-routine statements.
+- `Profile(ctx, conn, query, options)` times one execution, discards fetched rows, and always rolls back.
+
 ### Explicit direct API
 
 Use `Open` when the application needs an explicitly owned attachment and the
