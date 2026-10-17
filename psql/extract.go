@@ -39,7 +39,7 @@ func Extract(body string) []Statement {
 			statement.ProcedureQuoted = tokens[i+2].kind == tokenQuotedIdentifier
 		} else if kind != "executeStatement" {
 			endOffset := tokenRangeEnd(tokens, end, len(body))
-			statement.SQL = rewriteSQL(body, tokens, sqlStart, end, endOffset)
+			statement.SQL = rewriteSQL(body, tokens, sqlStart, end, endOffset, kind)
 			statement.Target = statementTarget(tokens, i, end, kind)
 			statement.Sources, statement.Calls, statement.QuotedSources, statement.QuotedCalls =
 				collectSources(tokens, sqlStart, end, kind == "delete")
@@ -174,7 +174,7 @@ type textEdit struct {
 	replacement string
 }
 
-func rewriteSQL(input string, tokens []token, start, end, endOffset int) string {
+func rewriteSQL(input string, tokens []token, start, end, endOffset int, kind string) string {
 	startOffset := tokens[start].start
 	if endOffset < startOffset {
 		return ""
@@ -183,12 +183,12 @@ func rewriteSQL(input string, tokens []token, start, end, endOffset int) string 
 	removedStart, removedEnd := -1, -1
 
 	for i := start; i < end; i++ {
-		if tokens[i].depth != 0 || !keyword(tokens[i], "INTO") || i+1 >= end || tokens[i+1].kind != tokenParameter {
+		if tokens[i].depth != 0 || !keyword(tokens[i], "INTO") || !isOutputInto(kind, tokens, start, i) {
 			continue
 		}
-		last := i + 1
-		for last+2 < end && tokens[last+1].kind == tokenPunctuation && tokens[last+1].text == "," && tokens[last+2].kind == tokenParameter {
-			last += 2
+		last, ok := intoTargetListEnd(tokens, input, i+1, end)
+		if !ok || last+1 != end {
+			continue
 		}
 		removeEnd := tokens[last].end
 		if last+1 < end && onlyWhitespace(input[tokens[last].end:tokens[last+1].start]) {
@@ -229,6 +229,62 @@ func rewriteSQL(input string, tokens []token, start, end, endOffset int) string 
 	}
 	output.WriteString(input[cursor:endOffset])
 	return trimASCIIWhitespace(output.String())
+}
+
+func isOutputInto(kind string, tokens []token, start, into int) bool {
+	if kind == "select" || kind == "forSelect" {
+		return true
+	}
+	if kind != "update" {
+		return false
+	}
+	for i := start; i < into; i++ {
+		if tokens[i].depth == 0 && keyword(tokens[i], "RETURNING") {
+			return true
+		}
+	}
+	return false
+}
+
+func intoTargetListEnd(tokens []token, input string, start, end int) (int, bool) {
+	last, ok := intoTargetEnd(tokens, input, start, end)
+	if !ok {
+		return 0, false
+	}
+	for last+1 < end && tokens[last+1].depth == 0 &&
+		tokens[last+1].kind == tokenPunctuation && tokens[last+1].text == "," {
+		last, ok = intoTargetEnd(tokens, input, last+2, end)
+		if !ok {
+			return 0, false
+		}
+	}
+	return last, true
+}
+
+func intoTargetEnd(tokens []token, input string, start, end int) (int, bool) {
+	if start >= end || tokens[start].depth != 0 {
+		return 0, false
+	}
+	t := tokens[start]
+	switch {
+	case t.kind == tokenParameter:
+		return start, true
+	case t.kind == tokenPunctuation && t.text == "?":
+		return start, true
+	case t.kind == tokenPunctuation && t.text == ":":
+		if start+1 < end && tokens[start+1].depth == 0 && isNameToken(tokens[start+1]) &&
+			onlyWhitespace(input[t.end:tokens[start+1].start]) {
+			return start + 1, true
+		}
+	case isNameToken(t):
+		if (keyword(t, "NEW") || keyword(t, "OLD")) && start+2 < end &&
+			tokens[start+1].depth == 0 && tokens[start+1].kind == tokenPunctuation && tokens[start+1].text == "." &&
+			isNameToken(tokens[start+2]) {
+			return start + 2, true
+		}
+		return start, true
+	}
+	return 0, false
 }
 
 func onlyWhitespace(text string) bool {

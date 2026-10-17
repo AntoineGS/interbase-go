@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"math"
 	"reflect"
 	"testing"
 )
@@ -269,5 +271,32 @@ func TestRoutineActivityDeltaReportsNewAndChangedRoutinesOnly(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("RoutineActivity.Delta() = %#v, want %#v", got, want)
+	}
+}
+
+func TestActivityCellInt64AcceptsIntegralFloat64Counters(t *testing.T) {
+	for _, tt := range []struct {
+		value float64
+		want  int64
+	}{
+		{value: 0, want: 0},
+		{value: 42, want: 42},
+		{value: -7, want: -7},
+		{value: -0x1p63, want: -1 << 63},
+	} {
+		got, err := activityCellInt64(Cell{Value: tt.value})
+		if err != nil || got != tt.want {
+			t.Errorf("activityCellInt64(%v) = (%d, %v), want (%d, nil)", tt.value, got, err, tt.want)
+		}
+	}
+}
+
+func TestActivityCellInt64RejectsInvalidFloat64Counters(t *testing.T) {
+	for _, value := range []float64{1.5, math.NaN(), math.Inf(1), math.Inf(-1), 0x1p63, -0x1p63 - 2048} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			if _, err := activityCellInt64(Cell{Value: value}); err == nil {
+				t.Fatalf("activityCellInt64(%v) error = nil, want error", value)
+			}
+		})
 	}
 }

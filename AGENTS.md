@@ -4,6 +4,23 @@ See `README.md` for prerequisites, build and test commands, and
 `docs/production-hardening.md` for the execution contract and repeatable
 checks.
 
+## No sensitive information in commits (required)
+
+This repository is public. Never commit sensitive information in code,
+tests, fixtures, testdata, comments, documentation or commit messages:
+
+- credentials, passwords, keys, tokens, connection strings or certificates;
+- host, server, database or file-path names of real systems;
+- customer, company or personal names;
+- SQL, procedure/trigger source, schema, table, column, index or generator
+  names copied from a real (non-fixture) database, and any data from one.
+
+Tests and fixtures use synthetic, neutral names and values only. When a bug
+is found on a real database, reproduce it with an equivalent synthetic
+fixture instead of copying its SQL or names. Before every commit, review the
+staged diff for such content; if anything slips into history, stop and report
+it rather than pushing.
+
 ## Work tracking — Beads (required)
 
 Tracked work lives in Beads (`bd`, issue prefix `ibg`); run `bd prime` for

@@ -95,9 +95,6 @@ func tokenize(input string) ([]token, error) {
 			if err != nil {
 				return nil, err
 			}
-			if value == "" {
-				return nil, fmt.Errorf("empty quoted identifier at byte %d", i)
-			}
 			tokens = append(tokens, token{kind: tokenIdentifier, text: value, quoted: true})
 			i = next
 		default:
@@ -245,6 +242,14 @@ func (p *parser) parseList() ([]*Node, error) {
 			return nil, err
 		}
 		children = append(children, child)
+		for p.keyword("PLAN") {
+			p.pos++
+			child, err = p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			children = append(children, child)
+		}
 
 		if p.done() {
 			return nil, fmt.Errorf("unterminated plan list")
@@ -278,12 +283,15 @@ func (p *parser) parseElement() (*Node, error) {
 }
 
 func (p *parser) parseTable() (*Node, error) {
-	if p.done() || p.current().kind != tokenIdentifier {
+	if p.done() || p.current().kind != tokenIdentifier || p.current().text == "" {
 		return nil, fmt.Errorf("expected table label")
 	}
 	labels := []string{p.current().text}
 	p.pos++
 	for !p.done() && p.current().kind == tokenIdentifier && !p.isAccess(p.pos) {
+		if p.current().text == "" {
+			return nil, fmt.Errorf("table label cannot be empty")
+		}
 		labels = append(labels, p.current().text)
 		p.pos++
 	}
@@ -310,7 +318,7 @@ func (p *parser) parseTable() (*Node, error) {
 	case p.keyword("ORDER"):
 		node.Access = "order"
 		p.pos++
-		if p.done() || p.current().kind != tokenIdentifier {
+		if p.done() || p.current().kind != tokenIdentifier || p.current().text == "" {
 			return nil, fmt.Errorf("ORDER access requires an index name")
 		}
 		node.OrderIndex = p.current().text

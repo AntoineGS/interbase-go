@@ -439,6 +439,17 @@ func activityCellInt64(cell Cell) (int64, error) {
 	switch value := cell.Value.(type) {
 	case int64:
 		return value, nil
+	case float64:
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return 0, errors.New("non-finite floating-point integer value")
+		}
+		if math.Trunc(value) != value {
+			return 0, fmt.Errorf("non-integral floating-point integer value %v", value)
+		}
+		if value < -0x1p63 || value >= 0x1p63 {
+			return 0, fmt.Errorf("floating-point integer value %v overflows int64", value)
+		}
+		return int64(value), nil
 	case []byte:
 		parsed, err := strconv.ParseInt(string(value), 10, 64)
 		if err != nil {

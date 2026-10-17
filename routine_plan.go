@@ -32,10 +32,11 @@ type PlanIndex struct {
 
 // PlanDescription contains parsed plan text and available catalog details.
 type PlanDescription struct {
-	Raw     string
-	Tree    *planparse.Tree
-	Problem string
-	Indexes map[string]PlanIndex
+	Raw         string
+	Tree        *planparse.Tree
+	Problem     string
+	Indexes     map[string]PlanIndex
+	MainOmitted bool
 }
 
 // RoutineRef identifies a procedure or a trigger and its relation/event.
@@ -76,7 +77,6 @@ func DescribePlan(ctx context.Context, conn *sql.Conn, query, raw string) (PlanD
 		return description, nil
 	}
 	description.Tree = tree
-
 	err = WithTransaction(ctx, conn, TransactionOptions{
 		ReadOnly:  true,
 		Isolation: sql.LevelReadCommitted,
@@ -173,14 +173,24 @@ func describePlanTx(ctx context.Context, tx *Transaction, query, raw string) (Pl
 		return description, nil
 	}
 	description.Tree = tree
+	scopes := psql.AnalyzeAliases(query)
 	if err := contextError(ctx); err != nil {
 		return description, err
 	}
 
 	quotedNames := quotedIdentifierSet(query, raw)
-	labels := planRelationLabels(tree, quotedNames)
+	labels := planRelationCandidates(tree, scopes, quotedNames)
 	indexNames := planIndexNames(tree, quotedNames)
 	relationNames, err := readPlanRelationsTx(ctx, tx, labels)
+	if err != nil {
+		return description, err
+	}
+	description.MainOmitted = mainPlanOmitted(scopes, tree, func(name string) bool {
+		_, ok := relationNames[name]
+		return ok
+	})
+	viewCandidates := planViewCandidates(tree, scopes, quotedNames)
+	viewRelations, err := readPlanViewRelationsTx(ctx, tx, viewCandidates)
 	if err != nil {
 		return description, err
 	}
@@ -188,7 +198,7 @@ func describePlanTx(ctx context.Context, tx *Transaction, query, raw string) (Pl
 	if err != nil {
 		return description, err
 	}
-	resolveRelationsWithQuotedNames(tree, psql.Aliases(query), func(name string) bool {
+	resolvePlanRelations(tree, scopes, viewRelations, func(name string) bool {
 		if _, quoted := quotedNames[name]; quoted {
 			_, ok := relationNames[name]
 			return ok
@@ -197,6 +207,68 @@ func describePlanTx(ctx context.Context, tx *Transaction, query, raw string) (Pl
 		return ok
 	}, quotedNames)
 	return description, nil
+}
+
+func mainPlanOmitted(scopes psql.AliasScopes, tree *planparse.Tree, isRelation func(string) bool) bool {
+	if !scopes.IsSelect() || tree == nil || isRelation == nil {
+		return false
+	}
+	hasRelationSource := false
+	for _, name := range scopes.TopLevelNames() {
+		for _, relation := range scopes.TopLevelRelations(name) {
+			if isRelation(relation) {
+				hasRelationSource = true
+			}
+		}
+		for _, relation := range scopes.TopLevelDerivedRelations(name) {
+			if isRelation(relation) {
+				hasRelationSource = true
+			}
+		}
+	}
+	if !hasRelationSource {
+		return false
+	}
+	for _, root := range tree.Roots {
+		var found bool
+		var visit func(*planparse.Node)
+		visit = func(node *planparse.Node) {
+			if node == nil || found {
+				return
+			}
+			if node.Kind == "table" && len(node.Labels) != 0 {
+				for _, relation := range scopes.TopLevelRelations(node.Labels[0]) {
+					if isRelation(relation) {
+						found = true
+						return
+					}
+				}
+			}
+			for _, child := range node.Children {
+				visit(child)
+			}
+		}
+		visit(root)
+		if found {
+			return false
+		}
+	}
+	return true
+}
+
+func planRelationCandidates(tree *planparse.Tree, scopes psql.AliasScopes, quotedNames map[string]struct{}) []lookupName {
+	candidates := planRelationLabels(tree, quotedNames)
+	for _, name := range scopes.TopLevelNames() {
+		for _, relation := range scopes.TopLevelRelations(name) {
+			_, quoted := quotedNames[relation]
+			candidates = append(candidates, lookupName{name: relation, quoted: quoted})
+		}
+		for _, relation := range scopes.TopLevelDerivedRelations(name) {
+			_, quoted := quotedNames[relation]
+			candidates = append(candidates, lookupName{name: relation, quoted: quoted})
+		}
+	}
+	return candidates
 }
 
 func resolveRelations(tree *planparse.Tree, aliases map[string]string, isRelation func(string) bool) {
@@ -232,6 +304,191 @@ func resolveRelationsWithQuotedNames(tree *planparse.Tree, aliases map[string]st
 	for _, root := range tree.Roots {
 		visit(root)
 	}
+}
+
+type planViewContexts map[string]map[string]string
+
+func resolvePlanRelations(tree *planparse.Tree, scopes psql.AliasScopes, views planViewContexts,
+	isRelation func(string) bool, quotedNames map[string]struct{}) {
+	if tree == nil {
+		return
+	}
+	var visit func(*planparse.Node)
+	visit = func(node *planparse.Node) {
+		if node == nil {
+			return
+		}
+		if node.Kind == "table" && len(node.Labels) != 0 {
+			chain := make([]string, len(node.Labels))
+			for i, label := range node.Labels {
+				chain[i] = trimCatalogName(label)
+			}
+			if relation, ok := scopes.Resolve(chain); ok {
+				node.Relation = relation
+			} else if len(chain) == 1 {
+				if isRelation != nil && isRelation(chain[0]) {
+					node.Relation = chain[0]
+				}
+			} else if !scopes.HasDerived(chain[0]) {
+				if relation, ok := resolvePlanViewChain(chain, scopes, views, quotedNames); ok {
+					node.Relation = relation
+				} else if !hasPlanViewContext(chain[0], scopes, views, quotedNames) {
+					last := chain[len(chain)-1]
+					if relation, ok := scopes.Resolve([]string{last}); ok {
+						node.Relation = relation
+					} else if isRelation != nil && isRelation(last) {
+						node.Relation = last
+					}
+				}
+			}
+		}
+		for _, child := range node.Children {
+			visit(child)
+		}
+	}
+	for _, root := range tree.Roots {
+		visit(root)
+	}
+}
+
+func hasPlanViewContext(first string, scopes psql.AliasScopes, views planViewContexts,
+	quotedNames map[string]struct{}) bool {
+	view := first
+	if relation, ok := scopes.Resolve([]string{first}); ok {
+		view = relation
+	}
+	_, quoted := quotedNames[first]
+	for viewName := range views {
+		if sameLookupName(view, viewName, quoted) {
+			return true
+		}
+	}
+	return false
+}
+
+func resolvePlanViewChain(chain []string, scopes psql.AliasScopes, views planViewContexts,
+	quotedNames map[string]struct{}) (string, bool) {
+	if len(chain) < 2 {
+		return "", false
+	}
+	view := chain[0]
+	if relation, ok := scopes.Resolve(chain[:1]); ok {
+		view = relation
+	}
+	_, viewQuoted := quotedNames[chain[0]]
+	for index := 1; index < len(chain); index++ {
+		_, contextQuoted := quotedNames[chain[index]]
+		relation, ok := findPlanViewContext(views, view, chain[index], viewQuoted, contextQuoted)
+		if !ok {
+			return "", false
+		}
+		if index == len(chain)-1 {
+			return relation, true
+		}
+		view = relation
+		viewQuoted = true
+	}
+	return "", false
+}
+
+func findPlanViewContext(views planViewContexts, view, context string, viewQuoted, contextQuoted bool) (string, bool) {
+	for viewName, contexts := range views {
+		if !sameLookupName(view, viewName, viewQuoted) {
+			continue
+		}
+		for contextName, relation := range contexts {
+			if sameLookupName(context, contextName, contextQuoted) {
+				return relation, true
+			}
+		}
+	}
+	return "", false
+}
+
+func planViewCandidates(tree *planparse.Tree, scopes psql.AliasScopes, quotedNames map[string]struct{}) []lookupName {
+	var names []lookupName
+	var visit func(*planparse.Node)
+	visit = func(node *planparse.Node) {
+		if node == nil {
+			return
+		}
+		if node.Kind == "table" && len(node.Labels) > 1 && !scopes.HasDerived(node.Labels[0]) {
+			name := trimCatalogName(node.Labels[0])
+			if relation, ok := scopes.Resolve([]string{name}); ok {
+				name = relation
+			}
+			_, quoted := quotedNames[node.Labels[0]]
+			names = append(names, lookupName{name: name, quoted: quoted})
+		}
+		for _, child := range node.Children {
+			visit(child)
+		}
+	}
+	for _, root := range tree.Roots {
+		visit(root)
+	}
+	return names
+}
+
+func readPlanViewRelationsTx(ctx context.Context, tx *Transaction, candidates []lookupName) (planViewContexts, error) {
+	views := make(planViewContexts)
+	pending := lookupNameVariants(candidates)
+	queried := make(map[string]struct{}, len(pending))
+	for len(pending) > 0 {
+		current := make([]string, 0, len(pending))
+		for _, name := range pending {
+			if _, exists := queried[name]; exists {
+				continue
+			}
+			queried[name] = struct{}{}
+			current = append(current, name)
+		}
+		pending = nil
+		for start := 0; start < len(current); start += routinePlanChunkSize {
+			end := start + routinePlanChunkSize
+			if end > len(current) {
+				end = len(current)
+			}
+			chunk := current[start:end]
+			query := "SELECT RDB$VIEW_NAME, RDB$CONTEXT_NAME, RDB$RELATION_NAME FROM RDB$VIEW_RELATIONS WHERE RDB$VIEW_NAME IN (" +
+				inPlaceholders(len(chunk)) + ")"
+			cursor, err := tx.Query(ctx, query, stringArguments(chunk)...)
+			if err != nil {
+				return nil, fmt.Errorf("interbase: read plan view relations: %w", err)
+			}
+			err = visitCatalogCursor(ctx, cursor, func(row []Cell) error {
+				if len(row) != 3 {
+					return errors.New("interbase: plan view relation query returned an unexpected column count")
+				}
+				view, err := catalogText(row[0])
+				if err != nil {
+					return fmt.Errorf("decode view name: %w", err)
+				}
+				contextName, err := catalogText(row[1])
+				if err != nil {
+					return fmt.Errorf("decode view context name: %w", err)
+				}
+				relation, err := catalogText(row[2])
+				if err != nil {
+					return fmt.Errorf("decode view relation name: %w", err)
+				}
+				view, contextName, relation = trimCatalogName(view), trimCatalogName(contextName), trimCatalogName(relation)
+				if view == "" || contextName == "" || relation == "" {
+					return nil
+				}
+				if views[view] == nil {
+					views[view] = make(map[string]string)
+				}
+				views[view][contextName] = relation
+				pending = append(pending, relation)
+				return nil
+			})
+			if err != nil {
+				return nil, fmt.Errorf("interbase: read plan view relations: %w", err)
+			}
+		}
+	}
+	return views, nil
 }
 
 func lookupAlias(aliases map[string]string, label string) (string, bool) {
@@ -474,6 +731,7 @@ func statementRoutineCandidates(statement psql.Statement) []lookupName {
 
 func planRoutineCandidates(statement psql.Statement) []lookupName {
 	candidates := []lookupName{{name: statement.Procedure, quoted: statement.ProcedureQuoted}}
+	candidates = append(candidates, psqlLookupNames(statement.Sources, statement.QuotedSources)...)
 	return append(candidates, psqlLookupNames(statement.Calls, statement.QuotedCalls)...)
 }
 
@@ -690,8 +948,8 @@ func deduplicateRoutineRefs(refs []RoutineRef) []RoutineRef {
 	seen := make(map[string]struct{}, len(refs))
 	result := make([]RoutineRef, 0, len(refs))
 	for _, ref := range refs {
-		key := strings.ToLower(ref.Kind) + "\x00" + catalogNameKey(ref.Name) + "\x00" +
-			catalogNameKey(ref.Relation) + "\x00" + ref.Event
+		key := strings.ToLower(ref.Kind) + "\x00" + trimCatalogName(ref.Name) + "\x00" +
+			trimCatalogName(ref.Relation) + "\x00" + ref.Event
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -758,7 +1016,9 @@ func catalogTextTx(ctx context.Context, tx *Transaction, cell Cell) (string, err
 	if !ok {
 		return activityCellText(cell)
 	}
-	reader, err := tx.OpenBlob(ctx, reference)
+	rawReference := reference
+	rawReference.charset = 0
+	reader, err := tx.OpenBlob(ctx, rawReference)
 	if err != nil {
 		return "", err
 	}
