@@ -937,6 +937,218 @@ func (t *Transaction) retain(commit bool) error {
 	return nil
 }
 
+// profileStatement prepares and executes one statement in this transaction,
+// retaining the native statement between prepare and execute. It does not
+// materialize row values.
+func (t *Transaction) profileStatement(ctx context.Context, query string, maxRows int, fetchAll bool) (
+	plan string, prep, exec, fetch time.Duration, returnsRows bool, rows int64, complete bool, err error,
+) {
+	if maxRows < 1 {
+		return "", 0, 0, 0, false, 0, false, errors.New("interbase: profile MaxRows must be positive")
+	}
+	if err := contextError(ctx); err != nil {
+		return "", 0, 0, 0, false, 0, false, err
+	}
+	if err := validateDatabaseSQLQuery(query); err != nil {
+		return "", 0, 0, 0, false, 0, false, err
+	}
+	if t == nil || t.attachment == nil || t.attachment.conn == nil {
+		return "", 0, 0, 0, false, 0, false, errTransactionDone
+	}
+	c := t.attachment.conn
+	var statement *nativeStatement
+	var cursor *Cursor
+	defer func() {
+		if cursor != nil {
+			err = errors.Join(err, cursor.Close())
+		}
+		if statement != nil {
+			c.mu.Lock()
+			closeErr := statement.close()
+			if closeErr != nil && c.native != nil && c.native.broken() {
+				t.invalidateLocked(closeErr)
+			}
+			c.mu.Unlock()
+			if closeErr != nil {
+				err = errors.Join(err, c.sanitizeError("close profile statement", closeErr))
+			}
+		}
+	}()
+
+	func() {
+		c.lockDirect()
+		defer c.mu.Unlock()
+		a, checkErr := t.checkLocked()
+		if checkErr != nil {
+			err = checkErr
+			return
+		}
+		releaseNative, enterErr := enterNativeContext(ctx)
+		if enterErr != nil {
+			err = enterErr
+			return
+		}
+		defer releaseNative()
+		started := time.Now()
+		statement, err = t.native.prepare(ctx, query, true)
+		prep = time.Since(started)
+		releaseNative()
+		if err == nil {
+			return
+		}
+		evidence := nativeCancellationEvidenceOf(err)
+		parts := splitNativeExecutionError(err)
+		operationErr := a.conn.sanitizeError("prepare profile statement", parts.primary)
+		cleanupErr := a.conn.sanitizeError("", parts.cleanup)
+		operationErr = classifyNativeOutcome("prepare profile statement", false,
+			contextCancellation(ctx), operationErr, cleanupErr, evidence)
+		operationErr = joinNativeRequestDiagnostic(operationErr,
+			a.conn.sanitizeError("", parts.request))
+		if a.conn.native.broken() {
+			t.invalidateLocked(operationErr)
+		}
+		err = operationErr
+	}()
+	if err != nil {
+		return
+	}
+	if err = contextError(ctx); err != nil {
+		return
+	}
+
+	func() {
+		c.lockDirect()
+		defer c.mu.Unlock()
+		a, checkErr := t.checkLocked()
+		if checkErr != nil {
+			err = checkErr
+			return
+		}
+		releaseNative, enterErr := enterNativeContext(ctx)
+		if enterErr != nil {
+			err = enterErr
+			return
+		}
+		defer releaseNative()
+		plan, err = statement.plan()
+		if err != nil {
+			err = a.conn.sanitizeError("read profile plan", err)
+			if a.conn.native.broken() {
+				t.invalidateLocked(err)
+			}
+			return
+		}
+		description, describeErr := statement.description()
+		if describeErr != nil {
+			err = a.conn.sanitizeError("describe profile statement", describeErr)
+			if a.conn.native.broken() {
+				t.invalidateLocked(err)
+			}
+			return
+		}
+		if description.Kind == "unsupported" {
+			err = fmt.Errorf("interbase: profile statement type %q is unsupported", description.Kind)
+			return
+		}
+		returnsRows = description.ReturnsRows
+	}()
+	if err != nil {
+		return
+	}
+	if err = contextError(ctx); err != nil {
+		return
+	}
+
+	func() {
+		c.lockDirect()
+		defer c.mu.Unlock()
+		a, checkErr := t.checkLocked()
+		if checkErr != nil {
+			err = checkErr
+			return
+		}
+		releaseNative, enterErr := enterNativeContext(ctx)
+		if enterErr != nil {
+			err = enterErr
+			return
+		}
+		defer releaseNative()
+		started := time.Now()
+		if returnsRows {
+			var nativeCursor *nativeCursor
+			var columns []string
+			nativeCursor, columns, err = statement.query(ctx, nil)
+			exec = time.Since(started)
+			releaseNative()
+			if err != nil {
+				evidence := nativeCancellationEvidenceOf(err)
+				parts := splitNativeExecutionError(err)
+				operationErr := a.conn.sanitizeError("execute profile query", parts.primary)
+				cleanupErr := a.conn.sanitizeError("", parts.cleanup)
+				operationErr = classifyNativeWriteOutcome("execute profile query", statement.queryMutating(),
+					contextCancellation(ctx), operationErr, cleanupErr, t.native.writeOutcomeState(), evidence)
+				operationErr = joinNativeRequestDiagnostic(operationErr,
+					a.conn.sanitizeError("", parts.request))
+				if a.conn.native.broken() {
+					t.invalidateLocked(operationErr)
+				}
+				err = operationErr
+				return
+			}
+			cursor = &Cursor{
+				tx: t, generation: t.generation, native: nativeCursor,
+				columns: append([]string(nil), columns...), ctx: ctx,
+			}
+			nativeCursor.directTransaction = t
+			t.cursors[cursor] = struct{}{}
+			err = contextError(ctx)
+			return
+		}
+		_, err = statement.exec(ctx, nil)
+		exec = time.Since(started)
+		releaseNative()
+		if err != nil {
+			evidence := nativeCancellationEvidenceOf(err)
+			parts := splitNativeExecutionError(err)
+			operationErr := a.conn.sanitizeError("execute profile statement", parts.primary)
+			cleanupErr := a.conn.sanitizeError("", parts.cleanup)
+			operationErr = classifyNativeWriteOutcome("execute profile statement", true,
+				contextCancellation(ctx), operationErr, cleanupErr, t.native.writeOutcomeState(), evidence)
+			operationErr = joinNativeRequestDiagnostic(operationErr,
+				a.conn.sanitizeError("", parts.request))
+			if a.conn.native.broken() {
+				t.invalidateLocked(operationErr)
+			}
+			err = operationErr
+			return
+		}
+		complete = true
+	}()
+	if err != nil {
+		return
+	}
+	if !returnsRows {
+		return
+	}
+
+	started := time.Now()
+	for fetchAll || rows < int64(maxRows) {
+		hasRow, nextErr := cursor.Next(ctx)
+		if nextErr != nil {
+			fetch = time.Since(started)
+			err = nextErr
+			return
+		}
+		if !hasRow {
+			complete = true
+			break
+		}
+		rows++
+	}
+	fetch = time.Since(started)
+	return
+}
+
 // Plan prepares query and returns its server-generated plan without executing
 // it. The prepared statement is always closed before returning.
 func (t *Transaction) Plan(ctx context.Context, query string) (string, error) {

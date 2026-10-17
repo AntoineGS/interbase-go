@@ -7201,6 +7201,12 @@ static int ib_information_response(ib_connection *connection, unsigned char item
 			}
 			continue;
 		}
+		/* InterBase may return only isc_info_end when this counter has no value. */
+		if (!transaction && (unsigned char) buffer[0] == isc_info_end) {
+			*response = buffer;
+			*response_length = 1U;
+			return 0;
+		}
 		payload_length = (size_t) (unsigned char) buffer[1] |
 			((size_t) (unsigned char) buffer[2] << 8U);
 		if (payload_length > SIZE_MAX - 4U) {
