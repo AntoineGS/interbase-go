@@ -30,6 +30,17 @@ func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dia
 		dialect = 3
 	}
 	plan := &lpPlan{dialect: dialect, procs: make(map[string]*lpRoutineMeta)}
+	// The routines run with the database's dialect; a connection of the
+	// other dialect cannot even prepare some of their statements (ibg-1o3).
+	databaseDialect, err := lpDatabaseDialect(ctx, pooled)
+	if err != nil {
+		return nil, err
+	}
+	if databaseDialect != dialect {
+		plan.problem("entry statement", 0, 0,
+			"The connection uses SQL dialect %d but the database is dialect %d; line profiling needs matching dialects.", dialect, databaseDialect)
+		return plan, nil
+	}
 	entry, err := psql.ParseEntryCall(entrySQL, dialect)
 	if err != nil {
 		plan.analysis.Problems = []RoutineProblem{{Routine: "entry statement", Message: err.Error()}}
@@ -47,6 +58,25 @@ func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dia
 		return nil, err
 	}
 	return plan, nil
+}
+
+// lpDatabaseDialect reads the database's SQL dialect with one info call,
+// outside any transaction.
+func lpDatabaseDialect(ctx context.Context, pooled *sql.Conn) (int, error) {
+	var dialect int64
+	err := pooled.Raw(func(driverConn any) error {
+		c, ok := driverConn.(*conn)
+		if !ok {
+			return ErrNotInterBaseConn
+		}
+		item, err := (&Attachment{conn: c}).DatabaseInfo(ctx, InfoDatabaseSQLDialect)
+		if err != nil {
+			return err
+		}
+		dialect, err = item.Int64()
+		return err
+	})
+	return int(dialect), err
 }
 
 func (plan *lpPlan) problem(routine string, line, column int, format string, args ...any) {

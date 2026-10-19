@@ -235,10 +235,11 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   such as `FOR SELECT … AS CURSOR`), the callees and `MayWrite`.
 - The entry statement is `EXECUTE PROCEDURE p [(args)]` or
   `SELECT * | columns FROM p [(args)]` with constant arguments.
-- Profile with the database's dialect. A Dialect 1 attachment cannot prepare
-  a statement that references a 64-bit numeric column or parameter
-  (`NUMERIC(18,x)` of a Dialect 3 database), so a Dialect 1 run of such a
-  routine fails at that statement, while the routine itself runs natively.
+- The connection dialect must match the database's SQL dialect (read with one
+  info call before any transaction). Otherwise the analysis returns a single
+  problem and `LineProfile` refuses before anything runs: the routines run
+  with the database's dialect, and a Dialect 1 attachment cannot even prepare
+  a statement that references a 64-bit numeric of a Dialect 3 database.
 - Measurements are per node, per line and per routine. `Adjusted` time is
   `Raw` time minus the measured round-trip baseline of the attachment
   (`Before`/`After` probes), so it approximates server time. Counters (server

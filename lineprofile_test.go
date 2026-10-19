@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"reflect"
@@ -1444,5 +1445,44 @@ func TestLineProfileFirstLine(t *testing.T) {
 	sort.SliceStable(callees, func(i, j int) bool { return firstLine(callees[i].Lines) < firstLine(callees[j].Lines) })
 	if callees[0].Name != "EMPTY" || callees[1].Name != "A" || callees[2].Name != "B" {
 		t.Fatalf("sorted callees %+v", callees)
+	}
+}
+
+// TestLineProfileRefusesDialectMismatch checks ibg-1o3: a connection
+// dialect other than the database's is a static refusal, read with one info
+// call before any transaction starts; matching dialects go on to the
+// analysis transaction.
+func TestLineProfileRefusesDialectMismatch(t *testing.T) {
+	for _, tt := range []struct{ connection, database int }{{1, 3}, {3, 1}, {3, 3}, {1, 1}} {
+		native := introspectionTestNative(byte(tt.database))
+		begins := 0
+		native.beginTransactionOverride = func([]byte) (*nativeTransaction, error) {
+			begins++
+			return nil, errors.New("LP test: begin")
+		}
+		db := openDatabaseSQLTestDB(t, &conn{native: native})
+		pooled, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		analysis, err := AnalyzeLineProfile(context.Background(), pooled, "EXECUTE PROCEDURE LP_P", tt.connection, nil)
+		_, runErr := LineProfile(context.Background(), pooled, LineProfileOptions{SQL: "EXECUTE PROCEDURE LP_P", Dialect: tt.connection})
+		pooled.Close()
+		if tt.connection == tt.database {
+			if err == nil || begins != 2 || errors.Is(runErr, ErrLineProfileRefused) {
+				t.Fatalf("dialect %d: analysis %v / %v, run %v, begins %d; want the analysis transaction", tt.connection, analysis.Problems, err, runErr, begins)
+			}
+			continue
+		}
+		want := fmt.Sprintf("The connection uses SQL dialect %d but the database is dialect %d; line profiling needs matching dialects.", tt.connection, tt.database)
+		if err != nil || len(analysis.Problems) != 1 || analysis.Problems[0].Message != want {
+			t.Fatalf("dialect %d on %d: analysis %+v / %v; want one problem %q", tt.connection, tt.database, analysis.Problems, err, want)
+		}
+		if !errors.Is(runErr, ErrLineProfileRefused) || !strings.Contains(runErr.Error(), want) {
+			t.Fatalf("dialect %d on %d: run error %v; want the refusal", tt.connection, tt.database, runErr)
+		}
+		if begins != 0 {
+			t.Fatalf("dialect %d on %d: %d transactions began; want none", tt.connection, tt.database, begins)
+		}
 	}
 }

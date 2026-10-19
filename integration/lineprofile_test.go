@@ -2047,3 +2047,44 @@ func lpBlobEdgeCases() []lpBlobFetchCase {
 	}
 	return cases
 }
+
+// TestLineProfileDialectMismatchRefused checks ibg-1o3: a Dialect 1
+// attachment to a Dialect 3 database is refused before anything runs; the
+// procedure's generator increment, which no rollback would undo, is absent.
+func TestLineProfileDialectMismatchRefused(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3, "")
+	options := interbase.TransactionOptions{Isolation: sql.LevelReadCommitted}
+	setup := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "NONE", 3, options)
+	ctx := readContextWithTimeout(t, 3*time.Minute)
+	for _, statement := range []string{
+		"CREATE GENERATOR LP_DL_GEN",
+		`CREATE PROCEDURE LP_DL_BUMP RETURNS (N NUMERIC(18,0)) AS
+BEGIN
+  N = GEN_ID(LP_DL_GEN, 1);
+END`,
+	} {
+		if _, err := setup.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "NONE", 1, options)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	const entry = "EXECUTE PROCEDURE LP_DL_BUMP"
+	want := "The connection uses SQL dialect 1 but the database is dialect 3; line profiling needs matching dialects."
+	analysis, err := interbase.AnalyzeLineProfile(ctx, conn, entry, 1, nil)
+	if err != nil || len(analysis.Problems) != 1 || analysis.Problems[0].Message != want {
+		t.Fatalf("AnalyzeLineProfile = %+v / %v; want one problem %q", analysis.Problems, err, want)
+	}
+	result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: entry, Dialect: 1})
+	if !errors.Is(err, interbase.ErrLineProfileRefused) || !strings.Contains(err.Error(), want) || len(result.Routines) != 0 {
+		t.Fatalf("LineProfile = %v (routines %d); want the refusal", err, len(result.Routines))
+	}
+	var value int64
+	if err := setup.QueryRowContext(ctx, "SELECT GEN_ID(LP_DL_GEN, 0) FROM RDB$DATABASE").Scan(&value); err != nil || value != 0 {
+		t.Fatalf("LP_DL_GEN = %d / %v; want 0, nothing ran", value, err)
+	}
+}
