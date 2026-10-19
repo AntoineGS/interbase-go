@@ -3,6 +3,7 @@
 package integration_test
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -118,6 +119,21 @@ BEGIN
   EXECUTE STATEMENT 'SELECT ID FROM LP_ES_T WHERE ID = 1' INTO :D;
   SUSPEND;
 END`,
+		"CREATE GENERATOR LP_G",
+		"SET GENERATOR LP_G TO 7",
+		`CREATE PROCEDURE LP_ES_TXC (K INTEGER) RETURNS (N INTEGER) AS
+BEGIN
+  INSERT INTO LP_LOG (ID, MSG) VALUES (900 + :K, 'txc');
+  IF (K = 1) THEN EXECUTE STATEMENT 'SAVEPOINT LP_S';
+  IF (K = 2) THEN EXECUTE STATEMENT 'RELEASE SAVEPOINT LP_S';
+  IF (K = 3) THEN EXECUTE STATEMENT 'ROLLBACK TO SAVEPOINT LP_S';
+  IF (K = 4) THEN EXECUTE STATEMENT 'SET GENERATOR LP_G TO 1';
+  IF (K = 5) THEN EXECUTE STATEMENT 'SET TRANSACTION';
+  IF (K = 6) THEN EXECUTE STATEMENT 'COMMIT';
+  IF (K = 7) THEN EXECUTE STATEMENT 'ROLLBACK';
+  N = K;
+  SUSPEND;
+END`,
 	}
 }
 
@@ -221,6 +237,67 @@ func TestLineProfileExecuteStatementDDL(t *testing.T) {
 			if err := conn.QueryRowContext(ctx,
 				"SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = 'LP_ES_X'").Scan(&exists); err != nil || exists != 0 {
 				t.Fatalf("LP_ES_X exists %d, %v", exists, err)
+			}
+		})
+	}
+}
+
+// TestLineProfileExecuteStatementTransactionControl pins the always
+// rolled-back envelope for dynamic transaction-control and savepoint texts:
+// the texts InterBase runs (savepoints, SET GENERATOR) are refused, the ones
+// it disallows fail as natively, and in every case the run is rolled back
+// with nothing committed, the generator included.
+func TestLineProfileExecuteStatementTransactionControl(t *testing.T) {
+	cases := []struct {
+		k       int
+		marker  string
+		gdsCode int64 // 0: refused by the line profiler, not run
+	}{
+		{1, "'SAVEPOINT LP_S'", 0},
+		{2, "'RELEASE SAVEPOINT LP_S'", 0},
+		{3, "'ROLLBACK TO SAVEPOINT LP_S'", 0},
+		{4, "'SET GENERATOR LP_G TO 1'", 0},
+		{5, "'SET TRANSACTION'", 335544853}, // isc_exec_stmt2_execute
+		{6, "'COMMIT'", 335544857},          // isc_exec_stmt_disallow
+		{7, "'ROLLBACK'", 335544857},        // isc_exec_stmt_disallow
+	}
+	for _, dialect := range []int{3, 1} {
+		t.Run(fmt.Sprintf("dialect %d", dialect), func(t *testing.T) {
+			conn, ctx := lpFixture(t, dialect)
+			for _, tc := range cases {
+				t.Run(strings.Trim(tc.marker, "'"), func(t *testing.T) {
+					query := fmt.Sprintf("select * from LP_ES_TXC(%d)", tc.k)
+					result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: query, Dialect: dialect})
+					if err != nil {
+						t.Fatalf("LineProfile(): %v", err)
+					}
+					if result.Outcome != interbase.LineProfileFailed || result.Err == nil || !result.RolledBack ||
+						result.FailedAt == nil || result.FailedAt.Line != lpLine(t, result.Routines[0].Source, tc.marker) {
+						t.Fatalf("outcome %s at %+v rolled back %v: %v", result.Outcome, result.FailedAt, result.RolledBack, result.Err)
+					}
+					if tc.gdsCode == 0 {
+						if !strings.Contains(result.Err.Error(), "does not run this kind of statement") {
+							t.Fatalf("error %v, want a refusal", result.Err)
+						}
+					} else {
+						var profiled *interbase.Error
+						if !errors.As(result.Err, &profiled) || profiled.GDSCode() != tc.gdsCode || profiled.SQLCode != -204 {
+							t.Fatalf("error %#v, want GDSCODE %d, SQLCODE -204", result.Err, tc.gdsCode)
+						}
+						_, nativeErr := lpNative(t, ctx, conn, query)
+						var native *interbase.Error
+						if !errors.As(nativeErr, &native) || native.GDSCode() != profiled.GDSCode() || native.SQLCode != profiled.SQLCode {
+							t.Fatalf("native error %v, profiled %v", nativeErr, result.Err)
+						}
+					}
+					var generator, logged int
+					if err := conn.QueryRowContext(ctx, "SELECT GEN_ID(LP_G, 0) FROM RDB$DATABASE").Scan(&generator); err != nil || generator != 7 {
+						t.Fatalf("LP_G = %d, %v; want 7", generator, err)
+					}
+					if err := conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM LP_LOG WHERE ID = ?", 900+tc.k).Scan(&logged); err != nil || logged != 0 {
+						t.Fatalf("rows inserted before the text: %d, %v; want none committed", logged, err)
+					}
+				})
 			}
 		})
 	}

@@ -459,7 +459,10 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 					} else if strings.HasPrefix(strings.ToUpper(query), "CREATE ") {
 						kind = "ddl"
 					} else if upper := strings.ToUpper(query); strings.HasPrefix(upper, "COMMIT") ||
-						strings.HasPrefix(upper, "ROLLBACK") || strings.HasPrefix(upper, "SET ") {
+						strings.HasPrefix(upper, "ROLLBACK") || strings.HasPrefix(upper, "SET ") ||
+						strings.HasPrefix(upper, "SAVEPOINT") || strings.HasPrefix(upper, "RELEASE") {
+						// As ib_statement_summary: every kind it does not
+						// list, savepoint statements included.
 						kind = "unsupported"
 					}
 					return StatementDescriptor{Kind: kind, ReturnsRows: isSelect, InputCount: inputs}, nil
