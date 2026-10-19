@@ -974,6 +974,10 @@ func (r *lpRun) descriptorType(d OutputDescriptor) string {
 		return text
 	case "SMALLINT", "INTEGER", "BIGINT":
 		if d.Scale == 0 {
+			// A BIGINT column exists in dialect 3 only: a dialect 1
+			// attachment, even to a dialect 3 database, cannot prepare a
+			// statement that references a 64-bit numeric (SQLCODE -206 or
+			// -804, probed for ibg-tvs), so NUMERIC(18,0) here is exact.
 			if d.Kind == "BIGINT" {
 				return "NUMERIC(18,0)"
 			}
