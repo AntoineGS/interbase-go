@@ -856,7 +856,7 @@ func (r *lpRun) runEntry() error {
 	f := newFrame(entry, r.dbNone, profile)
 	f.entry = true
 	r.active = map[*lpRoutineMeta]int{entry: 1}
-	setupStart, snapshotsBefore := time.Now(), r.result.Snapshots
+	setupStart, before := time.Now(), *r.result
 	if err := r.snapshot(nil); err != nil {
 		return err
 	}
@@ -869,7 +869,10 @@ func (r *lpRun) runEntry() error {
 		}
 		f.vars[param.name].value = value
 	}
-	r.result.Setup += time.Since(setupStart) - (r.result.Snapshots - snapshotsBefore)
+	// The arguments' prepares, snapshots and BLOB reads have buckets of
+	// their own.
+	r.result.Setup += time.Since(setupStart) - (r.result.Snapshots - before.Snapshots) -
+		(r.result.Prepare - before.Prepare) - (r.result.Blobs - before.Blobs)
 	profile.Calls++
 	if _, err := r.exec(f, entry.routine.Body); err != nil {
 		return err
@@ -881,11 +884,13 @@ func (r *lpRun) runEntry() error {
 }
 
 // setupValue evaluates a constant entry argument; its cost is setup
-// overhead, not line time.
+// overhead (its prepare Prepare overhead), not line time.
 func (r *lpRun) setupValue(text string) (value any, err error) {
 	// The argument's counters, prepare included, are overhead.
 	defer func() { err = errors.Join(err, r.snapshot(nil)) }()
+	start := time.Now()
 	stmt, err := r.tx.Prepare(r.ctx, text)
+	r.result.Prepare += time.Since(start)
 	if err != nil {
 		return nil, err
 	}

@@ -241,7 +241,10 @@ func compare(op string, l, r localValue) (localValue, bool) {
 	}
 }
 
-// castType removes a COLLATE clause, which CAST does not accept.
+// castType removes a COLLATE clause, which CAST does not accept. No type
+// the emulator casts to has one in practice: InterBase refuses COLLATE in
+// DECLARE VARIABLE and the catalog type of a parameter is rendered without
+// one (verified natively), so no collation is lost.
 func castType(typeText string) string {
 	upper := strings.ToUpper(typeText)
 	if i := strings.Index(upper, " COLLATE "); i >= 0 {

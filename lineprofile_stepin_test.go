@@ -611,3 +611,21 @@ func TestLineProfileSourceProceduresResolvedOncePerRoutine(t *testing.T) {
 		t.Fatalf("sourceProcedures() = %v, %v after %d lookups", procedures, err, lookups)
 	}
 }
+
+// TestLineProfileNativeCallSitesOnlyInSteppedRoutines checks that only
+// routines the run can step into are scanned: LP_OUTER2 is called in a
+// shape that runs natively, so its own calls are never emulated.
+func TestLineProfileNativeCallSitesOnlyInSteppedRoutines(t *testing.T) {
+	outer := lineProfileTestProc{name: "LP_OUTER2", inputs: []lpParam{{"N", "INTEGER"}}, outputs: []lpParam{{"I", "INTEGER"}},
+		body: "BEGIN\n  SELECT MAX(I) FROM LP_GEN(2) INTO :I;\n  SUSPEND;\nEND"}
+	body := "BEGIN\n" +
+		"  SELECT MAX(I) FROM LP_OUTER2(1) INTO :X;\n" +
+		"  EXECUTE PROCEDURE LP_TWICE 1 RETURNING_VALUES :X;\n" +
+		"END"
+	run, _ := newLineProfileStepRun(t, context.Background(), body, []lineProfileTestProc{lpGen, lpTwice, outer},
+		[]string{"LP_GEN", "LP_TWICE", "LP_OUTER2"})
+	want := []LineProfileCallSite{{Routine: "LP_FAKE", Line: 2, Procedure: "LP_OUTER2", Reason: lpReasonShape}}
+	if got := nativeCallSites(run.plan, run.stepInto); !reflect.DeepEqual(got, want) {
+		t.Fatalf("native call sites %+v, want %+v", got, want)
+	}
+}

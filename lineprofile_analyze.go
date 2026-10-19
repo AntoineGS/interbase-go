@@ -191,8 +191,16 @@ func (plan *lpPlan) callees(ctx context.Context, tx *Transaction, meta *lpRoutin
 		}
 		callees = append(callees, callee)
 	}
-	sort.SliceStable(callees, func(i, j int) bool { return callees[i].Lines[0] < callees[j].Lines[0] })
+	sort.SliceStable(callees, func(i, j int) bool { return firstLine(callees[i].Lines) < firstLine(callees[j].Lines) })
 	return callees, mayWrite, nil
+}
+
+// firstLine returns the first of lines, 0 when there is none.
+func firstLine(lines []int) int {
+	if len(lines) == 0 {
+		return 0
+	}
+	return lines[0]
 }
 
 // checkReadsOnly sets meta.readsOnly when running the routine provably never

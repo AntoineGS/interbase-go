@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1408,5 +1409,37 @@ func TestLineProfileBlobConversionMessage(t *testing.T) {
 			nativeErr.Message != "conversion error from string "+tt.want || nativeErr.SQLCode != -413 {
 			t.Errorf("%s dialect %d: %v, want message with %s", tt.word, tt.dialect, err, tt.want)
 		}
+	}
+}
+
+// TestLineProfileEntryArgumentOverhead checks that an entry argument's
+// prepare counts in Prepare and its BLOB read in Blobs, neither in Setup.
+func TestLineProfileEntryArgumentOverhead(t *testing.T) {
+	const pause = 30 * time.Millisecond
+	run, counts := newLineProfileFakeRun(t, context.Background(), "BEGIN\n  EXIT;\nEND",
+		func() (bool, error) { return true, nil },
+		func(string) (int64, error) { return 1, nil })
+	run.plan.entry.inputs = []lpParam{{"B", "BLOB SUB_TYPE 1"}}
+	run.plan.analysis.Entry.Args = []string{"'x'"}
+	run.result.Routines[0] = newRoutineProfile(run.plan.entry)
+	counts.rowValue = BlobRef{attachment: run.tx.attachment, tx: run.tx, generation: run.tx.generation, high: 1, low: 2, subtype: 1}
+	counts.onPrepare = func() { time.Sleep(pause) }
+	run.openBlob = func(BlobRef) (io.ReadCloser, error) {
+		time.Sleep(pause)
+		return io.NopCloser(strings.NewReader("x")), nil
+	}
+	if outcome, txErr := run.runInTransaction(); outcome != nil || txErr != nil {
+		t.Fatalf("runInTransaction() = %v, %v", outcome, txErr)
+	}
+	if r := run.result; r.Prepare < pause || r.Blobs < pause || r.Setup >= pause {
+		t.Fatalf("prepare %v, blobs %v, setup %v; want the prepare and the BLOB read out of Setup", r.Prepare, r.Blobs, r.Setup)
+	}
+}
+
+func TestLineProfileFirstLine(t *testing.T) {
+	callees := []LineProfileCallee{{Name: "B", Lines: []int{7}}, {Name: "EMPTY"}, {Name: "A", Lines: []int{3, 9}}}
+	sort.SliceStable(callees, func(i, j int) bool { return firstLine(callees[i].Lines) < firstLine(callees[j].Lines) })
+	if callees[0].Name != "EMPTY" || callees[1].Name != "A" || callees[2].Name != "B" {
+		t.Fatalf("sorted callees %+v", callees)
 	}
 }

@@ -60,13 +60,19 @@ func stepIntoSet(plan *lpPlan, names []string) map[string]bool {
 
 // nativeCallSites lists the calls of procedures marked for step-in that run
 // natively because of their shape, in the entry routine and in every
-// stepped-into routine.
+// routine the run can step into: one called in a step-in shape from the
+// entry or from another such routine.
 func nativeCallSites(plan *lpPlan, stepInto map[string]bool) []LineProfileCallSite {
 	routines := []*lpRoutineMeta{plan.entry}
-	names := make([]string, 0, len(stepInto))
-	for name := range stepInto {
-		if name != plan.entry.name {
-			names = append(names, name)
+	reached := map[string]bool{plan.entry.name: true}
+	var names []string
+	for queue := []*lpRoutineMeta{plan.entry}; len(queue) > 0; queue = queue[1:] {
+		for _, site := range queue[0].routine.CallSites() {
+			if callee := plan.procs[site.Name]; site.StepInShape && stepInto[site.Name] && callee != nil && !reached[site.Name] {
+				reached[site.Name] = true
+				names = append(names, site.Name)
+				queue = append(queue, callee)
+			}
 		}
 	}
 	sort.Strings(names)
@@ -234,7 +240,9 @@ func (r *lpRun) newVar(typeText string) *lpVar {
 // input parameters as the native call would (R17): a variable of the
 // parameter's exact type (or a BLOB for a BLOB) is passed as is; any other
 // argument is evaluated and converted to the parameter type, locally when
-// exact, otherwise on the server.
+// exact, otherwise on the server. InterBase refuses to compile a call with
+// fewer arguments than inputs ("parameter mismatch", verified natively), so
+// the count must match.
 func (r *lpRun) calleeArgs(f *lpFrame, node *LineProfileNode, proc *psql.ProcCall, callee *lpRoutineMeta) ([]any, error) {
 	if len(proc.Args) != len(callee.inputs) {
 		return nil, fmt.Errorf("interbase: line profile: %d arguments for %d parameters of %s",

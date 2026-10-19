@@ -120,20 +120,14 @@ func TestLiveLineProfileCorpus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var parsed, refused, errored int
+	var parsed, refused, errored, unnamed int
 	var failures []string
 	for _, p := range procs {
-		quoted := p.name
-		if dialect == 3 {
-			quoted = `"` + strings.ReplaceAll(p.name, `"`, `""`) + `"`
-		}
-		args := ""
-		if p.inputs > 0 {
-			args = "(" + strings.TrimSuffix(strings.Repeat("NULL,", p.inputs), ",") + ")"
-		}
-		entry := "EXECUTE PROCEDURE " + quoted + args
-		if p.output > 0 {
-			entry = "SELECT * FROM " + quoted + args
+		entry, ok := lpCorpusEntry(p, dialect)
+		if !ok {
+			unnamed++
+			failures = append(failures, fmt.Sprintf("%s: cannot be named in dialect %d", p.name, dialect))
+			continue
 		}
 		analysis, err := interbase.AnalyzeLineProfile(ctx, conn, entry, dialect, nil)
 		switch {
@@ -149,13 +143,38 @@ func TestLiveLineProfileCorpus(t *testing.T) {
 			parsed++
 		}
 	}
-	t.Logf("procedures=%d parsed=%d refused=%d analysis_errors=%d", len(procs), parsed, refused, errored)
+	t.Logf("procedures=%d parsed=%d refused=%d analysis_errors=%d unnamed=%d", len(procs), parsed, refused, errored, unnamed)
 	for _, f := range failures {
 		t.Logf("FAILURE %s", f)
 	}
 	if os.Getenv("INTERBASE_LP_CORPUS_STRICT") == "1" && refused+errored > 0 {
 		t.Fatalf("%d procedures could not be analyzed", refused+errored)
 	}
+}
+
+// lpCorpusEntry returns the entry statement of a corpus procedure, with
+// NULL arguments. Dialect 3 quotes the name; dialect 1 has no quoted names,
+// so a name that is not a plain upper-case identifier cannot be written
+// there (ok is false).
+func lpCorpusEntry(p lpCorpusProc, dialect int) (entry string, ok bool) {
+	name := p.name
+	if dialect == 3 {
+		name = `"` + strings.ReplaceAll(p.name, `"`, `""`) + `"`
+	} else {
+		for i, c := range p.name {
+			if !(c >= 'A' && c <= 'Z' || i > 0 && (c >= '0' && c <= '9' || c == '_' || c == '$')) {
+				return "", false
+			}
+		}
+	}
+	args := ""
+	if p.inputs > 0 {
+		args = "(" + strings.TrimSuffix(strings.Repeat("NULL,", p.inputs), ",") + ")"
+	}
+	if p.output > 0 {
+		return "SELECT * FROM " + name + args, true
+	}
+	return "EXECUTE PROCEDURE " + name + args, true
 }
 
 func lpCellText(v any) string {
@@ -297,6 +316,26 @@ func TestLiveLineProfileStatement(t *testing.T) {
 		}
 		if emulated != nativeText {
 			t.Errorf("column %s differs: emulated=%q native=%q", name, emulated, nativeText)
+		}
+	}
+}
+
+func TestLineProfileCorpusEntry(t *testing.T) {
+	for _, tt := range []struct {
+		proc    lpCorpusProc
+		dialect int
+		want    string
+		ok      bool
+	}{
+		{lpCorpusProc{"LP_A", 2, 1}, 1, "SELECT * FROM LP_A(NULL,NULL)", true},
+		{lpCorpusProc{"LP_A$1", 0, 0}, 1, "EXECUTE PROCEDURE LP_A$1", true},
+		{lpCorpusProc{"lp_lower", 0, 1}, 1, "", false},
+		{lpCorpusProc{"LP A", 1, 0}, 1, "", false},
+		{lpCorpusProc{"1LP", 0, 0}, 1, "", false},
+		{lpCorpusProc{`lp "q"`, 1, 0}, 3, `EXECUTE PROCEDURE "lp ""q"""(NULL)`, true},
+	} {
+		if got, ok := lpCorpusEntry(tt.proc, tt.dialect); got != tt.want || ok != tt.ok {
+			t.Errorf("lpCorpusEntry(%+v, %d) = %q, %v; want %q, %v", tt.proc, tt.dialect, got, ok, tt.want, tt.ok)
 		}
 	}
 }

@@ -1210,10 +1210,17 @@ func TestLineProfileDifferential(t *testing.T) {
 							t.Fatalf("FailedAt = %+v", result.FailedAt)
 						}
 						if tt.failAt != "" {
+							found := false
 							for _, r := range result.Routines {
-								if r.Name == result.FailedAt.Routine && lpLine(t, r.Source, tt.failAt) != result.FailedAt.Line {
-									t.Fatalf("FailedAt %+v, want the line of %q", result.FailedAt, tt.failAt)
+								if r.Name == result.FailedAt.Routine {
+									found = true
+									if lpLine(t, r.Source, tt.failAt) != result.FailedAt.Line {
+										t.Fatalf("FailedAt %+v, want the line of %q", result.FailedAt, tt.failAt)
+									}
 								}
+							}
+							if !found {
+								t.Fatalf("FailedAt %+v names no profiled routine", result.FailedAt)
 							}
 							var gotRows [][]any
 							for _, row := range result.KeptRows {
