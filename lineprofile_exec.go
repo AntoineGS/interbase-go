@@ -867,7 +867,8 @@ func (r *lpRun) runEntry() error {
 	f := newFrame(entry, r.dbNone, profile)
 	f.entry = true
 	r.active = map[*lpRoutineMeta]int{entry: 1}
-	setupStart, before := time.Now(), *r.result
+	setupStart := time.Now()
+	snapshots, prepare, blobs := r.result.Snapshots, r.result.Prepare, r.result.Blobs
 	if err := r.snapshot(nil); err != nil {
 		return err
 	}
@@ -882,8 +883,8 @@ func (r *lpRun) runEntry() error {
 	}
 	// The arguments' prepares, snapshots and BLOB reads have buckets of
 	// their own.
-	r.result.Setup += time.Since(setupStart) - (r.result.Snapshots - before.Snapshots) -
-		(r.result.Prepare - before.Prepare) - (r.result.Blobs - before.Blobs)
+	r.result.Setup += time.Since(setupStart) - (r.result.Snapshots - snapshots) -
+		(r.result.Prepare - prepare) - (r.result.Blobs - blobs)
 	profile.Calls++
 	if _, err := r.exec(f, entry.routine.Body); err != nil {
 		return err
