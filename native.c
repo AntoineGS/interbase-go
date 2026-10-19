@@ -6587,7 +6587,9 @@ static int ib_statement_cache_metadata(ib_statement *statement,
 {
 	ib_cursor descriptor;
 	char *catalog_error;
+	char *unpublish_error;
 	size_t count;
+	int result;
 
 	if (statement == NULL || statement->output == NULL ||
 		statement->output->sqld < 0 || statement->connection == NULL ||
@@ -6602,9 +6604,20 @@ static int ib_statement_cache_metadata(ib_statement *statement,
 	descriptor.statement_type = statement->statement_type;
 	catalog_error = NULL;
 	descriptor.output = ib_clone_sqlda(statement->output, &catalog_error);
-	if (descriptor.output == NULL ||
+	result = descriptor.output == NULL ? -1 :
 		ib_cursor_describe_metadata(&descriptor, cancel, generation,
-			&catalog_error) != 0) {
+			&catalog_error);
+	/* The catalog functions republish the user handle for the execution that
+	 * follows them on a query path; here it stays idle until the slot
+	 * completes, so leave nothing published for a cancellation to reach. */
+	unpublish_error = NULL;
+	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+		ib_append_error(&catalog_error, unpublish_error);
+		ib_cursor_free_parts(&descriptor);
+		ib_give_error(error, catalog_error);
+		return -1;
+	}
+	if (result != 0) {
 		ib_cursor_free_parts(&descriptor);
 		/* Without a slot, optional catalog failures are reported rather than
 		 * skipped; only the fatal ones fail Prepare. */
