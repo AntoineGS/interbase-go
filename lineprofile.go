@@ -69,9 +69,17 @@ const (
 // LineMetrics are the measurements of a node, a line or a frame. Hits counts
 // executions of a node, except for a WHILE node, whose Hits count condition
 // evaluations (N+1 for a loop whose body runs N times).
+//
+// FirstRaw and FirstAdjusted are the part of Raw and Adjusted spent in a
+// node's first hit (a WHILE node's first condition evaluation; a FOR
+// SELECT's first execution with all its fetches), so that a first-use cost,
+// such as the server compiling a native callee on its first call in the
+// attachment, stays visible next to the total. A line's are the sum over
+// its nodes. They are zero in a routine's Inclusive and Exclusive totals.
 type LineMetrics struct {
 	Hits, ServerCalls, RoundTrips, Rows, Errors int64
 	Raw, Adjusted                               time.Duration
+	FirstRaw, FirstAdjusted                     time.Duration
 	Pages                                       *PageCounters         // nil when unavailable
 	Tables                                      map[int]TableCounters // non-zero only
 }

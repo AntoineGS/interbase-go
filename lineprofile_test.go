@@ -225,6 +225,58 @@ func TestLineProfileLineAggregation(t *testing.T) {
 	}
 }
 
+func TestLineProfileFirstHitAggregation(t *testing.T) {
+	routines := []LineProfileRoutine{{
+		Parent: -1,
+		Nodes: []LineProfileNode{
+			{ID: 0, Kind: "assign", Line: 3, Metrics: LineMetrics{Hits: 2, Raw: 5, Adjusted: 3, FirstRaw: 4, FirstAdjusted: 2}},
+			{ID: 1, Kind: "if", Line: 3, Metrics: LineMetrics{Hits: 1, Raw: 7, Adjusted: 6, FirstRaw: 7, FirstAdjusted: 6}},
+		},
+	}, {
+		Parent: 0,
+		Nodes:  []LineProfileNode{{ID: 0, Kind: "assign", Line: 2, Metrics: LineMetrics{Hits: 1, Raw: 1, Adjusted: 1, FirstRaw: 1, FirstAdjusted: 1}}},
+	}}
+	aggregateRoutines(routines)
+	if line := routines[0].Lines[3]; line.FirstRaw != 11 || line.FirstAdjusted != 8 {
+		t.Fatalf("Lines[3] first hit = %v/%v, want the sum of its nodes' first hits 11/8", line.FirstRaw, line.FirstAdjusted)
+	}
+	for i, r := range routines {
+		for name, m := range map[string]LineMetrics{"exclusive": r.Exclusive, "inclusive": r.Inclusive} {
+			if m.FirstRaw != 0 || m.FirstAdjusted != 0 {
+				t.Fatalf("routine %d %s first hit = %v/%v, want zero", i, name, m.FirstRaw, m.FirstAdjusted)
+			}
+		}
+	}
+	if routines[0].Inclusive.Raw != 13 {
+		t.Fatalf("inclusive raw = %v", routines[0].Inclusive.Raw)
+	}
+}
+
+func TestLineProfileFirstHitMetrics(t *testing.T) {
+	const slow = 30 * time.Millisecond
+	rows, updates := 3, 0
+	run, _ := newLineProfileFakeRun(t, context.Background(), lineProfileFakeBody,
+		func() (bool, error) { rows--; return rows >= 0, nil },
+		func(string) (int64, error) {
+			if updates++; updates == 1 {
+				time.Sleep(slow)
+			}
+			return 1, nil
+		})
+	if outcome, txErr := run.runInTransaction(); outcome != nil || txErr != nil {
+		t.Fatalf("runInTransaction() = %v, %v", outcome, txErr)
+	}
+	update := run.result.Routines[0].Nodes[2].Metrics
+	if update.Hits != 3 || update.FirstRaw < slow || update.FirstAdjusted < slow || update.Raw-update.FirstRaw >= slow {
+		t.Fatalf("UPDATE hits %d raw %v first raw %v first adjusted %v; want the first hit's time only",
+			update.Hits, update.Raw, update.FirstRaw, update.FirstAdjusted)
+	}
+	loop := run.result.Routines[0].Nodes[1].Metrics
+	if loop.Hits != 1 || loop.FirstRaw != loop.Raw || loop.FirstAdjusted != loop.Adjusted {
+		t.Fatalf("FOR SELECT hit once: first %v/%v, total %v/%v", loop.FirstRaw, loop.FirstAdjusted, loop.Raw, loop.Adjusted)
+	}
+}
+
 func TestLineProfileSQLTextRewrites(t *testing.T) {
 	text := "SELECT 1 FROM T WHERE A = ? AND B = '?' AND /* ? */ C = ? AND \"?\" = 1"
 	got := castParams(text, []string{"VARCHAR(10)", "INTEGER"})

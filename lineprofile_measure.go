@@ -67,6 +67,10 @@ func (r *lpRun) serverCall(node *LineProfileNode, op func() error) error {
 	m.ServerCalls++
 	m.Raw += d
 	m.Adjusted += adjusted
+	if m.Hits == 1 {
+		m.FirstRaw += d
+		m.FirstAdjusted += adjusted
+	}
 	r.result.ServerCalls++
 	if roundTrip {
 		m.RoundTrips++
@@ -165,6 +169,8 @@ func addMetrics(a *LineMetrics, b LineMetrics) {
 	a.Errors += b.Errors
 	a.Raw += b.Raw
 	a.Adjusted += b.Adjusted
+	a.FirstRaw += b.FirstRaw
+	a.FirstAdjusted += b.FirstAdjusted
 	if b.Pages != nil {
 		pages := addPageCounters(pagesOf(a.Pages), *b.Pages)
 		a.Pages = &pages
@@ -206,6 +212,8 @@ func aggregateRoutine(routine *LineProfileRoutine) {
 		routine.Lines[node.Line] = line
 		addMetrics(&routine.Exclusive, node.Metrics)
 	}
+	// First hits are per node and line; a routine total has none.
+	routine.Exclusive.FirstRaw, routine.Exclusive.FirstAdjusted = 0, 0
 	routine.Inclusive = LineMetrics{}
 	addMetrics(&routine.Inclusive, routine.Exclusive)
 }
