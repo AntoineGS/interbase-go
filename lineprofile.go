@@ -95,6 +95,9 @@ type LineProfileNode struct {
 	// DynamicSQL is the last statement text an EXECUTE STATEMENT or FOR
 	// EXECUTE STATEMENT node evaluated, and DynamicTexts the number of
 	// distinct texts it evaluated in the run; SQL is the text sent for it.
+	// The node keeps its 32 most recently used texts prepared per call
+	// depth of its routine, so a recursion of depth d can hold d × 32
+	// prepared statements for the node until the run ends.
 	DynamicSQL   string
 	DynamicTexts int
 	Metrics      LineMetrics

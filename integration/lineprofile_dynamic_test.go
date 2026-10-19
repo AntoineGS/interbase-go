@@ -104,6 +104,15 @@ BEGIN
   X = -X;
   SUSPEND;
 END`,
+		`CREATE PROCEDURE LP_ES_DDL RETURNS (N INTEGER) AS
+BEGIN
+  N = 0;
+  BEGIN
+    EXECUTE STATEMENT 'CREATE TABLE LP_ES_X (ID INTEGER)';
+  WHEN ANY DO N = 1;
+  END
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_ES_TYPE RETURNS (D DOUBLE PRECISION) AS
 BEGIN
   EXECUTE STATEMENT 'SELECT ID FROM LP_ES_T WHERE ID = 1' INTO :D;
@@ -188,6 +197,30 @@ func TestLineProfileExecuteStatementCopy(t *testing.T) {
 				!strings.Contains(result.Err.Error(), "without conversion") || result.FailedAt == nil ||
 				result.FailedAt.Line != lpLine(t, result.Routines[0].Source, "EXECUTE STATEMENT") {
 				t.Fatalf("outcome %s at %+v: %v", result.Outcome, result.FailedAt, result.Err)
+			}
+		})
+	}
+}
+
+// TestLineProfileExecuteStatementDDL checks Ruling R26: a DDL text is never
+// run; the run fails at its line, and WHEN handlers do not catch it.
+func TestLineProfileExecuteStatementDDL(t *testing.T) {
+	for _, dialect := range []int{3, 1} {
+		t.Run(fmt.Sprintf("dialect %d", dialect), func(t *testing.T) {
+			conn, ctx := lpFixture(t, dialect)
+			result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: "select * from LP_ES_DDL", Dialect: dialect})
+			if err != nil {
+				t.Fatalf("LineProfile(): %v", err)
+			}
+			if result.Outcome != interbase.LineProfileFailed || result.Err == nil || !result.RolledBack ||
+				!strings.Contains(result.Err.Error(), "does not run this kind of statement") || result.FailedAt == nil ||
+				result.FailedAt.Line != lpLine(t, result.Routines[0].Source, "EXECUTE STATEMENT") {
+				t.Fatalf("outcome %s at %+v: %v", result.Outcome, result.FailedAt, result.Err)
+			}
+			var exists int
+			if err := conn.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = 'LP_ES_X'").Scan(&exists); err != nil || exists != 0 {
+				t.Fatalf("LP_ES_X exists %d, %v", exists, err)
 			}
 		})
 	}

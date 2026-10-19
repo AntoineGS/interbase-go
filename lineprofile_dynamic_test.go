@@ -105,8 +105,11 @@ func TestLineProfileExecuteStatementCache(t *testing.T) {
 	if deleteNode.DynamicTexts != 1 || deleteNode.DynamicSQL != "DELETE FROM LP_T" || counts.prepares["DELETE FROM LP_T"] != 1 {
 		t.Fatalf("DELETE node %+v, prepares %d", deleteNode, counts.prepares["DELETE FROM LP_T"])
 	}
+	// The UPDATE node keeps lpDynamicLimit texts prepared, the DELETE node
+	// its one text.
 	if maxOpen != lpDynamicLimit+1 {
-		t.Fatalf("at most %d dynamic statements open, want %d per node", maxOpen, lpDynamicLimit)
+		t.Fatalf("at most %d dynamic statements open across both nodes, want %d (%d for the UPDATE node, 1 for the DELETE node)",
+			maxOpen, lpDynamicLimit+1, lpDynamicLimit)
 	}
 	if run.result.Prepare <= 0 || counts.closed != counts.prepared || len(run.statements) != 0 {
 		t.Fatalf("prepare %v, statements %d prepared %d closed, %d kept", run.result.Prepare, counts.prepared, counts.closed, len(run.statements))
@@ -241,7 +244,11 @@ func TestLineProfileExecuteStatementErrors(t *testing.T) {
 		{name: "parameter marker", text: "'UPDATE LP_T SET A = ?'", when: "WHEN SQLCODE -804", sqlCode: -804, gdsCode: 335544853},
 		{name: "EXECUTE PROCEDURE", text: "'EXECUTE PROCEDURE LP_P'", when: "WHEN SQLCODE -204", sqlCode: -204, gdsCode: 335544853},
 		{name: "COMMIT", text: "'COMMIT'", when: "WHEN GDSCODE exec_stmt_disallow", sqlCode: -204, gdsCode: 335544857},
+		{name: "ROLLBACK WORK", text: "'ROLLBACK WORK'", when: "WHEN GDSCODE exec_stmt_disallow", sqlCode: -204, gdsCode: 335544857},
 		{name: "unsupported statement", text: "'SET GENERATOR LP_G TO 1'", when: "WHEN ANY", fatal: true},
+		{name: "ROLLBACK TO SAVEPOINT", text: "'ROLLBACK TO SAVEPOINT LP_S'", when: "WHEN ANY", fatal: true},
+		{name: "ROLLBACK WORK TO SAVEPOINT", text: "'ROLLBACK WORK TO SAVEPOINT LP_S'", when: "WHEN ANY", fatal: true},
+		{name: "DDL", text: "'CREATE TABLE LP_X (ID INTEGER)'", when: "WHEN ANY", fatal: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			run, counts, savepoints := newLineProfileDynamicRun(t, body(tt.text, tt.when), []string{"X"},
@@ -259,8 +266,12 @@ func TestLineProfileExecuteStatementErrors(t *testing.T) {
 			if tt.fatal {
 				var fatalErr *lpFatalError
 				var located *lpNodeError
-				if !errors.As(outcome, &fatalErr) || !errors.As(outcome, &located) || located.line != 6 || lineProfileNodeHits(run, 7) != 0 {
-					t.Fatalf("outcome %v; want an uncaught failure at line 6", outcome)
+				if !errors.As(outcome, &fatalErr) || !errors.As(outcome, &located) || located.line != 6 || lineProfileNodeHits(run, 7) != 0 ||
+					!strings.Contains(outcome.Error(), "does not run this kind of statement") {
+					t.Fatalf("outcome %v; want an uncaught refusal at line 6", outcome)
+				}
+				if counts.closed != counts.prepared || counts.queried != 0 {
+					t.Fatalf("statements %d prepared, %d closed, %d queried; a refused text is closed, never run", counts.prepared, counts.closed, counts.queried)
 				}
 				return
 			}
@@ -358,6 +369,57 @@ func TestLineProfileForExecuteStatement(t *testing.T) {
 				t.Fatalf("native call sites %+v, want a runs-ahead site %v", run.result.NativeCallSites, tt.runsAhead)
 			}
 			assertLineProfileFakeClosedWithoutCursorCheck(t, counts)
+		})
+	}
+}
+
+// TestLineProfileDynamicCloseFailureKeepsStatement checks that an evicted
+// or refused dynamic statement leaves the run's statements only once it is
+// closed, so that closeStatements still closes it when its close fails.
+func TestLineProfileDynamicCloseFailureKeepsStatement(t *testing.T) {
+	closeFailure := errors.New("close failed")
+	for _, tt := range []struct {
+		name, body, closing string
+		before              int // dynamic statements kept when it closes
+	}{
+		{name: "eviction", closing: "UPDATE LP_T SET A = 1", before: lpDynamicLimit + 1,
+			body: "DECLARE VARIABLE I INTEGER;\nBEGIN\n  I = 0;\n  WHILE (I < 33) DO\n  BEGIN\n    I = I + 1;\n" +
+				"    EXECUTE STATEMENT 'UPDATE LP_T SET A = ' || I;\n  END\nEND"},
+		{name: "refusal", closing: "EXECUTE PROCEDURE LP_P", before: 1,
+			body: "BEGIN\n  EXECUTE STATEMENT 'EXECUTE PROCEDURE LP_P';\nEND"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			updates := 0
+			var run *lpRun
+			run, counts, _ := newLineProfileDynamicRun(t, tt.body, nil, func() (bool, error) { return true, nil },
+				func(query string) (int64, error) {
+					updates++
+					return 1, nil
+				})
+			counts.valueFor = func(query string) driver.Value {
+				if strings.HasPrefix(query, "SELECT CAST((") {
+					return fmt.Sprintf("UPDATE LP_T SET A = %d", updates+1)
+				}
+				return nil
+			}
+			kept := -1
+			counts.onClose = func(query string) error {
+				if query == tt.closing && kept < 0 {
+					kept = countDynamicStatements(run)
+					return closeFailure
+				}
+				return nil
+			}
+			outcome, _ := run.runInTransaction()
+			if !errors.Is(outcome, closeFailure) {
+				t.Fatalf("outcome %v, want the close failure", outcome)
+			}
+			if kept != tt.before {
+				t.Fatalf("%d dynamic statements kept while closing %q, want %d (deleted only after a successful close)", kept, tt.closing, tt.before)
+			}
+			if len(run.statements) != 0 {
+				t.Fatalf("statements left after the run: %d", len(run.statements))
+			}
 		})
 	}
 }

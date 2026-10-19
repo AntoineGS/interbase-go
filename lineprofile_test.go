@@ -404,6 +404,7 @@ type lineProfileFakeCounts struct {
 	valueFor   func(query string) driver.Value
 	outputsFor func(query string) []OutputDescriptor
 	prepareErr func(query string) error
+	onClose    func(query string) error // result of closing a statement
 	prepares   map[string]int
 }
 
@@ -454,7 +455,10 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 						kind = "select"
 					} else if strings.HasPrefix(strings.ToUpper(query), "EXECUTE PROCEDURE") {
 						kind = "procedure"
-					} else if strings.HasPrefix(strings.ToUpper(query), "COMMIT") || strings.HasPrefix(strings.ToUpper(query), "SET ") {
+					} else if strings.HasPrefix(strings.ToUpper(query), "CREATE ") {
+						kind = "ddl"
+					} else if upper := strings.ToUpper(query); strings.HasPrefix(upper, "COMMIT") ||
+						strings.HasPrefix(upper, "ROLLBACK") || strings.HasPrefix(upper, "SET ") {
 						kind = "unsupported"
 					}
 					return StatementDescriptor{Kind: kind, ReturnsRows: isSelect, InputCount: inputs}, nil
@@ -516,8 +520,14 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 						abortOverride: closeCursor,
 					}, []string{"ID"}, nil
 				},
-				execOverride:  func([]argument) (int64, error) { return exec(query) },
-				closeOverride: func() error { counts.closed++; return nil },
+				execOverride: func([]argument) (int64, error) { return exec(query) },
+				closeOverride: func() error {
+					counts.closed++
+					if counts.onClose != nil {
+						return counts.onClose(query)
+					}
+					return nil
+				},
 			}
 			return statement, nil
 		},

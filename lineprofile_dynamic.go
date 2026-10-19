@@ -23,6 +23,9 @@ import (
 //     SELECT error does.
 //     COMMIT and ROLLBACK fail with isc_exec_stmt_disallow, EXECUTE PROCEDURE
 //     and SET TRANSACTION with SQLCODE -204, a "?" parameter with -804.
+//   - Statements InterBase runs but the emulator refuses (Ruling R26 for
+//     DDL; errNotRun): DDL, SET GENERATOR, SAVEPOINT, RELEASE SAVEPOINT and
+//     ROLLBACK [WORK] TO SAVEPOINT. The run fails at the line.
 //   - Without INTO a SELECT is opened and closed, never fetched.
 //   - With INTO the first row is assigned and a second one fetched (no
 //     singleton error); a FOR EXECUTE STATEMENT loop ends at the end of the
@@ -176,8 +179,16 @@ func (r *lpRun) dynamicStatement(f *lpFrame, n *psql.Node, node *LineProfileNode
 			return cachedStatement{}, err
 		}
 	}
+	// A statement leaves r.statements only once closed, so that
+	// closeStatements still closes it when its own close fails.
+	cached := cachedStatement{stmt: stmt, text: sent}
+	r.statements[key] = cached
 	var refused error
 	switch {
+	case stmt.kind == "ddl":
+		// Ruling R26: DDL is never run (its effects on metadata are not
+		// emulated), whatever InterBase would do.
+		refused = errNotRun(text)
 	case stmt.kind == "procedure":
 		refused = errExecuteStatement(text, -204, nil)
 	case len(stmt.Inputs()) > 0:
@@ -188,25 +199,30 @@ func (r *lpRun) dynamicStatement(f *lpFrame, n *psql.Node, node *LineProfileNode
 		if err := r.closeDynamic(stmt); err != nil {
 			return cachedStatement{}, fatal(errors.Join(err, refused))
 		}
+		delete(r.statements, key)
 		return cachedStatement{}, refused
 	}
 	if runsAhead != "" {
 		r.dynamicRunsAhead(f, n, runsAhead)
 	}
-	cached := cachedStatement{stmt: stmt, text: sent}
-	r.statements[key] = cached
 	keys = append(keys, key)
 	if len(keys) > lpDynamicLimit {
-		oldest := r.statements[keys[0]]
-		delete(r.statements, keys[0])
+		oldest := keys[0]
 		keys = keys[1:]
-		if err := r.closeDynamic(oldest.stmt); err != nil {
-			r.dynamic[nodeKey] = keys
+		r.dynamic[nodeKey] = keys
+		if err := r.closeDynamic(r.statements[oldest].stmt); err != nil {
 			return cachedStatement{}, fatal(err)
 		}
+		delete(r.statements, oldest)
 	}
 	r.dynamic[nodeKey] = keys
 	return cached, nil
+}
+
+// errNotRun refuses a dynamic text the line profiler does not run; WHEN
+// handlers cannot catch it.
+func errNotRun(text string) error {
+	return fatal(fmt.Errorf("interbase: line profile: EXECUTE STATEMENT %q: the line profiler does not run this kind of statement", text))
 }
 
 // prepareDynamic prepares a dynamic text; its time and counters are Prepare
@@ -235,25 +251,27 @@ func (r *lpRun) prepareDynamic(text string) (*PreparedStatement, error) {
 }
 
 // unsupportedDynamic is the outcome of a text the driver does not prepare:
-// the error InterBase raises for COMMIT, ROLLBACK and SET TRANSACTION;
-// statements InterBase runs, such as SET GENERATOR or SAVEPOINT, are not
-// emulated.
+// the error InterBase raises for COMMIT, ROLLBACK and SET TRANSACTION.
+// Statements InterBase runs are refused (errNotRun): SET GENERATOR is not
+// transactional, and SAVEPOINT, RELEASE SAVEPOINT and ROLLBACK [WORK] TO
+// SAVEPOINT would interfere with the emulator's own savepoints.
 func unsupportedDynamic(text string) error {
 	var words []string
 	for _, t := range topLevelTokens(text) {
-		if !t.comma && len(words) < 2 {
+		if !t.comma && len(words) < 3 {
 			words = append(words, strings.ToUpper(text[t.start:t.end]))
 		}
 	}
-	words = append(words, "", "")
+	words = append(words, "", "", "")
+	toSavepoint := words[1] == "TO" || words[1] == "WORK" && words[2] == "TO"
 	switch {
-	case words[0] == "COMMIT", words[0] == "ROLLBACK" && words[1] != "TO":
+	case words[0] == "COMMIT", words[0] == "ROLLBACK" && !toSavepoint:
 		return &Error{Operation: "line profile EXECUTE STATEMENT", SQLCode: -204, NativeCode: gdsExecStmtDisallow,
 			Message: "Sql statement not allowed in EXECUTE STATEMENT : " + text, gdsCodes: []int64{gdsExecStmtDisallow}}
 	case words[0] == "SET" && words[1] == "TRANSACTION":
 		return errExecuteStatement(text, -204, nil)
 	}
-	return fatal(fmt.Errorf("interbase: line profile: EXECUTE STATEMENT %q: the line profiler does not run this kind of statement", text))
+	return errNotRun(text)
 }
 
 // closeDynamic closes a dynamic statement; the close is Prepare overhead.

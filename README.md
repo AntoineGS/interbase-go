@@ -273,22 +273,26 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   <text> INTO <targets> DO <statement>` run as InterBase runs them (verified
   natively, dialects 1 and 3). The text is evaluated like any value and
   prepared in the run transaction; each node keeps its 32 most recently used
-  texts prepared. A routine with `EXECUTE STATEMENT` always may write. The
+  texts prepared per call depth (a recursion of depth d can hold d × 32
+  until the run ends). A routine with `EXECUTE STATEMENT` always may write. The
   node's `DynamicSQL` is the last text it evaluated and `DynamicTexts` the
   number of distinct texts; `SQL` is the text sent (with `FOR UPDATE` when a
   `FOR EXECUTE STATEMENT` over a procedure needs row-by-row fetches, as for
   `FOR SELECT`). As natively: a `SELECT` without `INTO` is opened but never
   fetched; `INTO` takes the first row (no singleton error); a fetch error is
   ignored (targets unchanged, the loop ends) but still counts in `Errors`;
-  every error is reported as `isc_exec_stmt2_execute`, with the statement's
+  an error is reported as `isc_exec_stmt2_execute`, with the statement's
   own SQLCODE for a prepare error and SQLCODE -204 for an execution error,
-  and `WHEN` handlers catch it. InterBase copies `INTO` columns without
+  except `COMMIT` and `ROLLBACK`, reported as `isc_exec_stmt_disallow`
+  (SQLCODE -204); `WHEN` handlers catch them. InterBase copies `INTO` columns without
   conversion, so a column of another type yields garbage there; the profiler
   assigns NULLs and exact copies only (same storage, a `VARCHAR` value that
   fits, a wider integer value that fits) and otherwise fails the run, as it
   does for a column count other than the targets', `INTO` on a statement
-  without rows, and statements it does not run (`SET GENERATOR`,
-  `SAVEPOINT`).
+  without rows, and statements it does not run: DDL (Ruling R26), `SET
+  GENERATOR` (not transactional) and `SAVEPOINT`, `RELEASE SAVEPOINT`,
+  `ROLLBACK [WORK] TO SAVEPOINT` (they would interfere with the profiler's
+  own savepoints).
 - Limitations: the emulator covers the supported PSQL subset; unsupported
   routines are refused up front with line and column. A run ends as
   `completed`, `failed` (with `FailedAt`) or `canceled` (context done).
