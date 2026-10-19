@@ -35,6 +35,7 @@ const (
 	NodeSelectInto, NodeForSelect, NodeInsert, NodeUpdate, NodeDelete NodeKind = "selectInto", "forSelect", "insert", "update", "delete"
 	NodeExecProc, NodeSuspend, NodeExit, NodeBreak                    NodeKind = "executeProcedure", "suspend", "exit", "break"
 	NodeException, NodePostEvent, NodeEmpty                           NodeKind = "exception", "postEvent", "empty"
+	NodeExecStmt, NodeForExecStmt                                     NodeKind = "executeStatement", "forExecuteStatement"
 )
 
 // Node is one statement. Line/Column locate its first byte and
@@ -43,13 +44,13 @@ type Node struct {
 	ID                               int // index in Routine.Nodes
 	Kind                             NodeKind
 	Line, Column, EndLine, EndColumn int
-	Children                         []*Node    // block: statements; if: [then] or [then, else]; while/forSelect: [body]
+	Children                         []*Node    // block: statements; if: [then] or [then, else]; while/forSelect/forExecuteStatement: [body]
 	Handlers                         []*Handler // block only
 	Target                           string     // assign: normalized variable name
-	Value                            *Expr      // assign value; exception message; postEvent name
+	Value                            *Expr      // assign value; exception message; postEvent name; executeStatement/forExecuteStatement statement text
 	Cond                             *Expr      // if/while
 	SQL                              *SQLText   // selectInto/forSelect/insert/update/delete
-	Into                             []string   // selectInto/forSelect targets (normalized)
+	Into                             []string   // selectInto/forSelect/executeStatement/forExecuteStatement targets (normalized); nil for executeStatement without INTO
 	Proc                             *ProcCall  // executeProcedure: callee + args; selectInto/forSelect: set when the shape is "plain output columns FROM p(args)" (spec 6.7)
 	Returning                        []string   // executeProcedure RETURNING_VALUES targets
 	Exception                        string     // exception: normalized exception name
@@ -177,15 +178,16 @@ func (r *Routine) HasSuspend() bool {
 }
 
 // MayWrite reports whether running the routine may change data: any DML,
-// EXECUTE PROCEDURE, procedure in FROM, or GEN_ID. POST_EVENT alone does not
-// count: the line profiler runs it as a no-op.
+// EXECUTE PROCEDURE, EXECUTE STATEMENT (its text is known only at run
+// time), procedure in FROM, or GEN_ID. POST_EVENT alone does not count: the
+// line profiler runs it as a no-op.
 func (r *Routine) MayWrite() bool {
 	if r.genID || len(r.calls) > 0 {
 		return true
 	}
 	for _, n := range r.Nodes {
 		switch n.Kind {
-		case NodeInsert, NodeUpdate, NodeDelete, NodeExecProc:
+		case NodeInsert, NodeUpdate, NodeDelete, NodeExecProc, NodeExecStmt, NodeForExecStmt:
 			return true
 		}
 	}
@@ -234,13 +236,19 @@ func groupSites(sites []callSite) []Callee {
 			callees = append(callees, Callee{Name: site.name, Quoted: site.quoted})
 		}
 		c := &callees[i]
-		if n := len(c.Lines); n == 0 || c.Lines[n-1] != site.line {
-			c.Lines = append(c.Lines, site.line)
-		}
+		c.Lines = append(c.Lines, site.line)
 		c.StepInShape = c.StepInShape || site.stepInShape
 	}
 	for i := range callees {
-		sort.Ints(callees[i].Lines)
+		lines := callees[i].Lines
+		sort.Ints(lines)
+		unique := lines[:1]
+		for _, line := range lines[1:] {
+			if line != unique[len(unique)-1] {
+				unique = append(unique, line)
+			}
+		}
+		callees[i].Lines = unique
 	}
 	sort.SliceStable(callees, func(i, j int) bool {
 		return callees[i].Lines[0] < callees[j].Lines[0]
@@ -571,9 +579,7 @@ func (p *parser) parseStatement() *Node {
 	case p.kw(i, "EXECUTE") && p.kw(i+1, "PROCEDURE"):
 		return p.parseExecProc()
 	case p.kw(i, "EXECUTE") && p.kw(i+1, "STATEMENT"):
-		p.problemAt(i, "EXECUTE STATEMENT is not supported")
-		p.skipStatement()
-		return nil
+		return p.parseExecStmt()
 	case p.kw(i, "SUSPEND"):
 		return p.parseSimple(NodeSuspend)
 	case p.kw(i, "EXIT"):
@@ -799,6 +805,9 @@ func (p *parser) parseFor() *Node {
 	n := p.newNode(NodeForSelect, p.pos)
 	forIndex := p.pos
 	start := p.pos + 1
+	if p.kw(start, "EXECUTE") && p.kw(start+1, "STATEMENT") {
+		return p.parseForExecStmt()
+	}
 	if !p.kw(start, "SELECT") {
 		p.problemAt(forIndex, "FOR %s is not supported", asciiUpper(p.describe(start)))
 		do := p.scanTo(start, func(i int) bool { return p.kw(i, "DO") || p.semicolon(i) })
@@ -1008,10 +1017,17 @@ func (p *parser) parseExecProc() *Node {
 	if p.kw(end, "RETURNING_VALUES") {
 		listEnd := p.scanTo(end+1, p.semicolon)
 		start, stop := end+1, listEnd
-		if p.punct(start, "(") && stop-1 > start && p.punct(stop-1, ")") {
+		toks := p.toks
+		if p.punct(start, "(") && stop-1 > start && matchingClose(p.toks[:stop], start) == stop-1 {
+			// InterBase accepts the list in parentheses (verified natively);
+			// its targets are then one level deeper.
 			start, stop = start+1, stop-1
+			toks = append([]token(nil), p.toks...)
+			for i := start; i < stop; i++ {
+				toks[i].depth--
+			}
 		}
-		last, ok := intoTargetListEnd(p.toks, p.src, start, stop)
+		last, ok := intoTargetListEnd(toks, p.src, start, stop)
 		if !ok || last+1 != stop {
 			p.problemAt(end, "malformed RETURNING_VALUES list")
 			p.skipStatement()
@@ -1022,6 +1038,61 @@ func (p *parser) parseExecProc() *Node {
 	}
 	p.routine.calls = append(p.routine.calls, callSite{name: n.Proc.Name, quoted: n.Proc.Quoted, line: t.line, stepInShape: true})
 	return p.terminate(n)
+}
+
+// execStmtText parses "EXECUTE STATEMENT <expr> [INTO <targets>]" in
+// tokens [p.pos, end) and sets n's text and targets; ok is false after a
+// reported problem.
+func (p *parser) execStmtText(n *Node, end int) bool {
+	start := p.pos + 2
+	into, targets := p.intoClause(start, end)
+	exprEnd := end
+	if into >= 0 {
+		exprEnd = into
+	}
+	if start >= exprEnd {
+		p.problemAt(p.pos, "EXECUTE STATEMENT without a statement text")
+		return false
+	}
+	n.Value, n.Into = p.expr(start, exprEnd), targets
+	return true
+}
+
+func (p *parser) parseExecStmt() *Node {
+	n := p.newNode(NodeExecStmt, p.pos)
+	end := p.scanTo(p.pos, p.semicolon)
+	if !p.execStmtText(n, end) {
+		p.skipStatement()
+		return nil
+	}
+	p.pos = end
+	return p.terminate(n)
+}
+
+// parseForExecStmt parses FOR EXECUTE STATEMENT <expr> INTO <targets> DO
+// <stmt>; InterBase requires the INTO.
+func (p *parser) parseForExecStmt() *Node {
+	n := p.newNode(NodeForExecStmt, p.pos)
+	forIndex := p.pos
+	p.pos++
+	end := p.scanTo(p.pos, func(i int) bool { return p.kw(i, "DO") || p.semicolon(i) })
+	if !p.kw(end, "DO") {
+		p.problemAt(forIndex, "FOR EXECUTE STATEMENT without DO")
+		p.pos = end
+		p.skipStatement()
+		return nil
+	}
+	ok := p.execStmtText(n, end)
+	if ok && n.Into == nil {
+		p.problemAt(forIndex, "FOR EXECUTE STATEMENT without a trailing INTO is not supported")
+		ok = false
+	}
+	p.pos = end + 1
+	if !ok {
+		p.parseStatement()
+		return nil
+	}
+	return p.withBody(n)
 }
 
 func (p *parser) parseException() *Node {

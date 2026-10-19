@@ -505,3 +505,162 @@ func TestLineProfileStepIntoNamesAreNormalized(t *testing.T) {
 		t.Fatalf("stepIntoSet() = %v, want %v", got, want)
 	}
 }
+
+// TestLineProfileNativeProcedureCursorRowByRow checks ibg-mkx: a native FOR
+// SELECT over a procedure fetches one row at a time (FOR UPDATE) when the
+// procedure or the loop body may write, so the procedure cannot run ahead of
+// the body; when FOR UPDATE does not prepare, the call site is labeled.
+func TestLineProfileNativeProcedureCursorRowByRow(t *testing.T) {
+	const reader = "BEGIN\n  FOR SELECT ID FROM LP_T INTO :X DO SUSPEND;\nEND"
+	const writer = "BEGIN\n  INSERT INTO LP_T (ID) VALUES (1);\n  SUSPEND;\nEND"
+	readBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT X FROM LP_SRC(1) INTO :Y DO\n    Y = Y + 1;\nEND"
+	writeBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT X FROM LP_SRC(1) INTO :Y DO\n    UPDATE LP_T SET A = :Y;\nEND"
+	joinBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT T.ID FROM LP_T T JOIN LP_SRC(1) S ON S.X = T.ID INTO :Y DO\n    Y = Y + 1;\nEND"
+	tableBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT ID FROM LP_T INTO :Y DO\n    UPDATE LP_T SET A = :Y;\nEND"
+	for _, tt := range []struct {
+		name, body, callee string
+		known, readOnly    bool
+		refuse             bool
+		wantRowByRow       bool
+		wantSite           bool
+	}{
+		{name: "callee writes", body: readBody, callee: writer, known: true, wantRowByRow: true},
+		{name: "callee reads, body reads", body: readBody, callee: reader, known: true},
+		{name: "callee reads, body writes", body: writeBody, callee: reader, known: true, wantRowByRow: true},
+		{name: "callee unknown", body: readBody, wantRowByRow: true},
+		{name: "join with a writing callee", body: joinBody, callee: writer, known: true, wantRowByRow: true},
+		{name: "table only", body: tableBody, callee: writer, known: true},
+		{name: "read-only run", body: readBody, callee: writer, known: true, readOnly: true},
+		{name: "FOR UPDATE refused", body: readBody, callee: writer, known: true, refuse: true, wantSite: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var procs []lineProfileTestProc
+			if tt.known {
+				procs = []lineProfileTestProc{{name: "LP_SRC", body: tt.callee,
+					inputs: []lpParam{{"P", "INTEGER"}}, outputs: []lpParam{{"X", "INTEGER"}}}}
+			}
+			rows := 2
+			run, _ := newLineProfileStepRunRows(t, context.Background(), tt.body, procs, nil,
+				func() (bool, error) { rows--; return rows >= 0, nil })
+			if tt.known {
+				meta := run.plan.procs["LP_SRC"]
+				meta.readsOnly = tt.callee == reader
+			}
+			run.opts.ReadOnly = tt.readOnly
+			var prepared []string
+			prepare := run.tx.native.prepareContextOverride
+			run.tx.native.prepareContextOverride = func(query string, arrays bool, op *nativeCancelOperation) (*nativeStatement, error) {
+				prepared = append(prepared, query)
+				if tt.refuse && strings.HasSuffix(query, " FOR UPDATE") {
+					return nil, &Error{Operation: "prepare", SQLCode: -104, Message: "token unknown"}
+				}
+				return prepare(query, arrays, op)
+			}
+			if outcome, txErr := run.runInTransaction(); outcome != nil || txErr != nil {
+				t.Fatalf("runInTransaction() = %v, %v", outcome, txErr)
+			}
+			loop := run.result.Routines[0].Nodes[1]
+			rowByRow := strings.HasSuffix(loop.SQL, " FOR UPDATE")
+			if rowByRow != tt.wantRowByRow || loop.Metrics.Rows != 2 || loop.Metrics.Errors != 0 {
+				t.Fatalf("FOR SELECT sent %q (rows %d, errors %d), want row by row %v; prepared %q",
+					loop.SQL, loop.Metrics.Rows, loop.Metrics.Errors, tt.wantRowByRow, prepared)
+			}
+			var sites []LineProfileCallSite
+			for _, site := range run.result.NativeCallSites {
+				if site.Reason == lpReasonRunsAhead {
+					sites = append(sites, site)
+				}
+			}
+			if tt.wantSite != (len(sites) == 1) || tt.wantSite &&
+				(sites[0] != LineProfileCallSite{Routine: "LP_FAKE", Line: 3, Procedure: "LP_SRC", Reason: lpReasonRunsAhead}) {
+				t.Fatalf("run-ahead call sites %+v, want one: %v", sites, tt.wantSite)
+			}
+		})
+	}
+}
+
+func TestLineProfileSourceProceduresResolvedOncePerRoutine(t *testing.T) {
+	routine, problems := psql.ParseRoutine("DECLARE VARIABLE X INTEGER;\nBEGIN\n"+
+		"  SELECT A FROM LP_SRC INTO :X;\n"+
+		"  SELECT A FROM LP_TAB INTO :X;\n"+
+		"END", psql.ParseOptions{Dialect: 3})
+	if len(problems) != 0 {
+		t.Fatalf("parse problems: %+v", problems)
+	}
+	meta := &lpRoutineMeta{name: "LP_CALLER", routine: routine}
+	lookups := 0
+	plan := &lpPlan{dialect: 3, procs: map[string]*lpRoutineMeta{"LP_CALLER": meta}}
+	plan.readProcedureRefs = func(_ context.Context, _ *Transaction, names []lookupName) ([]RoutineRef, error) {
+		lookups++
+		if len(names) != 2 {
+			t.Fatalf("lookup of %+v, want both source names", names)
+		}
+		return nil, nil
+	}
+	if _, mayWrite, err := plan.callees(context.Background(), nil, meta, 1); err != nil || mayWrite {
+		t.Fatalf("callees() mayWrite %v, err %v", mayWrite, err)
+	}
+	if err := plan.checkReadsOnly(context.Background(), nil, meta); err != nil || !meta.readsOnly {
+		t.Fatalf("checkReadsOnly() readsOnly %v, err %v", meta.readsOnly, err)
+	}
+	if lookups != 1 {
+		t.Fatalf("source names looked up %d times, want once per routine", lookups)
+	}
+	procedures, err := plan.sourceProcedures(context.Background(), nil, meta)
+	if err != nil || len(procedures) != 0 || lookups != 1 {
+		t.Fatalf("sourceProcedures() = %v, %v after %d lookups", procedures, err, lookups)
+	}
+}
+
+// TestLineProfileNativeCallSitesOnlyInSteppedRoutines checks that only
+// routines the run can step into are scanned: LP_OUTER2 is called in a
+// shape that runs natively, so its own calls are never emulated.
+func TestLineProfileNativeCallSitesOnlyInSteppedRoutines(t *testing.T) {
+	outer := lineProfileTestProc{name: "LP_OUTER2", inputs: []lpParam{{"N", "INTEGER"}}, outputs: []lpParam{{"I", "INTEGER"}},
+		body: "BEGIN\n  SELECT MAX(I) FROM LP_GEN(2) INTO :I;\n  SUSPEND;\nEND"}
+	body := "BEGIN\n" +
+		"  SELECT MAX(I) FROM LP_OUTER2(1) INTO :X;\n" +
+		"  EXECUTE PROCEDURE LP_TWICE 1 RETURNING_VALUES :X;\n" +
+		"END"
+	run, _ := newLineProfileStepRun(t, context.Background(), body, []lineProfileTestProc{lpGen, lpTwice, outer},
+		[]string{"LP_GEN", "LP_TWICE", "LP_OUTER2"})
+	want := []LineProfileCallSite{{Routine: "LP_FAKE", Line: 2, Procedure: "LP_OUTER2", Reason: lpReasonShape}}
+	if got := nativeCallSites(run.plan, run.stepInto); !reflect.DeepEqual(got, want) {
+		t.Fatalf("native call sites %+v, want %+v", got, want)
+	}
+}
+
+// TestLineProfileBlobColumnTextMultiByte checks that a text BLOB column
+// fits a variable with a multi-byte character set when its bytes are no
+// more than the declared length, and that a cut is still refused.
+func TestLineProfileBlobColumnTextMultiByte(t *testing.T) {
+	run := &lpRun{plan: &lpPlan{dialect: 3, charsets: map[int]lpCharset{0: {"NONE", 1}, 4: {"UTF8", 4}}}}
+	target := &lpVar{typ: psql.ParseTypeText("VARCHAR(5) CHARACTER SET UTF8")}
+	got, err := run.blobColumnText("abcde", "BLOB SUB_TYPE 1", target)
+	if err != nil || got != "abcde" {
+		t.Fatalf("blobColumnText(5 bytes) = %v, %v; want the value", got, err)
+	}
+	if _, err := run.blobColumnText("abcdef", "BLOB SUB_TYPE 1", target); !isFatal(err) {
+		t.Fatalf("blobColumnText(6 bytes) error = %v; want unsupported", err)
+	}
+}
+
+// TestLineProfileEmptyTypeText checks that an empty type text is refused,
+// not a panic.
+func TestLineProfileEmptyTypeText(t *testing.T) {
+	run := &lpRun{plan: &lpPlan{dialect: 3, charsets: map[int]lpCharset{0: {"NONE", 1}}}}
+	if err := errBlobVariable(""); !isFatal(err) {
+		t.Fatalf("errBlobVariable(\"\") = %v; want unsupported", err)
+	}
+	if _, err := run.blobColumnText("ab", "BLOB SUB_TYPE 1", &lpVar{}); !isFatal(err) {
+		t.Fatalf("blobColumnText to an empty type = %v; want unsupported", err)
+	}
+	if length, perChar := run.textLength(" "); length != 0 || perChar != 1 {
+		t.Fatalf("textLength(blank) = %d, %d", length, perChar)
+	}
+}
+
+func isFatal(err error) bool {
+	var fatalErr *lpFatalError
+	return errors.As(err, &fatalErr)
+}

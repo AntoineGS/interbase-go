@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -225,6 +228,58 @@ func TestLineProfileLineAggregation(t *testing.T) {
 	}
 }
 
+func TestLineProfileFirstHitAggregation(t *testing.T) {
+	routines := []LineProfileRoutine{{
+		Parent: -1,
+		Nodes: []LineProfileNode{
+			{ID: 0, Kind: "assign", Line: 3, Metrics: LineMetrics{Hits: 2, Raw: 5, Adjusted: 3, FirstRaw: 4, FirstAdjusted: 2}},
+			{ID: 1, Kind: "if", Line: 3, Metrics: LineMetrics{Hits: 1, Raw: 7, Adjusted: 6, FirstRaw: 7, FirstAdjusted: 6}},
+		},
+	}, {
+		Parent: 0,
+		Nodes:  []LineProfileNode{{ID: 0, Kind: "assign", Line: 2, Metrics: LineMetrics{Hits: 1, Raw: 1, Adjusted: 1, FirstRaw: 1, FirstAdjusted: 1}}},
+	}}
+	aggregateRoutines(routines)
+	if line := routines[0].Lines[3]; line.FirstRaw != 11 || line.FirstAdjusted != 8 {
+		t.Fatalf("Lines[3] first hit = %v/%v, want the sum of its nodes' first hits 11/8", line.FirstRaw, line.FirstAdjusted)
+	}
+	for i, r := range routines {
+		for name, m := range map[string]LineMetrics{"exclusive": r.Exclusive, "inclusive": r.Inclusive} {
+			if m.FirstRaw != 0 || m.FirstAdjusted != 0 {
+				t.Fatalf("routine %d %s first hit = %v/%v, want zero", i, name, m.FirstRaw, m.FirstAdjusted)
+			}
+		}
+	}
+	if routines[0].Inclusive.Raw != 13 {
+		t.Fatalf("inclusive raw = %v", routines[0].Inclusive.Raw)
+	}
+}
+
+func TestLineProfileFirstHitMetrics(t *testing.T) {
+	const slow = 30 * time.Millisecond
+	rows, updates := 3, 0
+	run, _ := newLineProfileFakeRun(t, context.Background(), lineProfileFakeBody,
+		func() (bool, error) { rows--; return rows >= 0, nil },
+		func(string) (int64, error) {
+			if updates++; updates == 1 {
+				time.Sleep(slow)
+			}
+			return 1, nil
+		})
+	if outcome, txErr := run.runInTransaction(); outcome != nil || txErr != nil {
+		t.Fatalf("runInTransaction() = %v, %v", outcome, txErr)
+	}
+	update := run.result.Routines[0].Nodes[2].Metrics
+	if update.Hits != 3 || update.FirstRaw < slow || update.FirstAdjusted < slow || update.Raw-update.FirstRaw >= slow {
+		t.Fatalf("UPDATE hits %d raw %v first raw %v first adjusted %v; want the first hit's time only",
+			update.Hits, update.Raw, update.FirstRaw, update.FirstAdjusted)
+	}
+	loop := run.result.Routines[0].Nodes[1].Metrics
+	if loop.Hits != 1 || loop.FirstRaw != loop.Raw || loop.FirstAdjusted != loop.Adjusted {
+		t.Fatalf("FOR SELECT hit once: first %v/%v, total %v/%v", loop.FirstRaw, loop.FirstAdjusted, loop.Raw, loop.Adjusted)
+	}
+}
+
 func TestLineProfileSQLTextRewrites(t *testing.T) {
 	text := "SELECT 1 FROM T WHERE A = ? AND B = '?' AND /* ? */ C = ? AND \"?\" = 1"
 	got := castParams(text, []string{"VARCHAR(10)", "INTEGER"})
@@ -345,7 +400,18 @@ type lineProfileFakeCounts struct {
 	rolledBack                                bool
 	onPrepare, onCursorClose                  func()       // optional server-side effects of a prepare and of a cursor close
 	rowValue                                  driver.Value // fetched column value; nil means int64(1)
+	// Optional per-statement behavior: valueFor overrides the fetched value,
+	// outputsFor the output descriptors and prepareErr fails the prepare;
+	// prepares counts prepares by statement text.
+	valueFor   func(query string) driver.Value
+	outputsFor func(query string) []OutputDescriptor
+	prepareErr func(query string) error
+	onClose    func(query string) error // result of closing a statement
+	prepares   map[string]int
 }
+
+// lineProfileFakeNull, returned by valueFor, makes the fake fetch a NULL.
+type lineProfileFakeNull struct{}
 
 func lineProfileAllPagesInfo([]byte) ([]byte, error) {
 	return infoItemsFrame(infoItemRecord(5, 0, 0, 0, 0), infoItemRecord(6, 0, 0, 0, 0),
@@ -369,7 +435,16 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 		handleStateOverride: func() nativeHandleState { return nativeHandleConsumed },
 		freeOverride:        func() {},
 		prepareContextOverride: func(query string, _ bool, _ *nativeCancelOperation) (*nativeStatement, error) {
+			if counts.prepareErr != nil {
+				if err := counts.prepareErr(query); err != nil {
+					return nil, err
+				}
+			}
 			counts.prepared++
+			if counts.prepares == nil {
+				counts.prepares = make(map[string]int)
+			}
+			counts.prepares[query]++
 			if counts.onPrepare != nil {
 				counts.onPrepare()
 			}
@@ -380,6 +455,16 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 					kind := "update"
 					if isSelect {
 						kind = "select"
+					} else if strings.HasPrefix(strings.ToUpper(query), "EXECUTE PROCEDURE") {
+						kind = "procedure"
+					} else if strings.HasPrefix(strings.ToUpper(query), "CREATE ") {
+						kind = "ddl"
+					} else if upper := strings.ToUpper(query); strings.HasPrefix(upper, "COMMIT") ||
+						strings.HasPrefix(upper, "ROLLBACK") || strings.HasPrefix(upper, "SET ") ||
+						strings.HasPrefix(upper, "SAVEPOINT") || strings.HasPrefix(upper, "RELEASE") {
+						// As ib_statement_summary: every kind it does not
+						// list, savepoint statements included.
+						kind = "unsupported"
 					}
 					return StatementDescriptor{Kind: kind, ReturnsRows: isSelect, InputCount: inputs}, nil
 				},
@@ -388,6 +473,11 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 				outputsOverride: func() ([]OutputDescriptor, error) {
 					if !isSelect {
 						return nil, nil
+					}
+					if counts.outputsFor != nil {
+						if outputs := counts.outputsFor(query); outputs != nil {
+							return outputs, nil
+						}
 					}
 					if _, blob := counts.rowValue.(BlobRef); blob {
 						return []OutputDescriptor{{Name: "ID", Kind: "BLOB", SubType: 1, Nullable: true}}, nil
@@ -403,10 +493,29 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 						}
 						return nil
 					}
+					// valueFor is asked once per fetched row.
+					var current driver.Value
 					return &nativeCursor{
-						nextOverride:      next,
-						indicatorOverride: func(int) (uint16, error) { return 0, nil },
+						nextOverride: func() (bool, error) {
+							hasRow, err := next()
+							if current = nil; hasRow && counts.valueFor != nil {
+								current = counts.valueFor(query)
+							}
+							return hasRow, err
+						},
+						indicatorOverride: func(int) (uint16, error) {
+							if _, null := current.(lineProfileFakeNull); null {
+								return nullIndicator, nil
+							}
+							return 0, nil
+						},
 						valueOverride: func(int) (driver.Value, error) {
+							if _, null := current.(lineProfileFakeNull); null {
+								return nil, nil
+							}
+							if current != nil {
+								return current, nil
+							}
 							if counts.rowValue != nil {
 								return counts.rowValue, nil
 							}
@@ -416,8 +525,14 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 						abortOverride: closeCursor,
 					}, []string{"ID"}, nil
 				},
-				execOverride:  func([]argument) (int64, error) { return exec(query) },
-				closeOverride: func() error { counts.closed++; return nil },
+				execOverride: func([]argument) (int64, error) { return exec(query) },
+				closeOverride: func() error {
+					counts.closed++
+					if counts.onClose != nil {
+						return counts.onClose(query)
+					}
+					return nil
+				},
 			}
 			return statement, nil
 		},
@@ -1075,6 +1190,121 @@ func TestLineProfileBlobReadsAreOverhead(t *testing.T) {
 	}
 }
 
+func TestLineProfileBlobOverCapFailsRun(t *testing.T) {
+	body := "DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;\nBEGIN\n" +
+		"  BEGIN\n" +
+		"    FOR SELECT ID FROM LP_T INTO :X DO\n" +
+		"      UPDATE LP_T SET A = :X;\n" +
+		"  WHEN ANY DO X = NULL;\n" +
+		"  END\n" +
+		"END"
+	for _, tt := range []struct {
+		name    string
+		max     int64
+		content string
+		fails   bool
+	}{
+		{"at cap", 10, "0123456789", false},
+		{"over cap", 10, "0123456789A", true},
+		{"default cap", 0, "small", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rows := 1
+			run, counts := newLineProfileFakeRun(t, context.Background(), body,
+				func() (bool, error) { rows--; return rows >= 0, nil },
+				func(string) (int64, error) { return 1, nil })
+			run.tx.native.execOverride = func(string, []argument, bool) (int64, error) { return 0, nil }
+			run.opts.MaxBlobBytes = tt.max
+			counts.rowValue = BlobRef{attachment: run.tx.attachment, tx: run.tx, generation: run.tx.generation,
+				high: 1, low: 2, subtype: 1}
+			run.openBlob = func(BlobRef) (io.ReadCloser, error) {
+				return lineProfileFakeBlobReader{Reader: strings.NewReader(tt.content), onRead: func() {}}, nil
+			}
+			outcome, txErr := run.runInTransaction()
+			if txErr != nil {
+				t.Fatalf("runInTransaction() tx error = %v", txErr)
+			}
+			if !tt.fails {
+				if outcome != nil {
+					t.Fatalf("outcome = %v, want completed", outcome)
+				}
+				return
+			}
+			var result LineProfileResult
+			finishLineProfile(context.Background(), &result, outcome, nil)
+			if result.Outcome != LineProfileFailed || result.Err == nil ||
+				result.Err.Error() != "interbase: line profile: BLOB too large to emulate (more than 10 bytes)" {
+				t.Fatalf("outcome %s err %v; want failed with the BLOB-too-large error", result.Outcome, result.Err)
+			}
+			if result.FailedAt == nil || result.FailedAt.Line != 4 {
+				t.Fatalf("FailedAt = %+v, want line 4", result.FailedAt)
+			}
+			if hits := lineProfileNodeHits(run, 6); hits != 0 {
+				t.Fatalf("WHEN ANY handler ran %d times; the over-cap error must not be catchable", hits)
+			}
+		})
+	}
+}
+
+func TestLineProfileBlobReadIsBounded(t *testing.T) {
+	run := &lpRun{result: &LineProfileResult{}, countersUnavailable: true, opts: LineProfileOptions{MaxBlobBytes: 100}}
+	source := &lineProfileCountingReader{remaining: 1 << 20}
+	run.openBlob = func(BlobRef) (io.ReadCloser, error) { return source, nil }
+	_, err := run.holdValue(BlobRef{})
+	if err == nil || !strings.Contains(err.Error(), "BLOB too large to emulate (more than 100 bytes)") {
+		t.Fatalf("holdBlobCapped() error = %v", err)
+	}
+	var fatalErr *lpFatalError
+	if !errors.As(err, &fatalErr) {
+		t.Fatalf("error %v is not fatal", err)
+	}
+	if source.read > 101 {
+		t.Fatalf("read %d bytes for a 100-byte cap; the read must stop after cap+1", source.read)
+	}
+	if !source.closed {
+		t.Fatal("BLOB reader not closed")
+	}
+}
+
+func TestLineProfileMaxBlobBytesLimits(t *testing.T) {
+	for _, tt := range []struct {
+		max, want int64
+	}{
+		{0, 16 << 20},
+		{-5, DefaultLineProfileMaxBlobBytes},
+		{100, 100},
+		{math.MaxInt64, math.MaxInt64 - 1},
+	} {
+		run := &lpRun{result: &LineProfileResult{}, countersUnavailable: true, opts: LineProfileOptions{MaxBlobBytes: tt.max}}
+		if got := run.maxBlobBytes(); got != tt.want {
+			t.Fatalf("maxBlobBytes() with MaxBlobBytes %d = %d, want %d", tt.max, got, tt.want)
+		}
+		run.openBlob = func(BlobRef) (io.ReadCloser, error) {
+			return lineProfileFakeBlobReader{Reader: strings.NewReader("hello blob"), onRead: func() {}}, nil
+		}
+		if got, err := run.holdValue(BlobRef{subtype: 1}); err != nil || got != "hello blob" {
+			t.Fatalf("holdValue() with MaxBlobBytes %d = %q, %v; want the whole BLOB", tt.max, got, err)
+		}
+	}
+}
+
+type lineProfileCountingReader struct {
+	remaining, read int
+	closed          bool
+}
+
+func (r *lineProfileCountingReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.remaining)
+	r.remaining -= n
+	r.read += n
+	return n, nil
+}
+
+func (r *lineProfileCountingReader) Close() error { r.closed = true; return nil }
+
 // wrapFakePrepare records the arguments every executed statement binds.
 func wrapFakePrepare(prepare func(string, bool, *nativeCancelOperation) (*nativeStatement, error),
 	bound *[]any) func(string, bool, *nativeCancelOperation) (*nativeStatement, error) {
@@ -1136,5 +1366,123 @@ func TestLineProfileRelationIDsIncludeOverhead(t *testing.T) {
 	got := relationIDs(&result)
 	if !reflect.DeepEqual(got, []int{5, 9}) {
 		t.Fatalf("relationIDs() = %v, want [5 9]", got)
+	}
+}
+
+func TestLineProfileExceedsPrecision(t *testing.T) {
+	for _, tt := range []struct {
+		value, typeText string
+		want            bool
+	}{
+		{"92233720368547758.07", "NUMERIC(18,2)", true},
+		{"-92233720368547758.08", "NUMERIC(18, 2)", true},
+		{"9223372036854775.80", "NUMERIC(18,2)", false},
+		{"0.07", "NUMERIC(18,2)", false},
+		{"21474836.47", "DECIMAL(9,2)", true},
+		{"1234567.89", "NUMERIC(9,2)", false},
+		{"12345678901", "INTEGER", false},
+		{"abc", "VARCHAR(5)", false},
+	} {
+		if got := exceedsPrecision(tt.value, tt.typeText); got != tt.want {
+			t.Errorf("exceedsPrecision(%q, %q) = %v, want %v", tt.value, tt.typeText, got, tt.want)
+		}
+	}
+}
+
+// TestLineProfileBlobConversionMessage checks the -413 message of a date or
+// time assigned to a BLOB variable, written as the server writes the value
+// (probed natively, dialects 1 and 3).
+func TestLineProfileBlobConversionMessage(t *testing.T) {
+	at := time.Date(2020, 1, 2, 3, 4, 5, 123400000, time.UTC)
+	midnight := time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC)
+	clock := time.Date(1900, 1, 1, 3, 4, 5, 123400000, time.UTC)
+	for _, tt := range []struct {
+		value   time.Time
+		word    string
+		dialect int
+		want    string
+	}{
+		{midnight, "DATE", 3, `"2020-01-02"`},
+		{at, "TIMESTAMP", 3, `"2020-01-02 03:04:05.1234"`},
+		{clock, "TIME", 3, `"03:04:05.1234"`},
+		{midnight, "DATE", 1, `"2-JAN-2020"`},
+		{at, "DATE", 1, `"2-JAN-2020 3:04:05.1234"`},
+	} {
+		var nativeErr *Error
+		if err := errBlobConversion(tt.value, tt.word, tt.dialect); !errors.As(err, &nativeErr) ||
+			nativeErr.Message != "conversion error from string "+tt.want || nativeErr.SQLCode != -413 {
+			t.Errorf("%s dialect %d: %v, want message with %s", tt.word, tt.dialect, err, tt.want)
+		}
+	}
+}
+
+// TestLineProfileEntryArgumentOverhead checks that an entry argument's
+// prepare counts in Prepare and its BLOB read in Blobs, neither in Setup.
+func TestLineProfileEntryArgumentOverhead(t *testing.T) {
+	const pause = 30 * time.Millisecond
+	run, counts := newLineProfileFakeRun(t, context.Background(), "BEGIN\n  EXIT;\nEND",
+		func() (bool, error) { return true, nil },
+		func(string) (int64, error) { return 1, nil })
+	run.plan.entry.inputs = []lpParam{{"B", "BLOB SUB_TYPE 1"}}
+	run.plan.analysis.Entry.Args = []string{"'x'"}
+	run.result.Routines[0] = newRoutineProfile(run.plan.entry)
+	counts.rowValue = BlobRef{attachment: run.tx.attachment, tx: run.tx, generation: run.tx.generation, high: 1, low: 2, subtype: 1}
+	counts.onPrepare = func() { time.Sleep(pause) }
+	run.openBlob = func(BlobRef) (io.ReadCloser, error) {
+		time.Sleep(pause)
+		return io.NopCloser(strings.NewReader("x")), nil
+	}
+	if outcome, txErr := run.runInTransaction(); outcome != nil || txErr != nil {
+		t.Fatalf("runInTransaction() = %v, %v", outcome, txErr)
+	}
+	if r := run.result; r.Prepare < pause || r.Blobs < pause || r.Setup >= pause {
+		t.Fatalf("prepare %v, blobs %v, setup %v; want the prepare and the BLOB read out of Setup", r.Prepare, r.Blobs, r.Setup)
+	}
+}
+
+func TestLineProfileFirstLine(t *testing.T) {
+	callees := []LineProfileCallee{{Name: "B", Lines: []int{7}}, {Name: "EMPTY"}, {Name: "A", Lines: []int{3, 9}}}
+	sort.SliceStable(callees, func(i, j int) bool { return firstLine(callees[i].Lines) < firstLine(callees[j].Lines) })
+	if callees[0].Name != "EMPTY" || callees[1].Name != "A" || callees[2].Name != "B" {
+		t.Fatalf("sorted callees %+v", callees)
+	}
+}
+
+// TestLineProfileRefusesDialectMismatch checks ibg-1o3: a connection
+// dialect other than the database's is a static refusal, read with one info
+// call before any transaction starts; matching dialects go on to the
+// analysis transaction.
+func TestLineProfileRefusesDialectMismatch(t *testing.T) {
+	for _, tt := range []struct{ connection, database int }{{1, 3}, {3, 1}, {3, 3}, {1, 1}} {
+		native := introspectionTestNative(byte(tt.database))
+		begins := 0
+		native.beginTransactionOverride = func([]byte) (*nativeTransaction, error) {
+			begins++
+			return nil, errors.New("LP test: begin")
+		}
+		db := openDatabaseSQLTestDB(t, &conn{native: native})
+		pooled, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		analysis, err := AnalyzeLineProfile(context.Background(), pooled, "EXECUTE PROCEDURE LP_P", tt.connection, nil)
+		_, runErr := LineProfile(context.Background(), pooled, LineProfileOptions{SQL: "EXECUTE PROCEDURE LP_P", Dialect: tt.connection})
+		pooled.Close()
+		if tt.connection == tt.database {
+			if err == nil || begins != 2 || errors.Is(runErr, ErrLineProfileRefused) {
+				t.Fatalf("dialect %d: analysis %v / %v, run %v, begins %d; want the analysis transaction", tt.connection, analysis.Problems, err, runErr, begins)
+			}
+			continue
+		}
+		want := fmt.Sprintf("The connection uses SQL dialect %d but the database is dialect %d; line profiling needs matching dialects.", tt.connection, tt.database)
+		if err != nil || len(analysis.Problems) != 1 || analysis.Problems[0].Message != want {
+			t.Fatalf("dialect %d on %d: analysis %+v / %v; want one problem %q", tt.connection, tt.database, analysis.Problems, err, want)
+		}
+		if !errors.Is(runErr, ErrLineProfileRefused) || !strings.Contains(runErr.Error(), want) {
+			t.Fatalf("dialect %d on %d: run error %v; want the refusal", tt.connection, tt.database, runErr)
+		}
+		if begins != 0 {
+			t.Fatalf("dialect %d on %d: %d transactions began; want none", tt.connection, tt.database, begins)
+		}
 	}
 }

@@ -31,6 +31,9 @@ ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 	isc_stmt_handle *statement, unsigned short option);
 ISC_STATUS ISC_EXPORT test_dsql_set_cursor_name(ISC_STATUS *status,
 	isc_stmt_handle *statement, char *name, unsigned short reserved);
+ISC_STATUS ISC_EXPORT test_database_info(ISC_STATUS *status,
+	isc_db_handle *database, short item_length, char *items,
+	short buffer_length, char *buffer);
 
 #define isc_dsql_allocate_statement test_dsql_allocate_statement
 #define isc_dsql_prepare test_dsql_prepare
@@ -41,7 +44,9 @@ ISC_STATUS ISC_EXPORT test_dsql_set_cursor_name(ISC_STATUS *status,
 #define isc_dsql_execute2 test_dsql_execute2
 #define isc_dsql_free_statement test_dsql_free_statement
 #define isc_dsql_set_cursor_name test_dsql_set_cursor_name
+#define isc_database_info test_database_info
 #include "../native.c"
+#undef isc_database_info
 #undef isc_dsql_allocate_statement
 #undef isc_dsql_prepare
 #undef isc_dsql_describe_bind
@@ -61,6 +66,14 @@ static char database_token;
 static ib_cancel_slot *expected_cancel_slot;
 static isc_stmt_handle expected_cancel_statement;
 static unsigned char expected_statement_type;
+static int describe_output_case;
+/* isc_database_info mock: the full response needs info_needed bytes; a
+ * shorter buffer gets isc_info_truncated, or with info_overrun a record
+ * header whose payload runs past the buffer. */
+static size_t info_needed;
+static int info_overrun;
+static int info_calls;
+static short info_lengths[16];
 
 ISC_STATUS ISC_EXPORT test_dsql_set_cursor_name(ISC_STATUS *status,
 	isc_stmt_handle *statement, char *name, unsigned short reserved)
@@ -151,6 +164,29 @@ ISC_STATUS ISC_EXPORT test_dsql_describe(ISC_STATUS *status,
 {
 	(void) statement;
 	(void) dialect;
+	if (describe_output_case) {
+		/* INTEGER with an alias, NUMERIC(9,2) and an unnamed expression. */
+		output->sqld = 3;
+		if (output->sqln < 3) {
+			return status_result(status, 0);
+		}
+		memset(output->sqlvar, 0, 3U * sizeof(XSQLVAR));
+		output->sqlvar[0].sqltype = SQL_LONG;
+		output->sqlvar[0].sqllen = (short) sizeof(ISC_LONG);
+		memcpy(output->sqlvar[0].sqlname, "ID", 2U);
+		output->sqlvar[0].sqlname_length = 2;
+		memcpy(output->sqlvar[0].aliasname, "LP_ID", 5U);
+		output->sqlvar[0].aliasname_length = 5;
+		output->sqlvar[1].sqltype = SQL_LONG | 1;
+		output->sqlvar[1].sqlsubtype = 1;
+		output->sqlvar[1].sqlscale = -2;
+		output->sqlvar[1].sqllen = (short) sizeof(ISC_LONG);
+		memcpy(output->sqlvar[1].sqlname, "AMOUNT", 6U);
+		output->sqlvar[1].sqlname_length = 6;
+		output->sqlvar[2].sqltype = SQL_INT64 | 1;
+		output->sqlvar[2].sqllen = (short) sizeof(ISC_INT64);
+		return status_result(status, 0);
+	}
 	output->sqld = 1;
 	output->sqlvar[0].sqltype = SQL_LONG;
 	output->sqlvar[0].sqllen = (short) sizeof(ISC_LONG);
@@ -219,6 +255,51 @@ ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 		*statement = NULL;
 	}
 	return status_result(status, 0);
+}
+
+ISC_STATUS ISC_EXPORT test_database_info(ISC_STATUS *status,
+	isc_db_handle *database, short item_length, char *items,
+	short buffer_length, char *buffer)
+{
+	size_t length;
+	size_t payload;
+
+	(void) items;
+	check(database != NULL && *database != NULL && item_length > 0 &&
+		buffer_length > 0 && buffer != NULL, "database info received invalid arguments");
+	if (info_calls < (int) (sizeof(info_lengths) / sizeof(info_lengths[0]))) {
+		info_lengths[info_calls] = buffer_length;
+	}
+	info_calls++;
+	length = (size_t) buffer_length;
+	payload = info_needed - 4U;
+	if (length >= info_needed) {
+		/* One record of `payload` bytes, then isc_info_end. Writing the full
+		 * buffer lets ASan catch a short allocation. */
+		memset(buffer, 0x5a, length);
+		buffer[0] = (char) isc_info_reads;
+		buffer[1] = (char) (payload & 0xffU);
+		buffer[2] = (char) ((payload >> 8U) & 0xffU);
+		buffer[info_needed - 1U] = (char) isc_info_end;
+		return status_result(status, 0);
+	}
+	memset(buffer, 0x5a, length);
+	if (info_overrun && length >= 3U) {
+		buffer[0] = (char) isc_info_reads;
+		buffer[1] = (char) (payload & 0xffU);
+		buffer[2] = (char) ((payload >> 8U) & 0xffU);
+	} else {
+		buffer[0] = (char) isc_info_truncated;
+	}
+	return status_result(status, 0);
+}
+
+static void reset_info(size_t needed, int overrun)
+{
+	info_needed = needed;
+	info_overrun = overrun;
+	info_calls = 0;
+	memset(info_lengths, 0, sizeof(info_lengths));
 }
 
 static void test_indicator_flags(void)
@@ -393,6 +474,151 @@ static void test_transient_query_publishes_execute2_handle(void)
 	ib_cancel_slot_free(slot);
 }
 
+static void test_database_info_items_growth_and_cap(void)
+{
+	static const unsigned char items[] = {isc_info_reads, isc_info_writes};
+	ib_connection connection;
+	char *response;
+	size_t response_length;
+	char *error;
+	int result;
+	int overrun;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &database_token;
+
+	/* Fits the initial buffer: one call. */
+	reset_info(64U, 0);
+	response = NULL;
+	error = NULL;
+	result = ib_connection_database_info_items(&connection, items, sizeof(items),
+		&response, &response_length, &error);
+	check(result == 0 && error == NULL && response != NULL && response_length == 64U &&
+		info_calls == 1 && info_lengths[0] == 512,
+		"small database info response was not returned from one 512-byte call");
+	free(response);
+
+	/* Growth by doubling, through both truncation signals. */
+	for (overrun = 0; overrun <= 1; overrun++) {
+		reset_info(3000U, overrun);
+		response = NULL;
+		error = NULL;
+		result = ib_connection_database_info_items(&connection, items, sizeof(items),
+			&response, &response_length, &error);
+		check(result == 0 && error == NULL && response != NULL &&
+			response_length == 3000U && info_calls == 4 &&
+			info_lengths[0] == 512 && info_lengths[1] == 1024 &&
+			info_lengths[2] == 2048 && info_lengths[3] == 4096,
+			"truncated database info response did not double to 4096 bytes");
+		check(response != NULL && (unsigned char) response[0] == isc_info_reads &&
+			(unsigned char) response[response_length - 1U] == isc_info_end,
+			"grown database info response lost its record or terminator");
+		free(response);
+	}
+
+	/* The buffer is capped at SHRT_MAX; past it the caller is told to fall
+	 * back (2) and nothing is returned. */
+	reset_info((size_t) SHRT_MAX + 1U, 0);
+	response = NULL;
+	error = NULL;
+	result = ib_connection_database_info_items(&connection, items, sizeof(items),
+		&response, &response_length, &error);
+	check(result == 2 && error != NULL && response == NULL && response_length == 0U,
+		"oversized database info response did not request the per-item fallback");
+	check(info_calls == 7 && info_lengths[5] == 16384 &&
+		info_lengths[6] == SHRT_MAX,
+		"database info growth did not stop at the SHRT_MAX cap");
+	ib_error_free(error);
+
+	/* Exactly SHRT_MAX fits on the capped call. */
+	reset_info((size_t) SHRT_MAX, 0);
+	response = NULL;
+	error = NULL;
+	result = ib_connection_database_info_items(&connection, items, sizeof(items),
+		&response, &response_length, &error);
+	check(result == 0 && error == NULL && response != NULL &&
+		response_length == (size_t) SHRT_MAX && info_calls == 7,
+		"a SHRT_MAX database info response was not accepted on the capped call");
+	free(response);
+
+	/* Invalid item lists fail before any native call. */
+	reset_info(64U, 0);
+	error = NULL;
+	check(ib_connection_database_info_items(&connection, items, 0U,
+		&response, &response_length, &error) == -1 && error != NULL &&
+		info_calls == 0, "empty database info item list was accepted");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_connection_database_info_items(&connection, items, 256U,
+		&response, &response_length, &error) == -1 && error != NULL &&
+		info_calls == 0, "oversized database info item list was accepted");
+	ib_error_free(error);
+}
+
+static void test_statement_output_metadata(void)
+{
+	const char query[] = "SELECT ID AS LP_ID, AMOUNT, ID + 1 FROM LP_T";
+	ib_connection connection;
+	ib_statement *statement;
+	ib_cancel_slot *slot;
+	ib_output_metadata metadata;
+	const char *name;
+	size_t name_length;
+	uint64_t generation;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &database_token;
+	connection.transaction = &transaction_token;
+	connection.dialect = SQL_DIALECT_V6;
+	expected_statement_type = isc_info_sql_stmt_select;
+	describe_output_case = 1;
+	slot = new_cancel_slot(&generation);
+	expected_cancel_slot = slot;
+	expected_cancel_statement = (isc_stmt_handle) &statement_token;
+	statement = ib_statement_prepare(&connection, query, sizeof(query) - 1U,
+		slot, generation, &error);
+	check(statement != NULL && error == NULL, "output metadata prepare failed");
+
+	check(ib_statement_output_metadata(statement, 0U, &metadata, &name,
+		&name_length, &error) == 0 && error == NULL, "INTEGER output metadata failed");
+	check(metadata.sql_type == SQL_LONG && metadata.sql_scale == 0 &&
+		metadata.length == (int) sizeof(ISC_LONG) && !metadata.nullable &&
+		name_length == 5U && memcmp(name, "LP_ID", 5U) == 0,
+		"INTEGER output metadata or alias name is wrong");
+
+	check(ib_statement_output_metadata(statement, 1U, &metadata, &name,
+		&name_length, &error) == 0 && error == NULL, "NUMERIC output metadata failed");
+	check(metadata.sql_type == SQL_LONG && metadata.sql_subtype == 1 &&
+		metadata.sql_scale == -2 && metadata.nullable &&
+		name_length == 6U && memcmp(name, "AMOUNT", 6U) == 0,
+		"NUMERIC output metadata lost its scale, subtype or name");
+
+	check(ib_statement_output_metadata(statement, 2U, &metadata, &name,
+		&name_length, &error) == 0 && error == NULL, "expression output metadata failed");
+	check(metadata.sql_type == SQL_INT64 && metadata.nullable && name_length == 0U,
+		"unnamed expression output metadata is wrong");
+
+	check(ib_statement_output_metadata(statement, 3U, &metadata, &name,
+		&name_length, &error) == -1 && error != NULL,
+		"out-of-range output metadata index was accepted");
+	ib_error_free(error);
+	error = NULL;
+	check(ib_statement_output_metadata(NULL, 0U, &metadata, &name,
+		&name_length, &error) == -1 && error != NULL,
+		"output metadata of a missing statement was accepted");
+	ib_error_free(error);
+	error = NULL;
+
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"output metadata statement cleanup failed");
+	ib_error_free(error);
+	describe_output_case = 0;
+	expected_cancel_slot = NULL;
+	expected_cancel_statement = NULL;
+	ib_cancel_slot_free(slot);
+}
+
 int main(void)
 {
 	test_indicator_flags();
@@ -400,6 +626,8 @@ int main(void)
 	test_transient_prepare_publishes_actual_handle();
 	test_transient_exec_publishes_actual_handle();
 	test_transient_query_publishes_execute2_handle();
+	test_database_info_items_growth_and_cap();
+	test_statement_output_metadata();
 	(void) puts("native direct tests passed");
 	return EXIT_SUCCESS;
 }

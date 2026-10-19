@@ -30,6 +30,17 @@ func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dia
 		dialect = 3
 	}
 	plan := &lpPlan{dialect: dialect, procs: make(map[string]*lpRoutineMeta)}
+	// The routines run with the database's dialect; a connection of the
+	// other dialect cannot even prepare some of their statements (ibg-1o3).
+	databaseDialect, err := lpDatabaseDialect(ctx, pooled)
+	if err != nil {
+		return nil, err
+	}
+	if databaseDialect != dialect {
+		plan.problem("entry statement", 0, 0,
+			"The connection uses SQL dialect %d but the database is dialect %d; line profiling needs matching dialects.", dialect, databaseDialect)
+		return plan, nil
+	}
 	entry, err := psql.ParseEntryCall(entrySQL, dialect)
 	if err != nil {
 		plan.analysis.Problems = []RoutineProblem{{Routine: "entry statement", Message: err.Error()}}
@@ -47,6 +58,25 @@ func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dia
 		return nil, err
 	}
 	return plan, nil
+}
+
+// lpDatabaseDialect reads the database's SQL dialect with one info call,
+// outside any transaction.
+func lpDatabaseDialect(ctx context.Context, pooled *sql.Conn) (int, error) {
+	var dialect int64
+	err := pooled.Raw(func(driverConn any) error {
+		c, ok := driverConn.(*conn)
+		if !ok {
+			return ErrNotInterBaseConn
+		}
+		item, err := (&Attachment{conn: c}).DatabaseInfo(ctx, InfoDatabaseSQLDialect)
+		if err != nil {
+			return err
+		}
+		dialect, err = item.Int64()
+		return err
+	})
+	return int(dialect), err
 }
 
 func (plan *lpPlan) problem(routine string, line, column int, format string, args ...any) {
@@ -160,25 +190,14 @@ func (plan *lpPlan) callees(ctx context.Context, tx *Transaction, meta *lpRoutin
 	for _, c := range meta.routine.Callees() {
 		add(c, c.StepInShape)
 	}
-	sources := meta.routine.SourceNames()
-	if len(sources) > 0 {
-		candidates := make([]lookupName, len(sources))
-		for i, s := range sources {
-			candidates[i] = lookupName{name: s.Name, quoted: true}
-		}
-		procedures, err := readProcedureRefsTx(ctx, tx, candidates)
-		if err != nil {
-			return nil, false, err
-		}
-		found := make(map[string]bool, len(procedures))
-		for _, p := range procedures {
-			found[p.Name] = true
-		}
-		for _, s := range sources {
-			if found[s.Name] {
-				add(s, false)
-				mayWrite = true
-			}
+	found, err := plan.sourceProcedures(ctx, tx, meta)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, s := range meta.routine.SourceNames() {
+		if found[s.Name] {
+			add(s, false)
+			mayWrite = true
 		}
 	}
 	callees := make([]LineProfileCallee, 0, len(order))
@@ -195,10 +214,75 @@ func (plan *lpPlan) callees(ctx context.Context, tx *Transaction, meta *lpRoutin
 			}
 		}
 		callee.Parses = ok && len(calleeMeta.problems) == 0
+		if ok {
+			if err := plan.checkReadsOnly(ctx, tx, calleeMeta); err != nil {
+				return nil, false, err
+			}
+		}
 		callees = append(callees, callee)
 	}
-	sort.SliceStable(callees, func(i, j int) bool { return callees[i].Lines[0] < callees[j].Lines[0] })
+	sort.SliceStable(callees, func(i, j int) bool { return firstLine(callees[i].Lines) < firstLine(callees[j].Lines) })
 	return callees, mayWrite, nil
+}
+
+// firstLine returns the first of lines, 0 when there is none.
+func firstLine(lines []int) int {
+	if len(lines) == 0 {
+		return 0
+	}
+	return lines[0]
+}
+
+// checkReadsOnly sets meta.readsOnly when running the routine provably never
+// writes: it parses without problems, has no DML, EXECUTE PROCEDURE,
+// procedure call or GEN_ID, and none of its bare FROM names is a procedure.
+func (plan *lpPlan) checkReadsOnly(ctx context.Context, tx *Transaction, meta *lpRoutineMeta) error {
+	if meta.readsChecked {
+		return nil
+	}
+	meta.readsChecked = true
+	if meta.routine == nil || len(meta.problems) > 0 || meta.routine.MayWrite() {
+		return nil
+	}
+	found, err := plan.sourceProcedures(ctx, tx, meta)
+	if err != nil || len(found) > 0 {
+		return err
+	}
+	meta.readsOnly = true
+	return nil
+}
+
+// sourceProcedures returns the bare FROM/JOIN names of meta that are
+// procedures, looked up in RDB$PROCEDURES once per routine.
+func (plan *lpPlan) sourceProcedures(ctx context.Context, tx *Transaction, meta *lpRoutineMeta) (map[string]bool, error) {
+	if meta.sourceProcs != nil {
+		return meta.sourceProcs, nil
+	}
+	found := make(map[string]bool)
+	if sources := meta.routine.SourceNames(); len(sources) > 0 {
+		candidates := make([]lookupName, len(sources))
+		for i, s := range sources {
+			candidates[i] = lookupName{name: s.Name, quoted: true}
+		}
+		procedures, err := plan.procedureRefs(ctx, tx, candidates)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range procedures {
+			found[p.Name] = true
+		}
+	}
+	meta.sourceProcs = found
+	return found, nil
+}
+
+// procedureRefs resolves names in RDB$PROCEDURES (readProcedureRefsTx
+// unless a test replaced it).
+func (plan *lpPlan) procedureRefs(ctx context.Context, tx *Transaction, names []lookupName) ([]RoutineRef, error) {
+	if plan.readProcedureRefs != nil {
+		return plan.readProcedureRefs(ctx, tx, names)
+	}
+	return readProcedureRefsTx(ctx, tx, names)
 }
 
 func mergeLines(a, b []int) []int {
@@ -383,9 +467,12 @@ func databaseCharset(ctx context.Context, tx *Transaction) (string, error) {
 }
 
 // userExceptions reads RDB$EXCEPTIONS: names to number and message, and
-// numbers back to names.
+// numbers back to names. RDB$MESSAGE is CHARACTER SET NONE, so it is read
+// as OCTETS: the message keeps its bytes, as in the server's error, on any
+// attachment character set (a CP1252 byte cannot be transliterated to UTF8).
 func userExceptions(ctx context.Context, tx *Transaction) (map[string]lpException, map[int32]string, error) {
-	cursor, err := tx.Query(ctx, "SELECT RDB$EXCEPTION_NAME, RDB$EXCEPTION_NUMBER, RDB$MESSAGE FROM RDB$EXCEPTIONS")
+	cursor, err := tx.Query(ctx, "SELECT RDB$EXCEPTION_NAME, RDB$EXCEPTION_NUMBER, "+
+		"CAST(RDB$MESSAGE AS VARCHAR(32765) CHARACTER SET OCTETS) FROM RDB$EXCEPTIONS")
 	if err != nil {
 		return nil, nil, fmt.Errorf("interbase: read exceptions: %w", err)
 	}

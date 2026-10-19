@@ -334,6 +334,41 @@ func TestParseRoutineDialect(t *testing.T) {
 	}
 }
 
+func TestParseRoutineExecuteStatement(t *testing.T) {
+	body := strings.Join([]string{
+		"declare variable s varchar(100);",
+		"begin",
+		"  execute statement 'update t set a = 1';",
+		"  execute statement ('select a, b from t') into :a, b;",
+		"  execute statement s || ' where id = ' || :a into a;",
+		"  for execute statement 'select a from t ' || s into :a do",
+		"  begin",
+		"    suspend;",
+		"  end",
+		"end",
+	}, "\n")
+	r := parseClean(t, body, ParseOptions{Params: []string{"A", "B"}})
+	want := strings.Join([]string{
+		"block 2:1-10:3",
+		"  executeStatement 3:3-3:41 value=\"'update t set a = 1'\"",
+		"  executeStatement 4:3-4:54 value=\"('select a, b from t')\" into=[A B]",
+		"  executeStatement 5:3-5:53 value=\"s || ' where id = ' || :a\" into=[A]",
+		"  forExecuteStatement 6:3-9:5 value=\"'select a from t ' || s\" into=[A]",
+		"    block 7:3-9:5",
+		"      suspend 8:5-8:12",
+		"",
+	}, "\n")
+	if got := renderRoutine(r); got != want {
+		t.Fatalf("tree =\n%s\nwant\n%s", got, want)
+	}
+	if es := r.Body.Children[2]; es.Value.Local != nil || len(es.Value.Params) != 2 {
+		t.Fatalf("concatenation expression %+v, want a server expression of S and A", es.Value)
+	}
+	if es := r.Body.Children[0]; es.Into != nil {
+		t.Fatalf("EXECUTE STATEMENT without INTO has targets %v", es.Into)
+	}
+}
+
 func TestParseRoutineRefusals(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -342,10 +377,16 @@ func TestParseRoutineRefusals(t *testing.T) {
 		wantText  []string
 	}{
 		{
-			name:      "execute statement",
-			body:      "begin\n  execute statement 'delete from t';\n  x = 1;\nend",
+			name:      "for execute statement without into",
+			body:      "begin\n  for execute statement 'select a from t' do\n    suspend;\n  x = 1;\nend",
 			wantLines: []int{2},
-			wantText:  []string{"EXECUTE STATEMENT"},
+			wantText:  []string{"FOR EXECUTE STATEMENT without"},
+		},
+		{
+			name:      "execute statement without a text",
+			body:      "begin\n  execute statement;\n  x = 1;\nend",
+			wantLines: []int{2},
+			wantText:  []string{"EXECUTE STATEMENT without"},
 		},
 		{
 			name:      "for select as cursor and where current of",
@@ -367,8 +408,8 @@ func TestParseRoutineRefusals(t *testing.T) {
 		},
 		{
 			name: "multiple problems reported together",
-			body: "begin\nexecute statement 'a';\nfrobnicate;\nif (x = 1) then\n  execute statement 'b';\n" +
-				"for execute statement 'c' into :x do\nbegin\n  suspend;\nend\nend",
+			body: "begin\nupdate t set a = 1 where current of c;\nfrobnicate;\nif (x = 1) then\n  frobnicate;\n" +
+				"for execute statement 'c' do\nbegin\n  suspend;\nend\nend",
 			wantLines: []int{2, 3, 5, 6},
 		},
 	}
@@ -395,7 +436,7 @@ func TestParseRoutineRefusals(t *testing.T) {
 }
 
 func TestParseRoutineRefusalKeepsParsing(t *testing.T) {
-	r, problems := ParseRoutine("begin\n  execute statement 'delete from t';\n  x = 1;\nend", ParseOptions{})
+	r, problems := ParseRoutine("begin\n  frobnicate 'delete from t';\n  x = 1;\nend", ParseOptions{})
 	if len(problems) != 1 || problems[0].Column != 3 {
 		t.Fatalf("problems = %+v, want one at column 3", problems)
 	}
@@ -409,7 +450,7 @@ func TestParseRoutineMalformed(t *testing.T) {
 		"", "begin", "end", "begin if", "begin if (", "begin x = ", "declare", "declare variable",
 		"declare variable x", "begin when", "begin execute", "begin execute procedure",
 		"begin execute procedure p returning_values", "begin end end", "(((", ")))", "begin for",
-		"begin for select", "begin when sqlcode - do x = 1; end", "begin else end", "begin if (x) then else end",
+		"begin for select", "begin for execute statement", "begin for execute statement x into", "begin execute statement", "begin execute statement x into", "begin when sqlcode - do x = 1; end", "begin else end", "begin if (x) then else end",
 		"begin begin", "begin x = 1; when any do", "begin when any do x = 1; y = 2; end",
 		"begin select a from t; end", "begin exception; end", "begin while (x) suspend; end",
 		"begin when sqlcode 99999999999 do exit; end", "begin suspend end",
@@ -466,6 +507,8 @@ func TestRoutineMayWrite(t *testing.T) {
 		{"procedure in assignment", "begin\nx = (select max(a) from p_src(2));\nend", true},
 		{"procedure in exception message", "begin\nexception e_one (select first 1 m from p_src(3));\nend", true},
 		{"procedure in post_event", "begin\npost_event (select first 1 n from p_src(4));\nend", true},
+		{"execute statement", "begin\nexecute statement 'select a from t' into :a;\nend", true},
+		{"for execute statement", "begin\nfor execute statement 'select a from t' into :a do suspend;\nend", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -764,5 +807,51 @@ func TestRoutineFunctionCallsAreNotProcedures(t *testing.T) {
 	}
 	if !r.MayWrite() {
 		t.Fatal("MayWrite() = false, want true")
+	}
+}
+
+func TestParseRoutineReturningValuesParentheses(t *testing.T) {
+	body := strings.Join([]string{
+		"DECLARE VARIABLE a INTEGER;",
+		"DECLARE VARIABLE b INTEGER;",
+		"begin",
+		"execute procedure p_two 1, 2 returning_values (:a, :b);",
+		"execute procedure p_two(1, 2) returning_values (a);",
+		"execute procedure p_two (1, 2) returning_values :a, b;",
+		"end",
+	}, "\n")
+	r := parseClean(t, body, ParseOptions{})
+	for i, want := range [][]string{{"A", "B"}, {"A"}, {"A", "B"}} {
+		n := r.Body.Children[i]
+		if n.Proc == nil || len(n.Proc.Args) != 2 || !reflect.DeepEqual(n.Returning, want) {
+			t.Fatalf("statement %d: Proc %+v Returning %v, want 2 args and %v", i, n.Proc, n.Returning, want)
+		}
+	}
+}
+
+func TestParseRoutineMalformedPositions(t *testing.T) {
+	for _, tt := range []struct {
+		body         string
+		line, column int
+		message      string
+	}{
+		{"begin\n  x = 1;\n  execute procedure p 1 returning_values (:a, 1);\nend", 3, 25, "malformed RETURNING_VALUES list"},
+		{"begin\n  execute procedure p 1 returning_values :a +;\nend", 2, 25, "malformed RETURNING_VALUES list"},
+		{"begin\n  execute procedure p 1 returning_values ();\nend", 2, 25, "malformed RETURNING_VALUES list"},
+		{"begin\n\n    execute procedure p(1,,2);\nend", 3, 23, "malformed EXECUTE PROCEDURE argument list"},
+		{"begin\n  execute procedure;\nend", 2, 3, "EXECUTE PROCEDURE without a procedure name"},
+	} {
+		_, problems := ParseRoutine(tt.body, ParseOptions{})
+		if len(problems) != 1 || problems[0].Line != tt.line || problems[0].Column != tt.column || problems[0].Message != tt.message {
+			t.Errorf("ParseRoutine(%q) problems = %+v, want %q at %d:%d", tt.body, problems, tt.message, tt.line, tt.column)
+		}
+	}
+}
+
+func TestRoutineCalleeLinesAreSortedAndUnique(t *testing.T) {
+	r := &Routine{calls: []callSite{{name: "P", line: 5}, {name: "P", line: 3}, {name: "P", line: 5}, {name: "Q", line: 4}, {name: "P", line: 3}}}
+	want := []Callee{{Name: "P", Lines: []int{3, 5}}, {Name: "Q", Lines: []int{4}}}
+	if got := r.Callees(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Callees() = %+v, want %+v", got, want)
 	}
 }

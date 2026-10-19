@@ -217,6 +217,9 @@ struct ib_cursor {
 	int server_cursor_open;
 	int statement_type;
 	int procedure;
+	/* Set when optional catalog enrichment failed and was skipped, so the
+	 * result must not be cached on a prepared statement. */
+	int metadata_degraded;
 	int output_pending;
 	int fetched;
 	int allow_arrays;
@@ -1391,8 +1394,11 @@ static void ib_status_text(const ISC_STATUS *status, char *text)
 	text[used] = '\0';
 }
 
+/* Every code takes at least two of the IB_STATUS_VECTOR_LENGTH slots, so a
+ * vector holds at most IB_STATUS_VECTOR_LENGTH / 2 codes. At up to 21 bytes
+ * each (separator and sign included) plus ", gds " and the exception suffix,
+ * 320 bytes always fit them; the snprintf guard below only defends the bound. */
 #define IB_STATUS_CODES_LENGTH 320U
-#define IB_STATUS_CODES_MAX 16U
 
 /*
  * Render ", gds <code> <code>..., exception <number>" for the isc_arg_gds codes
@@ -1418,16 +1424,14 @@ static void ib_status_codes(const ISC_STATUS *status, char *text, size_t size)
 			break;
 		}
 		if (status[index] == isc_arg_gds) {
-			if (codes < IB_STATUS_CODES_MAX) {
-				written = snprintf(text + used, size - used, "%s%" PRIdPTR,
-					codes == 0U ? ", gds " : " ", (intptr_t) status[index + 1U]);
-				if (written < 0 || (size_t) written >= size - used) {
-					text[used] = '\0';
-					break;
-				}
-				used += (size_t) written;
-				++codes;
+			written = snprintf(text + used, size - used, "%s%" PRIdPTR,
+				codes == 0U ? ", gds " : " ", (intptr_t) status[index + 1U]);
+			if (written < 0 || (size_t) written >= size - used) {
+				text[used] = '\0';
+				break;
 			}
+			used += (size_t) written;
+			++codes;
 			if (status[index + 1U] == isc_except && !have_number &&
 				index + 3U < IB_STATUS_VECTOR_LENGTH &&
 				status[index + 2U] == isc_arg_number) {
@@ -1522,7 +1526,8 @@ static int ib_catalog_error_requires_propagation(const char *error)
 		strstr(error, "pthread_") != NULL;
 }
 
-static int ib_catalog_fallback_if_optional(ib_cancel_slot *cancel, char **error)
+static int ib_catalog_fallback_if_optional(ib_cursor *cursor,
+	ib_cancel_slot *cancel, char **error)
 {
 	if (cancel == NULL || ib_catalog_error_requires_propagation(
 		error == NULL ? NULL : *error)) {
@@ -1532,6 +1537,7 @@ static int ib_catalog_fallback_if_optional(ib_cancel_slot *cancel, char **error)
 		free(*error);
 		*error = NULL;
 	}
+	cursor->metadata_degraded = 1;
 	return 1;
 }
 
@@ -3721,6 +3727,29 @@ static int ib_blob_lookup_bind_descriptor(ib_cursor *cursor, size_t parameter_in
 	return ib_blob_lookup_descriptor(cursor, &destination, descriptor, error);
 }
 
+/* ib_cursor_known_blob_charset reports the text BLOB character set the
+ * procedure catalog supplied for an output column, if any. */
+static int ib_cursor_known_blob_charset(const ib_cursor *cursor,
+	const XSQLVAR *variable, short *charset)
+{
+	short index;
+
+	if (cursor == NULL || cursor->output == NULL || cursor->blob_charsets == NULL ||
+		cursor->blob_charset_known == NULL || variable == NULL) {
+		return 0;
+	}
+	for (index = 0; index < cursor->output->sqld; index++) {
+		if (&cursor->output->sqlvar[index] == variable) {
+			if (cursor->blob_charset_known[index] == 0) {
+				return 0;
+			}
+			*charset = cursor->blob_charsets[index];
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int ib_cursor_blob_ref(ib_cursor *cursor, const XSQLVAR *variable,
 	ib_value_view *view, char **error)
 {
@@ -3756,6 +3785,9 @@ static int ib_cursor_blob_ref(ib_cursor *cursor, const XSQLVAR *variable,
 		} else {
 			ib_blob_descriptor(&descriptor, variable->sqlsubtype, 0);
 		}
+	} else if (variable->sqlsubtype == 1 &&
+		ib_cursor_known_blob_charset(cursor, variable, &blob_charset)) {
+		ib_blob_descriptor(&descriptor, 1, blob_charset);
 	} else if (variable->sqlname_length > 0 && variable->relname_length > 0) {
 		if (ib_blob_lookup_descriptor(cursor, variable, &descriptor, error) != 0) {
 			return -1;
@@ -5925,7 +5957,7 @@ static int ib_procedure_catalog_apply_row(ib_cursor *cursor,
 }
 
 static int ib_catalog_apply_row(ib_cursor *cursor, const ib_cursor *catalog,
-	char **error)
+	unsigned char *matched, char **error)
 {
 	char relation[METADATALENGTH + 1U];
 	char field[METADATALENGTH + 1U];
@@ -6029,6 +6061,9 @@ static int ib_catalog_apply_row(ib_cursor *cursor, const ib_cursor *catalog,
 			memcmp(source_field, field, field_length) != 0) {
 			continue;
 		}
+		if (matched != NULL) {
+			matched[index] = 1;
+		}
 		cursor->metadata[index].sql_type = ib_metadata_type_code(sql_type);
 		cursor->metadata[index].sql_subtype = field_subtype;
 		if ((sql_type == SQL_TEXT || sql_type == SQL_VARYING) &&
@@ -6059,8 +6094,14 @@ static int ib_catalog_apply_row(ib_cursor *cursor, const ib_cursor *catalog,
 	return 0;
 }
 
+/* ib_procedure_metadata_catalog reads procedure output parameters from the
+ * catalog. With relation_matched (a SELECT), only text BLOB columns that no
+ * relation catalog row matched are looked up: those are outputs of a
+ * selectable procedure, whose character set isc_blob_lookup_desc2 cannot
+ * resolve because it only knows relation fields. */
 static int ib_procedure_metadata_catalog(ib_cursor *cursor,
-	ib_cancel_slot *cancel, uint64_t generation, char **error)
+	const unsigned char *relation_matched, ib_cancel_slot *cancel,
+	uint64_t generation, char **error)
 {
 	char *catalog_query;
 	size_t catalog_query_length;
@@ -6071,7 +6112,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 	}
 	if (ib_procedure_catalog_query_text(&catalog_query, &catalog_query_length,
 		error) != 0) {
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6093,6 +6134,10 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 		int fatal_error;
 		XSQLVAR *variable = &cursor->output->sqlvar[index];
 
+		if (relation_matched != NULL && (relation_matched[index] ||
+			ib_sql_type(variable) != SQL_BLOB || variable->sqlsubtype != 1)) {
+			continue;
+		}
 		procedure_result = ib_descriptor_name(variable->relname,
 			variable->relname_length, procedure_name, sizeof(procedure_name),
 			&procedure_name_length, error);
@@ -6100,7 +6145,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 			variable->sqlname_length, parameter_name, sizeof(parameter_name),
 			&parameter_name_length, error);
 		if (procedure_result < 0 || parameter_result < 0) {
-			if (ib_catalog_fallback_if_optional(cancel, error)) {
+			if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 				free(catalog_query);
 				return 0;
 			}
@@ -6113,7 +6158,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 		catalog_cursor = (ib_cursor *) calloc(1U, sizeof(*catalog_cursor));
 		if (catalog_cursor == NULL) {
 			(void) ib_fail(error, "out of memory allocating procedure catalog cursor");
-			if (ib_catalog_fallback_if_optional(cancel, error)) {
+			if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 				free(catalog_query);
 				return 0;
 			}
@@ -6258,6 +6303,7 @@ procedure_catalog_done:
 			/* Procedure catalog metadata is an enhancement; preserve the query
 			 * result when the catalog is unavailable. */
 			free(catalog_error);
+			cursor->metadata_degraded = 1;
 			continue;
 		}
 		free(catalog_error);
@@ -6266,8 +6312,8 @@ procedure_catalog_done:
 	return 0;
 }
 
-static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
-	uint64_t generation, char **error)
+static int ib_metadata_catalog(ib_cursor *cursor, unsigned char *matched,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	char **relation_names;
 	size_t *relation_lengths;
@@ -6288,7 +6334,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 	relation_count = 0U;
 	if (ib_catalog_relation_list(cursor, &relation_names, &relation_lengths,
 		&relation_count, error) != 0) {
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6301,7 +6347,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 	if (ib_catalog_query_text(relation_count, &catalog_query, &catalog_query_length,
 		error) != 0) {
 		ib_free_catalog_relations(relation_names, relation_lengths, relation_count);
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6311,7 +6357,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		(void) ib_fail(error, "out of memory allocating catalog cursor");
 		free(catalog_query);
 		ib_free_catalog_relations(relation_names, relation_lengths, relation_count);
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6405,7 +6451,8 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		if (has_row == 0) {
 			break;
 		}
-		if (ib_catalog_apply_row(cursor, catalog_cursor, &catalog_error) != 0) {
+		if (ib_catalog_apply_row(cursor, catalog_cursor, matched,
+			&catalog_error) != 0) {
 			result = -1;
 			fatal_error = fatal_error ||
 				ib_catalog_error_requires_propagation(catalog_error);
@@ -6457,6 +6504,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		/* Catalog information is an enhancement; an unavailable catalog must not
 		 * turn an otherwise valid user query into a failure. */
 		free(catalog_error);
+		cursor->metadata_degraded = 1;
 		return 0;
 	}
 	free(catalog_error);
@@ -6490,40 +6538,105 @@ static int ib_cursor_describe_metadata(ib_cursor *cursor, ib_cancel_slot *cancel
 		return 0;
 	}
 	if (cursor->statement_type == isc_info_sql_stmt_exec_procedure) {
-		return ib_procedure_metadata_catalog(cursor, cancel, generation, error);
+		return ib_procedure_metadata_catalog(cursor, NULL, cancel, generation,
+			error);
 	}
-	return ib_metadata_catalog(cursor, cancel, generation, error);
+	{
+		unsigned char *matched;
+		int result;
+		short index;
+		int has_candidate;
+
+		matched = NULL;
+		if (cursor->output->sqld > 0) {
+			matched = (unsigned char *) calloc((size_t) cursor->output->sqld,
+				sizeof(*matched));
+			if (matched == NULL) {
+				return ib_fail(error, "out of memory allocating catalog matches");
+			}
+		}
+		result = ib_metadata_catalog(cursor, matched, cancel, generation, error);
+		has_candidate = 0;
+		for (index = 0; result == 0 && index < cursor->output->sqld; index++) {
+			const XSQLVAR *variable = &cursor->output->sqlvar[index];
+
+			if (!matched[index] && ib_sql_type(variable) == SQL_BLOB &&
+				variable->sqlsubtype == 1 && variable->relname_length > 0 &&
+				variable->sqlname_length > 0) {
+				has_candidate = 1;
+			}
+		}
+		if (has_candidate) {
+			result = ib_procedure_metadata_catalog(cursor, matched, cancel,
+				generation, error);
+		}
+		free(matched);
+		return result;
+	}
 }
 
 /* ib_statement_cache_metadata runs the column-metadata enrichment of a
- * prepared statement once, in the statement's transaction, and keeps a copy
- * on the statement. The enrichment is optional: on failure nothing is cached
- * and each execution enriches its own cursor, as before. */
-static void ib_statement_cache_metadata(ib_statement *statement)
+ * prepared statement once, in the statement's transaction and under the
+ * prepare operation's cancellation slot, and keeps a copy on the statement.
+ * The enrichment is optional: when it is skipped or degraded nothing is
+ * cached and each execution enriches its own cursor, as before. A fatal
+ * failure (cancellation, cancellation-slot protocol, catalog cleanup or a
+ * broken connection) is returned so that Prepare fails. */
+static int ib_statement_cache_metadata(ib_statement *statement,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	ib_cursor descriptor;
 	char *catalog_error;
+	char *unpublish_error;
 	size_t count;
+	int result;
 
 	if (statement == NULL || statement->output == NULL ||
 		statement->output->sqld < 0 || statement->connection == NULL ||
 		statement->connection->transaction == NULL) {
-		return;
+		return 0;
 	}
 	memset(&descriptor, 0, sizeof(descriptor));
 	descriptor.connection = statement->connection;
 	descriptor.prepared = statement;
 	descriptor.transaction = statement->connection->transaction;
+	descriptor.statement = statement->statement;
 	descriptor.statement_type = statement->statement_type;
 	catalog_error = NULL;
 	descriptor.output = ib_clone_sqlda(statement->output, &catalog_error);
-	if (descriptor.output == NULL ||
-		ib_cursor_describe_metadata(&descriptor, NULL, 0U, &catalog_error) != 0) {
-		free(catalog_error);
+	result = descriptor.output == NULL ? -1 :
+		ib_cursor_describe_metadata(&descriptor, cancel, generation,
+			&catalog_error);
+	/* The catalog functions republish the user handle for the execution that
+	 * follows them on a query path; here it stays idle until the slot
+	 * completes, so leave nothing published for a cancellation to reach. */
+	unpublish_error = NULL;
+	if (ib_cancel_slot_unpublish(cancel, generation, &unpublish_error) != 0) {
+		ib_append_error(&catalog_error, unpublish_error);
 		ib_cursor_free_parts(&descriptor);
-		return;
+		ib_give_error(error, catalog_error);
+		return -1;
+	}
+	if (result != 0) {
+		ib_cursor_free_parts(&descriptor);
+		/* Without a slot, optional catalog failures are reported rather than
+		 * skipped; only the fatal ones fail Prepare. */
+		if (cancel != NULL || statement->connection->broken ||
+			ib_catalog_error_requires_propagation(catalog_error)) {
+			if (catalog_error == NULL) {
+				(void) ib_fail(&catalog_error, "prepare-time catalog metadata failed");
+			}
+			ib_give_error(error, catalog_error);
+			return -1;
+		}
+		free(catalog_error);
+		return 0;
 	}
 	free(catalog_error);
+	if (descriptor.metadata_degraded) {
+		ib_cursor_free_parts(&descriptor);
+		return 0;
+	}
 	count = (size_t) descriptor.output->sqld;
 	if (count != 0U) {
 		statement->cached_metadata = descriptor.metadata;
@@ -6536,6 +6649,7 @@ static void ib_statement_cache_metadata(ib_statement *statement)
 	statement->metadata_count = count;
 	statement->metadata_cached = 1;
 	ib_cursor_free_parts(&descriptor);
+	return 0;
 }
 
 static void ib_statement_free_metadata_cache(ib_statement *statement)
@@ -8254,8 +8368,8 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 
 static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 	const char *query,
-	size_t query_length, int allow_arrays, ib_cancel_slot *cancel,
-	uint64_t generation, char **error)
+	size_t query_length, int allow_arrays, int cache_metadata,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
@@ -8351,7 +8465,10 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 		ib_cancel_slot_complete(cancel, generation);
 		goto fail;
 	}
-	ib_cancel_slot_complete(cancel, generation);
+	/* The prepare-time catalog enrichment below still runs under the slot. */
+	if (!cache_metadata) {
+		ib_cancel_slot_complete(cancel, generation);
+	}
 	descriptor.connection = connection;
 	descriptor.transaction = prepare_transaction;
 	descriptor.statement = statement->statement;
@@ -8375,6 +8492,11 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 		statement->output = descriptor.output;
 		descriptor.output = NULL;
 	}
+	if (cache_metadata && ib_statement_cache_metadata(statement, cancel,
+		generation, &failure_error) != 0) {
+		goto fail;
+	}
+	ib_cancel_slot_complete(cancel, generation);
 	if (owns_transaction) {
 		memset(status, 0, sizeof(status));
 		result = isc_commit_transaction(status, &prepare_transaction);
@@ -8418,7 +8540,7 @@ ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
 	size_t query_length, ib_cancel_slot *cancel, uint64_t generation,
 	char **error)
 {
-	return ib_statement_prepare_mode(connection, query, query_length, 0,
+	return ib_statement_prepare_mode(connection, query, query_length, 0, 0,
 		cancel, generation, error);
 }
 
@@ -9749,7 +9871,11 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	if (override_charset == 0 && variable->sqlsubtype == 1 &&
 		variable->sqlname_length > 0 &&
 		variable->relname_length > 0) {
-		if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
+		short known_charset;
+
+		if (ib_cursor_known_blob_charset(cursor, variable, &known_charset)) {
+			ib_blob_descriptor(&source_descriptor, 1, known_charset);
+		} else if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
 			error) != 0) {
 			return NULL;
 		}
@@ -10334,8 +10460,7 @@ ib_statement *ib_transaction_prepare(ib_transaction *transaction,
 		return NULL;
 	}
 	statement = ib_statement_prepare_mode(&transaction->view, query, query_length,
-		allow_arrays, cancel, generation, error);
-	ib_statement_cache_metadata(statement);
+		allow_arrays, 1, cancel, generation, error);
 	ib_transaction_sync(transaction);
 	return statement;
 }

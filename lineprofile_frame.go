@@ -95,6 +95,12 @@ func localValueOf(v *lpVar) (localValue, bool) {
 			return localValue{kind: localStringKind, s: []byte(s)}, true
 		}
 	}
+	if isBlobType(v.typ.Text) {
+		// Natively IS NULL is false for any BLOB variable holding a value,
+		// even an integer taken as a BLOB id (lpBadBlob), whose other uses
+		// fail (ibg-b6o).
+		return localValue{kind: localOpaqueKind}, true
+	}
 	return localValue{}, false
 }
 

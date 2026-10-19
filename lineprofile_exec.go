@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"time"
 
@@ -31,6 +32,7 @@ type lpRun struct {
 	statements map[string]cachedStatement
 	selects    map[string]lpSelectText // chosen SELECT text per node (R18)
 	writes     map[*psql.Node]bool     // blockWrites results
+	sites      map[*lpRoutineMeta][]lpSite
 	// stepInto holds the procedures run under emulation when called in a
 	// step-in shape (spec 6.7).
 	stepInto map[string]bool
@@ -50,6 +52,14 @@ type lpRun struct {
 	// countersUnavailable is set once the server cannot supply activity
 	// counters; node Pages and Tables are then cleared (R16).
 	countersUnavailable bool
+	// dynamic holds the EXECUTE STATEMENT texts prepared per node, least
+	// recently used first (their statements are in statements);
+	// dynamicTexts the hashes of the distinct texts each node evaluated;
+	// procedureNames the source names of dynamic texts found to be
+	// procedures.
+	dynamic        map[string][]string
+	dynamicTexts   map[*LineProfileNode]map[uint64]struct{}
+	procedureNames map[string]bool
 }
 
 // runInTransaction runs the entry routine inside the run's transaction and
@@ -248,6 +258,10 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 		return lpContinue, nil
 	case psql.NodeExecProc:
 		return lpContinue, r.execProcedure(f, n, node)
+	case psql.NodeExecStmt:
+		return lpContinue, r.execStatement(f, n, node)
+	case psql.NodeForExecStmt:
+		return r.forExecStatement(f, n, node)
 	case psql.NodeSuspend:
 		if f.suspend != nil {
 			return lpContinue, f.suspend(f.row())
@@ -418,7 +432,10 @@ func (r *lpRun) catchable(err error) bool {
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
-// matches reports whether one of h's conditions matches err.
+// matches reports whether one of h's conditions matches err. WHEN GDSCODE
+// matches the first status code only, as InterBase does (verified natively:
+// the second code of a user exception, isc_random, or of a transliteration
+// failure is not matched).
 func (r *lpRun) matches(h *psql.Handler, err error) bool {
 	var nativeErr *Error
 	if !errors.As(err, &nativeErr) {
@@ -455,15 +472,16 @@ func handlesAny(h *psql.Handler) bool {
 }
 
 // blockWrites reports whether a block may change data, so that undoing it
-// can matter: it contains a data statement, EXECUTE PROCEDURE or an
-// expression with a subquery (which may select from a procedure).
+// can matter: it contains a data statement, EXECUTE PROCEDURE, EXECUTE
+// STATEMENT or an expression with a subquery (which may select from a
+// procedure).
 func (r *lpRun) blockWrites(n *psql.Node) bool {
 	if writes, ok := r.writes[n]; ok {
 		return writes
 	}
 	var walk func(n *psql.Node) bool
 	walk = func(n *psql.Node) bool {
-		if n.SQL != nil || n.Kind == psql.NodeExecProc || exprSelects(n.Value) || exprSelects(n.Cond) {
+		if n.SQL != nil || writesDynamically(n.Kind) || exprSelects(n.Value) || exprSelects(n.Cond) {
 			return true
 		}
 		for _, child := range n.Children {
@@ -513,7 +531,27 @@ func (r *lpRun) execSelectInto(f *lpFrame, n *psql.Node, node *LineProfileNode) 
 	if err != nil {
 		return err
 	}
-	rows, err := r.queryRows(node, b, 2)
+	// The CAST statement runs on a scratch node so that, when it is run
+	// again without the CAST, the node holds only the native-equivalent run.
+	attempt := &LineProfileNode{Metrics: LineMetrics{Hits: node.Metrics.Hits}}
+	rows, err := r.queryRows(attempt, b, 2)
+	node.SQL = attempt.SQL
+	if err != nil && cast != nil && r.catchable(err) {
+		// The failure may be a row's in-statement CAST (R18), where the
+		// server raises the singleton error before converting any row
+		// (ibg-pm8). bindSelect casts only statements that can run again,
+		// so the plain statement decides, as it would natively; the
+		// attempt is Retries overhead.
+		r.discardAttempt(attempt.Metrics)
+		if b, err = r.bind(f, node, n.SQL.Text, n.SQL.Params); err != nil {
+			return err
+		}
+		cast = nil
+		rows, err = r.queryRows(node, b, 2)
+	} else {
+		attempt.Metrics.Hits = 0
+		addMetrics(&node.Metrics, attempt.Metrics)
+	}
 	if err != nil {
 		return err
 	}
@@ -527,6 +565,15 @@ func (r *lpRun) execSelectInto(f *lpFrame, n *psql.Node, node *LineProfileNode) 
 		node.Metrics.Errors++
 		return errSingleton()
 	}
+}
+
+// discardAttempt moves the server work of a statement run only to choose
+// how to run its node out of the run's measured calls into overhead.
+func (r *lpRun) discardAttempt(m LineMetrics) {
+	r.result.Retries += m.Raw
+	r.result.ServerCalls -= m.ServerCalls
+	r.result.RoundTrips -= m.RoundTrips
+	r.result.OverheadActivity = r.result.OverheadActivity.Add(ActivityDelta{Tables: m.Tables, Pages: m.Pages})
 }
 
 // assignRow assigns the columns of row to targets; exact[i] (when set)
@@ -663,7 +710,16 @@ func (r *lpRun) execProcedure(f *lpFrame, n *psql.Node, node *LineProfileNode) e
 	if len(rows) == 0 || len(n.Returning) == 0 {
 		return nil
 	}
-	return r.assignRow(f, node, n.Returning, rows[0], outputs, nil)
+	row := rows[0]
+	// The outputs are parameters: a BLOB one is held as in a variable.
+	for i, name := range n.Returning {
+		if target, ok := f.vars[name]; ok && i < len(row) && i < len(outputs) && outputs[i].Kind == "BLOB" {
+			if err := blobVariableInto(cellValue(row[i]), "BLOB", target); err != nil {
+				return err
+			}
+		}
+	}
+	return r.assignRow(f, node, n.Returning, row, outputs, nil)
 }
 
 func procedureName(name string, quoted bool) string {
@@ -692,7 +748,7 @@ func (r *lpRun) emitRow(f *lpFrame) error {
 			return errBlobNotFound()
 		}
 		if ref, isBlob := value.(BlobRef); isBlob {
-			held, err := r.holdBlob(ref, keptBlobLimit)
+			held, err := r.holdBlob(ref, keptBlobLimit, true)
 			if err != nil {
 				return err
 			}
@@ -730,24 +786,48 @@ func truncateKeptBlob(value any) any {
 // holdValue replaces a BLOB reference fetched from the server by the BLOB's
 // content (R22): a reference dies with the transaction and binds only to a
 // BLOB parameter of the same subtype and character set, while bytes bind
-// anywhere PSQL would accept the value. Other values are returned as is.
+// anywhere PSQL would accept the value. Other values are returned as is. A
+// BLOB larger than MaxBlobBytes is never truncated: it fails the run with a
+// fatal error.
 func (r *lpRun) holdValue(value any) (any, error) {
 	ref, ok := value.(BlobRef)
 	if !ok {
 		return value, nil
 	}
-	return r.holdBlob(ref, -1)
+	return r.holdBlob(ref, r.maxBlobBytes(), false)
+}
+
+// maxBlobBytes is the effective MaxBlobBytes: the default for zero or a
+// negative value, at most math.MaxInt64-1 so that a read of cap+1 bytes
+// cannot overflow.
+func (r *lpRun) maxBlobBytes() int64 {
+	switch {
+	case r.opts.MaxBlobBytes <= 0:
+		return DefaultLineProfileMaxBlobBytes
+	case r.opts.MaxBlobBytes == math.MaxInt64:
+		return math.MaxInt64 - 1
+	}
+	return r.opts.MaxBlobBytes
+}
+
+// errBlobTooLarge reports a BLOB over the MaxBlobBytes cap.
+func errBlobTooLarge(limit int64) error {
+	return fmt.Errorf("interbase: line profile: BLOB too large to emulate (more than %d bytes)", limit)
 }
 
 // holdBlob reads a BLOB — text as a string, other subtypes as bytes — up to
-// limit bytes when limit is not negative, marking a cut value. The read is
+// limit bytes. Past limit the value is cut and marked when cut is set (kept
+// rows' display); otherwise the read fails with errBlobTooLarge. The read is
 // overhead: its time goes to Blobs and an activity snapshot follows.
-func (r *lpRun) holdBlob(ref BlobRef, limit int64) (any, error) {
+func (r *lpRun) holdBlob(ref BlobRef, limit int64, cut bool) (any, error) {
 	start := time.Now()
 	data, truncated, err := r.readBlob(ref, limit)
 	r.result.Blobs += time.Since(start)
 	if snapErr := r.snapshot(nil); err == nil {
 		err = snapErr
+	}
+	if err == nil && truncated && !cut {
+		err = errBlobTooLarge(limit)
 	}
 	if err != nil {
 		return nil, fatal(err)
@@ -770,13 +850,9 @@ func (r *lpRun) readBlob(ref BlobRef, limit int64) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	var source io.Reader = reader
-	if limit >= 0 {
-		source = io.LimitReader(reader, limit+1)
-	}
-	data, readErr := io.ReadAll(source)
+	data, readErr := io.ReadAll(io.LimitReader(reader, limit+1))
 	err = errors.Join(readErr, reader.Close())
-	if limit >= 0 && int64(len(data)) > limit {
+	if int64(len(data)) > limit {
 		return data[:limit], true, err
 	}
 	return data, false, err
@@ -791,7 +867,8 @@ func (r *lpRun) runEntry() error {
 	f := newFrame(entry, r.dbNone, profile)
 	f.entry = true
 	r.active = map[*lpRoutineMeta]int{entry: 1}
-	setupStart, snapshotsBefore := time.Now(), r.result.Snapshots
+	setupStart := time.Now()
+	snapshots, prepare, blobs := r.result.Snapshots, r.result.Prepare, r.result.Blobs
 	if err := r.snapshot(nil); err != nil {
 		return err
 	}
@@ -804,7 +881,10 @@ func (r *lpRun) runEntry() error {
 		}
 		f.vars[param.name].value = value
 	}
-	r.result.Setup += time.Since(setupStart) - (r.result.Snapshots - snapshotsBefore)
+	// The arguments' prepares, snapshots and BLOB reads have buckets of
+	// their own.
+	r.result.Setup += time.Since(setupStart) - (r.result.Snapshots - snapshots) -
+		(r.result.Prepare - prepare) - (r.result.Blobs - blobs)
 	profile.Calls++
 	if _, err := r.exec(f, entry.routine.Body); err != nil {
 		return err
@@ -816,11 +896,13 @@ func (r *lpRun) runEntry() error {
 }
 
 // setupValue evaluates a constant entry argument; its cost is setup
-// overhead, not line time.
+// overhead (its prepare Prepare overhead), not line time.
 func (r *lpRun) setupValue(text string) (value any, err error) {
 	// The argument's counters, prepare included, are overhead.
 	defer func() { err = errors.Join(err, r.snapshot(nil)) }()
+	start := time.Now()
 	stmt, err := r.tx.Prepare(r.ctx, text)
+	r.result.Prepare += time.Since(start)
 	if err != nil {
 		return nil, err
 	}

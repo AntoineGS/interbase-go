@@ -232,16 +232,24 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
 
 - `AnalyzeLineProfile` never executes routine code. It reads metadata in a
   short read-only transaction and returns problems (unsupported constructs
-  such as `EXECUTE STATEMENT`), the callees and `MayWrite`.
+  such as `FOR SELECT … AS CURSOR`), the callees and `MayWrite`.
 - The entry statement is `EXECUTE PROCEDURE p [(args)]` or
   `SELECT * | columns FROM p [(args)]` with constant arguments.
+- The connection dialect must match the database's SQL dialect (read with one
+  info call before any transaction). Otherwise the analysis returns a single
+  problem and `LineProfile` refuses before anything runs: the routines run
+  with the database's dialect, and a Dialect 1 attachment cannot even prepare
+  a statement that references a 64-bit numeric of a Dialect 3 database.
 - Measurements are per node, per line and per routine. `Adjusted` time is
   `Raw` time minus the measured round-trip baseline of the attachment
   (`Before`/`After` probes), so it approximates server time. Counters (server
   calls, round trips, rows, pages, per-table activity) are those of this
   attachment only. Work done by the profiler itself (prepares, savepoints,
-  snapshots, setup, BLOB reads) is reported in separate overhead buckets and
-  never counted in line metrics.
+  snapshots, setup, BLOB reads, retries) is reported in separate overhead
+  buckets and never counted in line metrics. `Retries` is the time of a
+  singleton `SELECT ... INTO` whose in-statement `CAST` failed and that ran
+  again without it, so the node counts only the run native PSQL would do;
+  the attempt's counters go to `OverheadActivity`.
 - Transaction envelope: read-committed, read-only unless the analysis says the
   routine may write, and always rolled back. Effects that are not
   transactional, such as generator increments, external tables, events and
@@ -249,6 +257,56 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
 - `StepInto` lists procedures to emulate when called in a supported shape, so
   their lines are profiled too; other calls run natively and are reported in
   `NativeCallSites`.
+- A native `FOR SELECT` over a procedure would let the client's row
+  prefetch run the procedure ahead of the loop body. When the procedure (as
+  far as the analysis can tell) or the loop body may write, and the run is
+  read-write, the profiler sends the cursor with `FOR UPDATE`, which makes
+  the client fetch one row at a time, so the procedure and the body
+  interleave as in native PSQL. Each row then costs a round trip, counted in
+  the line's time. When `FOR UPDATE` does not prepare for that statement,
+  the plain statement runs and the call site is listed in `NativeCallSites`
+  with the reason "may run ahead; step in for exact interleaving".
+- `FirstRaw` and `FirstAdjusted` give the part of a node's (or line's) time
+  spent in its first hit. A native callee's first call in an attachment can
+  be much slower than later calls, because the server compiles it on first
+  execution; the first-hit times show that cost next to the total. Preparing
+  the call beforehand does not move it (measured), so the profiler does not
+  try to warm callees up.
+- BLOB values fetched into variables are held in client memory up to
+  `MaxBlobBytes` (default 16 MiB, also used for 0 or a negative value). A
+  larger BLOB ends the run as `failed` at its line with "BLOB too large to
+  emulate"; the value is never truncated and `WHEN` handlers cannot catch
+  this. Kept output rows show at most 64 KiB of a BLOB.
+- `EXECUTE STATEMENT <text> [INTO <targets>]` and `FOR EXECUTE STATEMENT
+  <text> INTO <targets> DO <statement>` run as InterBase runs them (verified
+  natively, dialects 1 and 3). The text is evaluated like any value and
+  prepared in the run transaction; each node keeps its 32 most recently used
+  texts prepared per call depth (a recursion of depth d can hold d × 32
+  until the run ends). A routine with `EXECUTE STATEMENT` always may write. The
+  node's `DynamicSQL` is the last text it evaluated and `DynamicTexts` the
+  number of distinct texts; `SQL` is the text sent (with `FOR UPDATE` when a
+  `FOR EXECUTE STATEMENT` over a procedure needs row-by-row fetches, as for
+  `FOR SELECT`). As natively: a `SELECT` without `INTO` is opened but never
+  fetched; `INTO` takes the first row (no singleton error); a fetch error is
+  ignored (targets unchanged, the loop ends) but still counts in `Errors`;
+  an error is reported as `isc_exec_stmt2_execute`, with the statement's
+  own SQLCODE for a prepare error and SQLCODE -204 for an execution error,
+  except `COMMIT` and `ROLLBACK`, reported as `isc_exec_stmt_disallow`
+  (SQLCODE -204); `WHEN` handlers catch them. InterBase copies `INTO`
+  columns without conversion, so a column of another type yields garbage
+  there; the profiler assigns NULLs and exact copies only (same storage, a
+  `VARCHAR` value that fits, a wider integer value that fits) and otherwise
+  fails the run, as it does for a column count other than the targets',
+  `INTO` on a statement without rows, and statements it does not run: DDL
+  (Ruling R26), `SET GENERATOR` (not transactional) and `SAVEPOINT`,
+  `RELEASE SAVEPOINT`, `ROLLBACK [WORK] TO SAVEPOINT` (they would interfere
+  with the profiler's own savepoints).
+- BLOB variables follow InterBase (verified natively, dialects 1 and 3): a
+  BLOB variable or BLOB output parameter assigned to a text variable fails
+  with SQLCODE -902, while a BLOB column selected into one is cut to the
+  variable's length; a CHAR value assigned to a BLOB fills its full width in
+  bytes; `IS NULL` is false for any BLOB variable holding a value. A BLOB
+  variable used inside a larger expression is not emulated exactly.
 - Limitations: the emulator covers the supported PSQL subset; unsupported
   routines are refused up front with line and column. A run ends as
   `completed`, `failed` (with `FailedAt`) or `canceled` (context done).
@@ -256,7 +314,8 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   `Transaction.Prepare` and re-executes the returned `PreparedStatement`
   (`Exec`, `Query`, `Outputs`, `Close`) with new parameters. Callers can use
   the same API directly to run a statement repeatedly in one transaction
-  without preparing it again.
+  without preparing it again. `Exec` of a statement that produces a result
+  set returns `ErrPreparedStatementReturnsRows`.
 
 Live checks are env-gated; see `lineprofile_live_test.go` for
 `INTERBASE_LP_CORPUS`, `INTERBASE_LP_SQL`, `INTERBASE_LP_STEP_INTO` and

@@ -19,7 +19,15 @@ type LineProfileOptions struct {
 	ReadOnly bool     // caller's decision from AnalyzeLineProfile.MayWrite
 	StepInto []string // procedures to emulate when called in a step-in shape (spec 6.7); names are upper-cased unless double-quoted
 	KeepRows int      // default 10
+	// MaxBlobBytes caps the bytes of a BLOB held in an emulated variable
+	// (0 or a negative value means DefaultLineProfileMaxBlobBytes). A larger BLOB ends the run
+	// as failed at its line ("BLOB too large to emulate"); a variable is
+	// never truncated, and WHEN handlers cannot catch the failure.
+	MaxBlobBytes int64
 }
+
+// DefaultLineProfileMaxBlobBytes is the default LineProfileOptions.MaxBlobBytes.
+const DefaultLineProfileMaxBlobBytes = 16 << 20
 
 // LineProfileAnalysis is the static analysis of an entry statement.
 type LineProfileAnalysis struct {
@@ -61,9 +69,17 @@ const (
 // LineMetrics are the measurements of a node, a line or a frame. Hits counts
 // executions of a node, except for a WHILE node, whose Hits count condition
 // evaluations (N+1 for a loop whose body runs N times).
+//
+// FirstRaw and FirstAdjusted are the part of Raw and Adjusted spent in a
+// node's first hit (a WHILE node's first condition evaluation; a FOR
+// SELECT's first execution with all its fetches), so that a first-use cost,
+// such as the server compiling a native callee on its first call in the
+// attachment, stays visible next to the total. A line's are the sum over
+// its nodes. They are zero in a routine's Inclusive and Exclusive totals.
 type LineMetrics struct {
 	Hits, ServerCalls, RoundTrips, Rows, Errors int64
 	Raw, Adjusted                               time.Duration
+	FirstRaw, FirstAdjusted                     time.Duration
 	Pages                                       *PageCounters         // nil when unavailable
 	Tables                                      map[int]TableCounters // non-zero only
 }
@@ -76,7 +92,15 @@ type LineProfileNode struct {
 	Line, EndLine int
 	SQL           string // last SQL text sent for this node ("" when evaluated locally only)
 	Local         int64  // evaluations and conversions done locally; conversions done by an in-statement CAST (R18) are not counted
-	Metrics       LineMetrics
+	// DynamicSQL is the last statement text an EXECUTE STATEMENT or FOR
+	// EXECUTE STATEMENT node evaluated, and DynamicTexts the number of
+	// distinct texts it evaluated in the run; SQL is the text sent for it.
+	// The node keeps its 32 most recently used texts prepared per call
+	// depth of its routine, so a recursion of depth d can hold d × 32
+	// prepared statements for the node until the run ends.
+	DynamicSQL   string
+	DynamicTexts int
+	Metrics      LineMetrics
 }
 
 // LineProfileRoutine is one profiled routine: the entry routine, or the
@@ -122,6 +146,10 @@ type LineProfileResult struct {
 	// Blobs is the overhead of reading BLOB values fetched into variables
 	// (they are held as bytes, R22) and of reading kept BLOB outputs.
 	Blobs time.Duration
+	// Retries is the time of statements the emulator ran only to choose
+	// how to run a node: a singleton SELECT whose in-statement CAST failed
+	// and that ran again without it (the node counts the second run only).
+	Retries time.Duration
 	// OverheadActivity holds the attachment counters of overhead work —
 	// prepares (with their catalog reads), savepoint statements, entry
 	// arguments, BLOB reads and early cursor closes — which never count in
@@ -135,7 +163,9 @@ type LineProfileResult struct {
 }
 
 // LineProfileCallSite is a call of a procedure marked for step-in that runs
-// natively because of its shape.
+// natively because of its shape, or a native FOR SELECT over a procedure
+// that may run ahead of its loop body because it could not be fetched one
+// row at a time.
 type LineProfileCallSite struct {
 	Routine           string
 	Line              int
@@ -156,6 +186,12 @@ type lpRoutineMeta struct {
 	inputs, outputs []lpParam
 	routine         *psql.Routine
 	problems        []RoutineProblem
+	// readsOnly is set when the analysis proved that running the routine
+	// never writes (see lpPlan.checkReadsOnly); false means it may write.
+	readsOnly, readsChecked bool
+	// sourceProcs holds the bare FROM/JOIN names that are procedures, nil
+	// until looked up (lpPlan.sourceProcedures).
+	sourceProcs map[string]bool
 }
 
 // lpPlan is everything AnalyzeLineProfile reads, kept for the run.
@@ -171,6 +207,8 @@ type lpPlan struct {
 	// exceptionNames maps numbers back to names (RDB$EXCEPTIONS).
 	exceptions     map[string]lpException
 	exceptionNames map[int32]string
+	// readProcedureRefs replaces readProcedureRefsTx in tests.
+	readProcedureRefs func(context.Context, *Transaction, []lookupName) ([]RoutineRef, error)
 }
 
 // lpException is a user exception from RDB$EXCEPTIONS.

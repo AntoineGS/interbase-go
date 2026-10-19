@@ -29,9 +29,13 @@ func lpFixture(t *testing.T, dialect int) (*sql.Conn, context.Context) {
 
 	since := "CAST('NOW' AS DATE) - D"
 	quotedAlias := `"Q"`
+	// ibg-tvs: the widest exact scaled type holding one digit more than its
+	// precision (BIGINT storage in dialect 3, INTEGER in dialect 1).
+	wide, wideValue := "NUMERIC(18,2)", "92233720368547758.07"
 	if dialect == 1 {
 		since = "'NOW' - D"
 		quotedAlias = "AS Q"
+		wide, wideValue = "NUMERIC(9,2)", "21474836.47"
 	}
 	ddl := []string{
 		"CREATE TABLE LP_ITEMS (ID INTEGER, CODE CHAR(3) CHARACTER SET NONE, NAME VARCHAR(20) CHARACTER SET NONE, " +
@@ -68,6 +72,77 @@ BEGIN
     SELECT CAST(B AS VARCHAR(40)) FROM LP_BLOBS8 WHERE ID = 100 INTO :V;
     SUSPEND;
   END
+END`,
+		`CREATE PROCEDURE LP_BLOBCAP RETURNS (N INTEGER) AS
+DECLARE VARIABLE B BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  N = 0;
+  BEGIN
+    SELECT B FROM LP_BLOBS WHERE ID = 1 INTO :B;
+    N = 1;
+  WHEN ANY DO N = 2;
+  END
+  SUSPEND;
+END`,
+		"CREATE TABLE LP_MK_LOG (ID INTEGER)",
+		`CREATE PROCEDURE LP_MK_GEN (N INTEGER) RETURNS (I INTEGER) AS
+BEGIN
+  I = 0;
+  WHILE (I < N) DO
+  BEGIN
+    I = I + 1;
+    INSERT INTO LP_MK_LOG VALUES (:I);
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_CALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_GEN(5) INTO :I DO
+  BEGIN
+    SELECT COUNT(*) FROM LP_MK_LOG INTO :C;
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_READ (N INTEGER) RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  I = 0;
+  WHILE (I < N) DO
+  BEGIN
+    I = I + 1;
+    SELECT COUNT(*) FROM LP_MK_LOG INTO :C;
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_WCALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I, C FROM LP_MK_READ(4) INTO :I, :C DO
+  BEGIN
+    INSERT INTO LP_MK_LOG VALUES (:I);
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_BAREW RETURNS (I INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_GEN(5) INTO :I DO
+    SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_MK_VIA (N INTEGER) RETURNS (I INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_BAREW INTO :I DO
+    IF (I <= N) THEN SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_MK_VCALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_VIA(5) INTO :I DO
+  BEGIN
+    SELECT COUNT(*) FROM LP_MK_LOG INTO :C;
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_RCALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I, C FROM LP_MK_READ(3) INTO :I, :C DO
+    SUSPEND;
 END`,
 		`CREATE PROCEDURE LP_BLOBOUT RETURNS (B BLOB SUB_TYPE TEXT CHARACTER SET NONE) AS
 BEGIN
@@ -246,6 +321,29 @@ END`,
 BEGIN
   FOR SELECT C3, U3, P4 FROM LP_PADS WHERE ID < 3 ORDER BY ID INTO :V2, :U2, :W DO SUSPEND;
 END`,
+		`CREATE PROCEDURE LP_PM_FIRST RETURNS (W VARCHAR(8) CHARACTER SET WIN1252) AS
+BEGIN
+  SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID INTO :W;
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_PM_SECOND RETURNS (W VARCHAR(8) CHARACTER SET WIN1252) AS
+BEGIN
+  SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID DESC INTO :W;
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_PM_SRC (K INTEGER) RETURNS (T VARCHAR(40) CHARACTER SET WIN1252) AS
+BEGIN
+  INSERT INTO LP_LOG (ID, MSG) VALUES (:K, 'pm');
+  T = 'short';
+  SUSPEND;
+  T = 'far too long here';
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_PM_PROC RETURNS (W VARCHAR(8) CHARACTER SET WIN1252) AS
+BEGIN
+  SELECT T FROM LP_PM_SRC(900) INTO :W;
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_R18U (MAXID INTEGER) RETURNS (U VARCHAR(8)) AS
 BEGIN
   FOR SELECT U40 FROM LP_TEXTS WHERE ID <= :MAXID ORDER BY ID INTO :U DO SUSPEND;
@@ -367,6 +465,116 @@ BEGIN
   SELECT N92 FROM LP_PRICES WHERE ID = :ID INTO :N42;
   SUSPEND;
 END`,
+		// ibg-b6o: BLOB parity edges, as probed natively.
+		"CREATE TABLE LP_BLOBSW (ID INTEGER, B BLOB SUB_TYPE TEXT CHARACTER SET WIN1252)",
+		"CREATE TABLE LP_BLOBSX (ID INTEGER, B BLOB SUB_TYPE TEXT CHARACTER SET NONE)",
+		"INSERT INTO LP_BLOBSX VALUES (1, 'Caf\xe9 blob')",
+		`CREATE PROCEDURE LP_BRAW (K INTEGER) RETURNS (R VARCHAR(40) CHARACTER SET OCTETS) AS
+DECLARE VARIABLE XN BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  SELECT B FROM LP_BLOBSX WHERE ID = 1 INTO :XN;
+  IF (K = 1) THEN
+  BEGIN
+    INSERT INTO LP_BLOBS8 (ID, B) VALUES (63, :XN);
+    SELECT CAST(B AS VARCHAR(40) CHARACTER SET OCTETS) FROM LP_BLOBS8 WHERE ID = 63 INTO :R;
+  END
+  IF (K = 2) THEN
+  BEGIN
+    INSERT INTO LP_BLOBSW (ID, B) VALUES (64, :XN);
+    SELECT CAST(B AS VARCHAR(40) CHARACTER SET OCTETS) FROM LP_BLOBSW WHERE ID = 64 INTO :R;
+  END
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BCHAR (K INTEGER) RETURNS (R VARCHAR(80) CHARACTER SET OCTETS) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  IF (K = 1) THEN X = CAST('ab' AS CHAR(5));
+  IF (K = 2) THEN X = CAST('ab' AS CHAR(5) CHARACTER SET UTF8);
+  IF (K = 3) THEN X = CAST('ab' AS CHAR(5) CHARACTER SET WIN1252);
+  IF (K = 4) THEN SELECT U3 FROM LP_PADS WHERE ID = 2 INTO :X;
+  IF (K = 5) THEN SELECT C3 FROM LP_PADS WHERE ID = 2 INTO :X;
+  INSERT INTO LP_BLOBSX VALUES (70 + :K, :X);
+  SELECT '[' || CAST(B AS VARCHAR(40) CHARACTER SET OCTETS) || ']' FROM LP_BLOBSX WHERE ID = 70 + :K INTO :R;
+  SUSPEND;
+END`,
+		"CREATE PROCEDURE LP_BOUT_T RETURNS (B BLOB SUB_TYPE TEXT CHARACTER SET NONE) AS BEGIN B = 'abcdefghij'; END",
+		"CREATE PROCEDURE LP_BSEL_T (K INTEGER) RETURNS (B BLOB SUB_TYPE TEXT CHARACTER SET NONE) AS BEGIN B = 'abcdefghij'; SUSPEND; END",
+		`CREATE PROCEDURE LP_BTEXT (K INTEGER) RETURNS (R VARCHAR(40) CHARACTER SET NONE, Q VARCHAR(5) CHARACTER SET NONE) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  X = 'abcdefghij';
+  R = 'start';
+  SUSPEND;
+  IF (K = 1) THEN R = X;
+  IF (K = 2) THEN EXECUTE PROCEDURE LP_BOUT_T RETURNING_VALUES :R;
+  IF (K = 3) THEN EXECUTE PROCEDURE LP_BOUT_T RETURNING_VALUES :Q;
+  IF (K = 4) THEN SELECT B FROM LP_BSEL_T(1) INTO :Q;
+  IF (K = 5) THEN FOR SELECT B FROM LP_BSEL_T(1) INTO :R DO SUSPEND;
+  IF (K = 6) THEN X = NULL;
+  IF (K = 6) THEN R = X;
+  IF (X IS NULL) THEN Q = 'null'; ELSE Q = 'set';
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BUTF8 RETURNS (R VARCHAR(40) CHARACTER SET NONE) AS
+DECLARE VARIABLE U VARCHAR(10) CHARACTER SET UTF8;
+BEGIN
+  SELECT B FROM LP_BSEL_T(1) INTO :U;
+  R = U;
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BISNULL RETURNS (R VARCHAR(10)) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  X = 42;
+  IF (X IS NULL) THEN R = 'null'; ELSE R = 'notnull';
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BDATE (K INTEGER) RETURNS (R VARCHAR(10)) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  R = 'start';
+  IF (K = 1) THEN X = CAST('2020-01-02' AS DATE);
+  IF (K = 2) THEN X = CAST('2020-01-02 03:04:05.1234' AS TIMESTAMP);
+  IF (K = 3) THEN X = CAST('2020-01-02 13:04:05' AS TIMESTAMP);
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BNUM (K INTEGER) RETURNS (R VARCHAR(40)) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  R = 'start';
+  IF (K = 1) THEN X = CAST(5 AS NUMERIC(18,0));
+  IF (K = 2) THEN X = CAST(0 AS NUMERIC(18,0));
+  IF (K = 3) THEN X = CAST(1.5 AS NUMERIC(18,2));
+  IF (K = 4) THEN X = CAST(0 AS NUMERIC(18,2));
+  R = 'assigned';
+  SUSPEND;
+  INSERT INTO LP_BLOBSX VALUES (80 + :K, :X);
+  SELECT '[' || CAST(B AS VARCHAR(40)) || ']' FROM LP_BLOBSX WHERE ID = 80 + :K INTO :R;
+  SUSPEND;
+END`,
+		// ibg-85p: WHEN GDSCODE matches the first status code only.
+		`CREATE PROCEDURE LP_GDS2 RETURNS (R VARCHAR(20)) AS
+BEGIN
+  R = 'none';
+  BEGIN
+    BEGIN
+      EXCEPTION LP_EX;
+    WHEN GDSCODE random DO R = 'second';
+    END
+  WHEN GDSCODE except DO R = 'first';
+  END
+  SUSPEND;
+END`,
+		"CREATE PROCEDURE LP_WIDE_OUT RETURNS (V " + wide + ") AS BEGIN V = " + wideValue + "; END",
+		`CREATE PROCEDURE LP_WIDE_IN (K INTEGER) RETURNS (D DOUBLE PRECISION, T VARCHAR(30), N NUMERIC(15,4)) AS
+BEGIN
+  EXECUTE PROCEDURE LP_WIDE_OUT RETURNING_VALUES :D;
+  EXECUTE PROCEDURE LP_WIDE_OUT RETURNING_VALUES :T;
+  SUSPEND;
+  IF (K = 1) THEN
+    EXECUTE PROCEDURE LP_WIDE_OUT RETURNING_VALUES :N;
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_RET (X INTEGER) RETURNS (Y INTEGER, Z SMALLINT) AS
 BEGIN
   Y = X * 2;
@@ -377,6 +585,13 @@ BEGIN
   EXECUTE PROCEDURE LP_RET 21 RETURNING_VALUES :R, :Q;
   SUSPEND;
   EXECUTE PROCEDURE LP_RET :R RETURNING_VALUES :R, :Q;
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_CALLER_P RETURNS (R INTEGER, Q SMALLINT) AS
+BEGIN
+  EXECUTE PROCEDURE LP_RET 4 RETURNING_VALUES (:R, :Q);
+  SUSPEND;
+  EXECUTE PROCEDURE LP_RET (5) RETURNING_VALUES (Q, R);
   SUSPEND;
 END`,
 		`CREATE PROCEDURE LP_MANY RETURNS (I INTEGER) AS
@@ -674,6 +889,7 @@ END`,
 		ddl = append(ddl, fmt.Sprintf("INSERT INTO LP_BIG VALUES (%d)", i))
 	}
 	ddl = append(ddl, lpBlobFetchDDL()...)
+	ddl = append(ddl, lpDynamicDDL()...)
 	for _, statement := range ddl {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("%s: %v", strings.SplitN(statement, "\n", 2)[0], err)
@@ -837,6 +1053,11 @@ func TestLineProfileDifferential(t *testing.T) {
 				},
 				{name: "execute writes", sql: "execute procedure LP_WRITES 6", skipHits: true},
 				{name: "singleton", sql: "execute procedure LP_SINGLETON"},
+				// ibg-pm8: a second row is a singleton error even when a
+				// row fails the conversion to its target.
+				{name: "singleton, second row fails the conversion", sql: "select * from LP_PM_FIRST", failAt: "SELECT W40"},
+				{name: "singleton, first row fails the conversion", sql: "select * from LP_PM_SECOND", failAt: "SELECT W40"},
+				{name: "singleton from a writing procedure, a row fails the conversion", sql: "select * from LP_PM_PROC", failAt: "SELECT T FROM"},
 				{name: "truncation", sql: "execute procedure LP_TRUNC"},
 				{name: "UTF8 length in bytes", sql: "execute procedure LP_TRUNC8"},
 				{name: "bare procedure in FROM", sql: "select * from LP_BARE_USER"},
@@ -844,6 +1065,11 @@ func TestLineProfileDifferential(t *testing.T) {
 				{name: "numeric conversions", sql: "select * from LP_NUMS"},
 				{name: "BLOB variable into another charset", sql: "select * from LP_BLOBCOPY(1)"},
 				{name: "BLOB variable as procedure input", sql: "select * from LP_BLOBCALL(1)"},
+				{name: "WHEN GDSCODE matches the first status code", sql: "select * from LP_GDS2", unexecuted: []string{"'second'"}},
+				{name: "scaled value wider than its precision", sql: "select * from LP_WIDE_IN(0)", unexecuted: []string{"RETURNING_VALUES :N"}},
+				{name: "scaled value wider than its precision, stepped", sql: "select * from LP_WIDE_IN(0)", unexecuted: []string{"RETURNING_VALUES :N"},
+					stepInto: []string{"LP_WIDE_OUT"}},
+				{name: "scaled value wider than its precision, overflow", sql: "select * from LP_WIDE_IN(1)", failAt: "RETURNING_VALUES :N"},
 				{name: "narrowing numeric value", sql: "select * from LP_NARROW(1)"},
 				{name: "narrowing numeric overflow", sql: "select * from LP_NARROW(3)"},
 				{name: "returning values", sql: "select * from LP_CALLER",
@@ -858,6 +1084,8 @@ func TestLineProfileDifferential(t *testing.T) {
 							t.Fatalf("variable argument SQL = %q", byVariable.SQL)
 						}
 					}},
+				{name: "returning values in parentheses", sql: "select * from LP_CALLER_P"},
+				{name: "returning values in parentheses, stepped", sql: "select * from LP_CALLER_P", stepInto: []string{"LP_RET"}},
 				{name: "WHEN without errors from the callee", sql: "select * from LP_WHEN(0)",
 					unexecuted: []string{"'not reached 1'", "'not reached 2'", "'-other'", "'-inner'", "'-outer'", "'-any'"},
 					check:      lpCheckSavepoints},
@@ -919,6 +1147,11 @@ func TestLineProfileDifferential(t *testing.T) {
 							t.Fatalf("rows %d kept %d while hits %d; want 15, 10, 16", result.Rows, len(result.KeptRows), loop.Metrics.Hits)
 						}
 					}},
+				{name: "native procedure cursor that writes", sql: "select * from LP_MK_CALLER", check: lpCheckRowByRow(true)},
+				{name: "stepped procedure cursor that writes", sql: "select * from LP_MK_CALLER", stepInto: []string{"LP_MK_GEN"}},
+				{name: "native procedure cursor under a writing body", sql: "select * from LP_MK_WCALLER", check: lpCheckRowByRow(true)},
+				{name: "native procedure cursor writing through a bare procedure", sql: "select * from LP_MK_VCALLER", check: lpCheckRowByRow(true)},
+				{name: "native read-only procedure cursor", sql: "select * from LP_MK_RCALLER", check: lpCheckRowByRow(false)},
 			}
 			for _, c := range lpBlobFetchCases() {
 				tests = append(tests, struct {
@@ -932,6 +1165,32 @@ func TestLineProfileDifferential(t *testing.T) {
 					failAt      string
 					check       func(t *testing.T, result interbase.LineProfileResult)
 				}{name: c.name, sql: c.sql, skipHits: true, stepInto: c.stepInto, failAt: c.failAt})
+			}
+			for _, c := range lpBlobEdgeCases() {
+				tests = append(tests, struct {
+					name        string
+					sql         string
+					localLines  []string
+					unexecuted  []string
+					skipHits    bool
+					defaultKeep bool
+					stepInto    []string
+					failAt      string
+					check       func(t *testing.T, result interbase.LineProfileResult)
+				}{name: c.name, sql: c.sql, skipHits: true, stepInto: c.stepInto, failAt: c.failAt})
+			}
+			for _, c := range lpDynamicCases() {
+				tests = append(tests, struct {
+					name        string
+					sql         string
+					localLines  []string
+					unexecuted  []string
+					skipHits    bool
+					defaultKeep bool
+					stepInto    []string
+					failAt      string
+					check       func(t *testing.T, result interbase.LineProfileResult)
+				}{name: c.name, sql: c.sql, skipHits: true, failAt: c.failAt, check: c.check})
 			}
 			for _, tt := range tests {
 				t.Run(tt.name, func(t *testing.T) {
@@ -958,10 +1217,17 @@ func TestLineProfileDifferential(t *testing.T) {
 							t.Fatalf("FailedAt = %+v", result.FailedAt)
 						}
 						if tt.failAt != "" {
+							found := false
 							for _, r := range result.Routines {
-								if r.Name == result.FailedAt.Routine && lpLine(t, r.Source, tt.failAt) != result.FailedAt.Line {
-									t.Fatalf("FailedAt %+v, want the line of %q", result.FailedAt, tt.failAt)
+								if r.Name == result.FailedAt.Routine {
+									found = true
+									if lpLine(t, r.Source, tt.failAt) != result.FailedAt.Line {
+										t.Fatalf("FailedAt %+v, want the line of %q", result.FailedAt, tt.failAt)
+									}
 								}
+							}
+							if !found {
+								t.Fatalf("FailedAt %+v names no profiled routine", result.FailedAt)
 							}
 							var gotRows [][]any
 							for _, row := range result.KeptRows {
@@ -971,6 +1237,7 @@ func TestLineProfileDifferential(t *testing.T) {
 								t.Fatalf("rows before the error %#v, native %#v", gotRows, nativeRows)
 							}
 						}
+						lpCheckFirstHits(t, result)
 						t.Logf("native and emulated SQLCODE %d at line %d", lpSQLCode(nativeErr), result.FailedAt.Line)
 						return
 					}
@@ -1017,11 +1284,60 @@ func TestLineProfileDifferential(t *testing.T) {
 					if tt.check != nil {
 						tt.check(t, result)
 					}
+					lpCheckFirstHits(t, result)
 					t.Logf("rows %d, server calls %d, round trips %d, raw %v, prepare %v, snapshots %v, setup %v",
 						result.Rows, result.ServerCalls, result.RoundTrips, result.Raw, result.Prepare, result.Snapshots, result.Setup)
 				})
 			}
 		})
+	}
+}
+
+// lpCheckRowByRow checks ibg-mkx: the entry's FOR SELECT over a procedure
+// is sent with FOR UPDATE (one row per fetch) exactly when it may write, and
+// the first-hit times are consistent.
+func lpCheckRowByRow(want bool) func(t *testing.T, result interbase.LineProfileResult) {
+	return func(t *testing.T, result interbase.LineProfileResult) {
+		t.Helper()
+		routine := result.Routines[0]
+		loop := routine.Nodes[lpNodeAt(t, routine, "FOR SELECT")]
+		if got := strings.HasSuffix(loop.SQL, " FOR UPDATE"); got != want {
+			t.Fatalf("FOR SELECT sent %q, want FOR UPDATE %v", loop.SQL, want)
+		}
+		for _, site := range result.NativeCallSites {
+			t.Fatalf("unexpected native call site %+v", site)
+		}
+		t.Logf("FOR SELECT rows %d server calls %d round trips %d raw %v", loop.Metrics.Rows, loop.Metrics.ServerCalls, loop.Metrics.RoundTrips, loop.Metrics.Raw)
+		lpCheckFirstHits(t, result)
+	}
+}
+
+// lpCheckFirstHits checks the first-hit invariants: a node's first hit is
+// part of its total (all of it for a single hit), a line's is the sum of its
+// nodes', and routine totals have none.
+func lpCheckFirstHits(t *testing.T, result interbase.LineProfileResult) {
+	t.Helper()
+	for _, routine := range result.Routines {
+		lines := make(map[int][2]time.Duration)
+		for _, node := range routine.Nodes {
+			m := node.Metrics
+			if m.FirstRaw > m.Raw || m.FirstAdjusted > m.Adjusted || m.FirstAdjusted > m.FirstRaw ||
+				m.Hits == 1 && (m.FirstRaw != m.Raw || m.FirstAdjusted != m.Adjusted) ||
+				m.Hits == 0 && (m.FirstRaw != 0 || m.FirstAdjusted != 0) {
+				t.Fatalf("%s node at line %d: hits %d first %v/%v total %v/%v", node.Kind, node.Line, m.Hits, m.FirstRaw, m.FirstAdjusted, m.Raw, m.Adjusted)
+			}
+			first := lines[node.Line]
+			lines[node.Line] = [2]time.Duration{first[0] + m.FirstRaw, first[1] + m.FirstAdjusted}
+		}
+		for line, first := range lines {
+			if got := routine.Lines[line]; got.FirstRaw != first[0] || got.FirstAdjusted != first[1] {
+				t.Fatalf("line %d first %v/%v, want %v/%v", line, got.FirstRaw, got.FirstAdjusted, first[0], first[1])
+			}
+		}
+		if routine.Inclusive.FirstRaw != 0 || routine.Exclusive.FirstRaw != 0 ||
+			routine.Inclusive.FirstAdjusted != 0 || routine.Exclusive.FirstAdjusted != 0 {
+			t.Fatalf("routine %s totals have first-hit times", routine.Name)
+		}
 	}
 }
 
@@ -1039,6 +1355,7 @@ func TestLineProfileAnalysis(t *testing.T) {
 		{sql: "select * from LP_BARE_USER", mayWrite: true, callee: "LP_NOARGS"},
 		{sql: "select * from LP_WHEN(0)", mayWrite: true, callee: "LP_RAISE"},
 		{sql: "select * from LP_EXC(0)"},
+		{sql: "select * from LP_ES_FOR", mayWrite: true},
 		{sql: "select * from LP_ITEMS", problem: "table or view"},
 		{sql: "select * from LP_MISSING(1)", problem: "does not exist"},
 		{sql: "select * from LP_SCALARS", problem: "0 arguments"},
@@ -1064,6 +1381,115 @@ func TestLineProfileAnalysis(t *testing.T) {
 			}
 			if tt.callee != "" && (len(analysis.Callees) != 1 || analysis.Callees[0].Name != tt.callee || !analysis.Callees[0].Parses) {
 				t.Fatalf("callees = %+v, want %s", analysis.Callees, tt.callee)
+			}
+		})
+	}
+}
+
+// TestLineProfileBlobDateMessage checks ibg-b6o: assigning a date or time to
+// a BLOB variable fails with the server's message, the value written as the
+// server writes it in each dialect.
+func TestLineProfileBlobDateMessage(t *testing.T) {
+	for _, dialect := range []int{3, 1} {
+		t.Run(fmt.Sprintf("dialect %d", dialect), func(t *testing.T) {
+			conn, ctx := lpFixture(t, dialect)
+			for k := 1; k <= 3; k++ {
+				query := fmt.Sprintf("select * from LP_BDATE(%d)", k)
+				_, nativeErr := lpNative(t, ctx, conn, query)
+				result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: query, Dialect: dialect})
+				var native, emulated *interbase.Error
+				if err != nil || !errors.As(nativeErr, &native) || !errors.As(result.Err, &emulated) {
+					t.Fatalf("%s: emulated %v (%v), native %v", query, result.Err, err, nativeErr)
+				}
+				if emulated.SQLCode != native.SQLCode || emulated.Message != native.Message {
+					t.Fatalf("%s: emulated %q (SQLCODE %d), native %q (SQLCODE %d)", query, emulated.Message, emulated.SQLCode, native.Message, native.SQLCode)
+				}
+			}
+		})
+	}
+}
+
+// TestLineProfileSingletonCastRetry checks ibg-pm8 beyond the SQLCODE (see
+// the differential cases): a failing in-statement CAST is retried without
+// it and counts one error, and a singleton SELECT that cannot run twice is
+// never cast in the statement.
+func TestLineProfileSingletonCastRetry(t *testing.T) {
+	conn, ctx := lpFixture(t, 3)
+	texts := lpRelationID(t, ctx, conn, "LP_TEXTS")
+	for _, tt := range []struct {
+		query, marker string
+		wantSQL       string
+		retried       bool // the CAST statement ran first; its work is Retries overhead
+	}{
+		{"select * from LP_PM_FIRST", "SELECT W40", "SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID", true},
+		{"select * from LP_PM_PROC", "SELECT T FROM", "SELECT T FROM LP_PM_SRC(900)", false},
+	} {
+		result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: tt.query, Dialect: 3})
+		if err != nil || lpSQLCode(result.Err) != -811 {
+			t.Fatalf("%s: %v / %v", tt.query, result.Err, err)
+		}
+		routine := result.Routines[0]
+		node := routine.Nodes[lpNodeAt(t, routine, tt.marker)]
+		// Execute and two fetches of the plain statement only, as natively.
+		if node.SQL != tt.wantSQL || node.Metrics.Errors != 1 || node.Metrics.Rows != 2 || node.Metrics.ServerCalls != 3 {
+			t.Fatalf("%s: node SQL %q errors %d rows %d calls %d; want the plain statement, one error, two rows, 3 calls",
+				tt.query, node.SQL, node.Metrics.Errors, node.Metrics.Rows, node.Metrics.ServerCalls)
+		}
+		if (result.Retries > 0) != tt.retried {
+			t.Fatalf("%s: Retries %v, want retried %v", tt.query, result.Retries, tt.retried)
+		}
+		if tt.retried {
+			// LP_TEXTS has four rows: one scan in the node, the CAST
+			// attempt's scan in the overhead.
+			if got := node.Metrics.Tables[texts].SeqReads; got != 4 {
+				t.Fatalf("%s: node LP_TEXTS reads %d, want one scan (4)", tt.query, got)
+			}
+			if got := result.OverheadActivity.Tables[texts].SeqReads; got < 4 {
+				t.Fatalf("%s: overhead LP_TEXTS reads %d, want the CAST attempt's scan", tt.query, got)
+			}
+		}
+	}
+}
+
+// TestLineProfileExceptionMessageBytes checks ibg-96o: RDB$EXCEPTIONS
+// messages are CHARACTER SET NONE, so a CP1252 byte in one cannot be
+// transliterated to a UTF8 attachment; the analysis reads the messages as
+// bytes and the emulated EXCEPTION raises the same message as the server.
+func TestLineProfileExceptionMessageBytes(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3, "")
+	setup := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "NONE", 3,
+		interbase.TransactionOptions{Isolation: sql.LevelReadCommitted})
+	ctx := readContextWithTimeout(t, 3*time.Minute)
+	for _, statement := range []string{
+		"CREATE EXCEPTION LP_X8 'Caf\xe9 failure'",
+		"CREATE PROCEDURE LP_X8R (K INTEGER) RETURNS (R INTEGER) AS BEGIN R = K; SUSPEND; IF (K > 0) THEN EXCEPTION LP_X8; END",
+	} {
+		if _, err := setup.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	for _, charset := range []string{"UTF8", "NONE"} {
+		t.Run(charset, func(t *testing.T) {
+			db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, charset, 3,
+				interbase.TransactionOptions{Isolation: sql.LevelReadCommitted})
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatalf("db.Conn(): %v", err)
+			}
+			defer conn.Close()
+			const query = "select * from LP_X8R(1)"
+			analysis, err := interbase.AnalyzeLineProfile(ctx, conn, query, 3, nil)
+			if err != nil || len(analysis.Problems) != 0 {
+				t.Fatalf("AnalyzeLineProfile() = %+v, %v", analysis.Problems, err)
+			}
+			_, nativeErr := lpNative(t, ctx, conn, query)
+			result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: query, Dialect: 3})
+			var native, emulated *interbase.Error
+			if err != nil || !errors.As(nativeErr, &native) || !errors.As(result.Err, &emulated) {
+				t.Fatalf("LineProfile() = %v (%v); native %v", result.Err, err, nativeErr)
+			}
+			if emulated.SQLCode != native.SQLCode || emulated.Message != native.Message || !strings.Contains(native.Message, "Caf\xe9") {
+				t.Fatalf("emulated %q (SQLCODE %d), native %q (SQLCODE %d)", emulated.Message, emulated.SQLCode, native.Message, native.SQLCode)
 			}
 		})
 	}
@@ -1456,6 +1882,38 @@ func TestLineProfileKeptBlobRows(t *testing.T) {
 	}
 }
 
+// TestLineProfileBlobCap checks LineProfileOptions.MaxBlobBytes: a BLOB at
+// the cap is held whole; a larger one fails the run at its line, even
+// inside a WHEN ANY block, and is never truncated.
+func TestLineProfileBlobCap(t *testing.T) {
+	conn, ctx := lpFixture(t, 3)
+	const length = int64(len("hello blob"))
+	for _, tt := range []struct {
+		max   int64
+		fails bool
+	}{{length, false}, {length - 1, true}, {0, false}} {
+		result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
+			SQL: "select * from LP_BLOBCAP", Dialect: 3, MaxBlobBytes: tt.max,
+		})
+		if err != nil {
+			t.Fatalf("LineProfile(max %d): %v", tt.max, err)
+		}
+		if !tt.fails {
+			if result.Outcome != interbase.LineProfileCompleted || len(result.KeptRows) != 1 || fmt.Sprint(result.KeptRows[0][0].Value) != "1" {
+				t.Fatalf("max %d: outcome %s rows %#v err %v", tt.max, result.Outcome, result.KeptRows, result.Err)
+			}
+			continue
+		}
+		want := fmt.Sprintf("BLOB too large to emulate (more than %d bytes)", tt.max)
+		if result.Outcome != interbase.LineProfileFailed || result.Err == nil || !strings.Contains(result.Err.Error(), want) ||
+			result.FailedAt == nil || result.FailedAt.Line != lpLine(t, result.Routines[0].Source, "SELECT B FROM LP_BLOBS") ||
+			result.Rows != 0 || !result.RolledBack {
+			t.Fatalf("max %d: outcome %s at %+v rows %d err %v; want failed at the SELECT, not caught",
+				tt.max, result.Outcome, result.FailedAt, result.Rows, result.Err)
+		}
+	}
+}
+
 // lpBlobShapes are the fetch shapes that assign a value of each source
 // column (I integer, Z integer 0, N NUMERIC(15,2), D DATE) to a BLOB
 // variable.
@@ -1548,4 +2006,85 @@ func lpBlobFetchCases() []lpBlobFetchCase {
 		}
 	}
 	return cases
+}
+
+// lpBlobEdgeCases are the differential cases of ibg-b6o, as probed
+// natively: BLOB content is written without transliteration; a CHAR value
+// fills a BLOB with its full width in bytes; a BLOB variable or output
+// parameter assigned to a text variable fails with SQLCODE -902, while a
+// BLOB column selected into one is cut to its length; IS NULL on a BLOB
+// variable holding an integer is false; a date assigned to a BLOB fails
+// with SQLCODE -413. A BLOB column fits a multi-byte text variable of at
+// least its length in bytes.
+func lpBlobEdgeCases() []lpBlobFetchCase {
+	cases := []lpBlobFetchCase{
+		{name: "BLOB edge: bad BLOB IS NULL", sql: "select * from LP_BISNULL"},
+		{name: "BLOB edge: text BLOB into a UTF8 variable it fits", sql: "select * from LP_BUTF8"},
+		{name: "BLOB edge: text BLOB from a stepped procedure cut to a text target", sql: "select * from LP_BTEXT(4)", stepInto: []string{"LP_BSEL_T"}},
+		{name: "BLOB edge: text BLOB rows from a stepped procedure", sql: "select * from LP_BTEXT(5)", stepInto: []string{"LP_BSEL_T"}},
+		{name: "BLOB edge: BLOB output parameter into text, stepped", sql: "select * from LP_BTEXT(2)", stepInto: []string{"LP_BOUT_T"},
+			failAt: "IF (K = 2)"},
+	}
+	for k := 1; k <= 2; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: raw bytes %d", k), sql: fmt.Sprintf("select * from LP_BRAW(%d)", k)})
+	}
+	for k := 1; k <= 5; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: CHAR width %d", k), sql: fmt.Sprintf("select * from LP_BCHAR(%d)", k)})
+	}
+	for k := 0; k <= 6; k++ {
+		failAt := ""
+		if k >= 1 && k <= 3 {
+			failAt = fmt.Sprintf("IF (K = %d)", k)
+		}
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: BLOB into text %d", k), sql: fmt.Sprintf("select * from LP_BTEXT(%d)", k), failAt: failAt})
+	}
+	for k := 1; k <= 4; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: exact numeric %d", k), sql: fmt.Sprintf("select * from LP_BNUM(%d)", k)})
+	}
+	for k := 1; k <= 3; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: date %d", k), sql: fmt.Sprintf("select * from LP_BDATE(%d)", k),
+			failAt: fmt.Sprintf("IF (K = %d)", k)})
+	}
+	return cases
+}
+
+// TestLineProfileDialectMismatchRefused checks ibg-1o3: a Dialect 1
+// attachment to a Dialect 3 database is refused before anything runs; the
+// procedure's generator increment, which no rollback would undo, is absent.
+func TestLineProfileDialectMismatchRefused(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3, "")
+	options := interbase.TransactionOptions{Isolation: sql.LevelReadCommitted}
+	setup := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "NONE", 3, options)
+	ctx := readContextWithTimeout(t, 3*time.Minute)
+	for _, statement := range []string{
+		"CREATE GENERATOR LP_DL_GEN",
+		`CREATE PROCEDURE LP_DL_BUMP RETURNS (N NUMERIC(18,0)) AS
+BEGIN
+  N = GEN_ID(LP_DL_GEN, 1);
+END`,
+	} {
+		if _, err := setup.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "NONE", 1, options)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	const entry = "EXECUTE PROCEDURE LP_DL_BUMP"
+	want := "The connection uses SQL dialect 1 but the database is dialect 3; line profiling needs matching dialects."
+	analysis, err := interbase.AnalyzeLineProfile(ctx, conn, entry, 1, nil)
+	if err != nil || len(analysis.Problems) != 1 || analysis.Problems[0].Message != want {
+		t.Fatalf("AnalyzeLineProfile = %+v / %v; want one problem %q", analysis.Problems, err, want)
+	}
+	result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: entry, Dialect: 1})
+	if !errors.Is(err, interbase.ErrLineProfileRefused) || !strings.Contains(err.Error(), want) || len(result.Routines) != 0 {
+		t.Fatalf("LineProfile = %v (routines %d); want the refusal", err, len(result.Routines))
+	}
+	var value int64
+	if err := setup.QueryRowContext(ctx, "SELECT GEN_ID(LP_DL_GEN, 0) FROM RDB$DATABASE").Scan(&value); err != nil || value != 0 {
+		t.Fatalf("LP_DL_GEN = %d / %v; want 0, nothing ran", value, err)
+	}
 }
