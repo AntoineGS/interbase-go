@@ -315,6 +315,45 @@ static void test_sqlcode_status_keeps_numeric_context(void)
 	ib_error_free(error);
 }
 
+static void test_status_codes_report_gds_and_exception_number(void)
+{
+	char *error;
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+
+	memset(status, 0, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = (ISC_STATUS) isc_except;
+	status[2] = isc_arg_number;
+	status[3] = (ISC_STATUS) 42;
+	status[4] = isc_arg_gds;
+	status[5] = (ISC_STATUS) isc_random;
+	status[6] = isc_arg_string;
+	status[7] = (ISC_STATUS) (uintptr_t) "LP_EX";
+	status[8] = isc_arg_end;
+	error = NULL;
+
+	require_condition(ib_fail_status(&error, "synthetic exception", status) == -1,
+		"user exception status did not fail");
+	require_condition(error != NULL, "user exception status produced no error");
+	require_condition(strstr(error, "native status 335544517, gds 335544517 335544382, exception 42)") != NULL,
+		"GDS codes and exception number are missing from the error envelope");
+	ib_error_free(error);
+
+	memset(status, 0, sizeof(status));
+	status[0] = isc_arg_gds;
+	status[1] = (ISC_STATUS) isc_dsql_error;
+	status[2] = isc_arg_end;
+	error = NULL;
+	require_condition(ib_fail_status(&error, "synthetic sql error", status) == -1,
+		"plain status did not fail");
+	require_condition(strstr(error, "gds 335544569)") != NULL ||
+		strstr(error, "gds 335544569):") != NULL,
+		"single GDS code is missing");
+	require_condition(strstr(error, "exception") == NULL,
+		"plain status reported an exception number");
+	ib_error_free(error);
+}
+
 static void test_dialect_is_encoded_in_dpb(void)
 {
 	ib_connection *connection;
@@ -477,6 +516,7 @@ int main(void)
 	test_malformed_arguments_are_safe();
 	test_unterminated_status_vector_is_not_interpreted();
 	test_sqlcode_status_keeps_numeric_context();
+	test_status_codes_report_gds_and_exception_number();
 	test_unset_connection_defaults_to_dialect_three();
 	test_dialect_is_encoded_in_dpb();
 	test_connect_timeout_is_encoded_as_little_endian_integer();

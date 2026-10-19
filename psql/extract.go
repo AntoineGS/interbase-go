@@ -172,12 +172,22 @@ type textEdit struct {
 	start       int
 	end         int
 	replacement string
+	param       string // variable name for a "?" replacement in routine SQL
 }
 
 func rewriteSQL(input string, tokens []token, start, end, endOffset int, kind string) string {
+	sql, _ := rewriteSQLParams(input, tokens, start, end, endOffset, kind, true)
+	return sql
+}
+
+// rewriteSQLParams removes a trailing output INTO and replaces variable
+// references by "?", returning the referenced names in order. Trigger
+// context replaces NEW.x/OLD.x; otherwise ":name" may also be written with
+// whitespace after the colon, as PSQL allows.
+func rewriteSQLParams(input string, tokens []token, start, end, endOffset int, kind string, trigger bool) (string, []string) {
 	startOffset := tokens[start].start
 	if endOffset < startOffset {
-		return ""
+		return "", nil
 	}
 	edits := make([]textEdit, 0)
 	removedStart, removedEnd := -1, -1
@@ -204,7 +214,15 @@ func rewriteSQL(input string, tokens []token, start, end, endOffset int, kind st
 			continue
 		}
 		if tokens[i].kind == tokenParameter {
-			edits = append(edits, textEdit{start: tokens[i].start, end: tokens[i].end, replacement: "?"})
+			edits = append(edits, textEdit{start: tokens[i].start, end: tokens[i].end, replacement: "?", param: asciiUpper(tokens[i].text)})
+			continue
+		}
+		if !trigger {
+			if t := tokens[i]; t.kind == tokenPunctuation && t.text == ":" && i+1 < end && isNameToken(tokens[i+1]) &&
+				onlyWhitespace(input[t.end:tokens[i+1].start]) {
+				edits = append(edits, textEdit{start: t.start, end: tokens[i+1].end, replacement: "?", param: normalizedName(tokens[i+1])})
+				i++
+			}
 			continue
 		}
 		if tokens[i].kind == tokenIdentifier && (keyword(tokens[i], "NEW") || keyword(tokens[i], "OLD")) && i+2 < end &&
@@ -218,6 +236,7 @@ func rewriteSQL(input string, tokens []token, start, end, endOffset int, kind st
 	})
 
 	var output strings.Builder
+	var params []string
 	cursor := startOffset
 	for _, edit := range edits {
 		if edit.start < cursor || edit.end > endOffset {
@@ -226,9 +245,12 @@ func rewriteSQL(input string, tokens []token, start, end, endOffset int, kind st
 		output.WriteString(input[cursor:edit.start])
 		output.WriteString(edit.replacement)
 		cursor = edit.end
+		if edit.param != "" {
+			params = append(params, edit.param)
+		}
 	}
 	output.WriteString(input[cursor:endOffset])
-	return trimASCIIWhitespace(output.String())
+	return trimASCIIWhitespace(output.String()), params
 }
 
 func isOutputInto(kind string, tokens []token, start, into int) bool {

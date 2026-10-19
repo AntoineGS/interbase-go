@@ -79,11 +79,11 @@ func TestStatementDescriptionReportsColumnOrigins(t *testing.T) {
 		want  []interbase.ColumnOrigin
 	}{
 		{"SELECT c.ID, c.COUNTRY AS NAME, c.ID + 1, w.LABEL FROM GO_COUNTRY c JOIN GO_WRITE w ON w.ID = c.ID",
-			[]interbase.ColumnOrigin{{"GO_COUNTRY", "ID"}, {"GO_COUNTRY", "COUNTRY"}, {}, {"GO_WRITE", "LABEL"}}},
+			[]interbase.ColumnOrigin{{Relation: "GO_COUNTRY", Field: "ID"}, {Relation: "GO_COUNTRY", Field: "COUNTRY"}, {}, {Relation: "GO_WRITE", Field: "LABEL"}}},
 		{"SELECT * FROM GO_COUNTRY",
-			[]interbase.ColumnOrigin{{"GO_COUNTRY", "ID"}, {"GO_COUNTRY", "COUNTRY"}, {"GO_COUNTRY", "CURRENCY"}}},
+			[]interbase.ColumnOrigin{{Relation: "GO_COUNTRY", Field: "ID"}, {Relation: "GO_COUNTRY", Field: "COUNTRY"}, {Relation: "GO_COUNTRY", Field: "CURRENCY"}}},
 		{"SELECT a.ID, b.ID FROM GO_COUNTRY a JOIN GO_COUNTRY b ON b.ID = a.ID",
-			[]interbase.ColumnOrigin{{"GO_COUNTRY", "ID"}, {"GO_COUNTRY", "ID"}}},
+			[]interbase.ColumnOrigin{{Relation: "GO_COUNTRY", Field: "ID"}, {Relation: "GO_COUNTRY", Field: "ID"}}},
 		{"SELECT COUNT(*) FROM GO_COUNTRY", []interbase.ColumnOrigin{{}}},
 	}
 	for _, tc := range cases {

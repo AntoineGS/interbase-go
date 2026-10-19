@@ -740,6 +740,9 @@ type conn struct {
 	statements         map[*stmt]struct{}
 	rows               map[*rows]struct{}
 	distributed        *DistributedTransaction
+	// activityPerItem is set once the combined activity response exceeded the
+	// native limit; guarded by mu.
+	activityPerItem bool
 	// directBeforeLock is a package-test seam for deterministic cancellation
 	// tests while a direct operation waits for the connection mutex.
 	directBeforeLock func()
@@ -1604,6 +1607,36 @@ type Error struct {
 	NativeCode int64
 	Message    string
 	cause      error
+
+	gdsCodes        []int64
+	exceptionNumber int32
+	hasException    bool
+}
+
+// GDSCodes returns the isc_arg_gds codes of the failure's status vector in
+// order. It is empty when the client returned no status vector.
+func (e *Error) GDSCodes() []int64 {
+	if e == nil || len(e.gdsCodes) == 0 {
+		return nil
+	}
+	return append([]int64(nil), e.gdsCodes...)
+}
+
+// GDSCode returns the first GDS code, or zero when there is none.
+func (e *Error) GDSCode() int64 {
+	if e == nil || len(e.gdsCodes) == 0 {
+		return 0
+	}
+	return e.gdsCodes[0]
+}
+
+// ExceptionNumber returns the user exception number that follows isc_except
+// (335544517) in the status vector.
+func (e *Error) ExceptionNumber() (int32, bool) {
+	if e == nil {
+		return 0, false
+	}
+	return e.exceptionNumber, e.hasException
 }
 
 func (e *Error) Error() string {
@@ -1650,11 +1683,12 @@ func parseNativeError(message string) error {
 	}
 	close += statusStart + len(statusMarker)
 	sqlCode, sqlErr := strconv.Atoi(strings.TrimSpace(remainder[:statusStart]))
-	nativeCode, nativeErr := strconv.ParseInt(
-		strings.TrimSpace(remainder[statusStart+len(statusMarker):close]), 10, 64)
+	statusFields := strings.Split(remainder[statusStart+len(statusMarker):close], ", ")
+	nativeCode, nativeErr := strconv.ParseInt(strings.TrimSpace(statusFields[0]), 10, 64)
 	if sqlErr != nil || nativeErr != nil {
 		return &Error{Message: message}
 	}
+	gdsCodes, exceptionNumber, hasException := parseStatusCodeFields(statusFields[1:])
 
 	detail := strings.TrimSpace(remainder[close+1:])
 	detail = strings.TrimPrefix(detail, ":")
@@ -1664,7 +1698,35 @@ func parseNativeError(message string) error {
 		SQLCode:    sqlCode,
 		NativeCode: nativeCode,
 		Message:    detail,
+
+		gdsCodes:        gdsCodes,
+		exceptionNumber: exceptionNumber,
+		hasException:    hasException,
 	}
+}
+
+// parseStatusCodeFields reads the optional "gds <code> <code>..." and
+// "exception <number>" fields the native layer appends to the status envelope.
+func parseStatusCodeFields(fields []string) (codes []int64, exception int32, hasException bool) {
+	for _, field := range fields {
+		parts := strings.Fields(field)
+		if len(parts) < 2 {
+			continue
+		}
+		switch parts[0] {
+		case "gds":
+			for _, part := range parts[1:] {
+				if code, err := strconv.ParseInt(part, 10, 64); err == nil {
+					codes = append(codes, code)
+				}
+			}
+		case "exception":
+			if number, err := strconv.ParseInt(parts[1], 10, 32); err == nil {
+				exception, hasException = int32(number), true
+			}
+		}
+	}
+	return codes, exception, hasException
 }
 
 func sanitizeError(operation string, err error, secrets ...string) error {

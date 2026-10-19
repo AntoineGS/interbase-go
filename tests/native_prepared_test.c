@@ -3742,6 +3742,76 @@ static void test_slot_synchronization_failures_abort(void)
 	teardown_sync_fault_slot();
 }
 
+
+static void test_transaction_prepare_caches_catalog_metadata(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+	static const char tpb[] = {isc_tpb_version3, isc_tpb_read, isc_tpb_read_committed,
+		isc_tpb_rec_version};
+	ib_connection *connection;
+	ib_transaction *transaction;
+	struct ib_statement *statement;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+	int catalog_executions;
+	int execution;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_relation = 1;
+	connection = new_connection();
+	transaction = ib_transaction_begin(connection, tpb, sizeof(tpb), &error);
+	check(transaction != NULL && error == NULL, "direct transaction start failed");
+	ib_error_free(error);
+	error = NULL;
+	if (transaction == NULL) {
+		free(connection);
+		return;
+	}
+	statement = (ib_transaction_prepare)(transaction, query, sizeof(query) - 1U, 1,
+		NULL, 0U, &error);
+	check(statement != NULL && error == NULL, "direct statement preparation failed");
+	ib_error_free(error);
+	catalog_executions = execute2_calls - user_execute2_calls;
+	check(catalog_executions == 1 && statement != NULL && statement->metadata_cached &&
+		statement->metadata_count == 1U && statement->cached_metadata != NULL &&
+		statement->cached_metadata[0].sql_type == IB_METADATA_INTEGER,
+		"direct prepare did not run and cache the catalog metadata once");
+	for (execution = 0; statement != NULL && execution < 3; execution++) {
+		bindings = new_integer_binding(execution);
+		error = NULL;
+		cursor = ib_statement_query(statement, bindings, &error);
+		check(cursor != NULL && error == NULL, "cached-metadata prepared query failed");
+		ib_error_free(error);
+		ib_bindings_free(bindings);
+		check(cursor != NULL && cursor->metadata != NULL &&
+			cursor->metadata[0].sql_type == IB_METADATA_INTEGER &&
+			cursor->metadata != statement->cached_metadata,
+			"prepared cursor did not receive its own copy of the cached metadata");
+		if (cursor != NULL) {
+			error = NULL;
+			check(ib_cursor_close(cursor, &error) == 0 && error == NULL,
+				"cached-metadata cursor close failed");
+			ib_error_free(error);
+		}
+	}
+	check(execute2_calls - user_execute2_calls == catalog_executions,
+		"prepared executions repeated the catalog query");
+	if (statement != NULL) {
+		error = NULL;
+		check(ib_statement_close(statement, &error) == 0 && error == NULL,
+			"cached-metadata statement close failed");
+		ib_error_free(error);
+	}
+	error = NULL;
+	check(ib_transaction_rollback(transaction, &error) == 0 && error == NULL,
+		"direct transaction rollback failed");
+	ib_error_free(error);
+	ib_transaction_free(transaction);
+	free(connection);
+}
+
 int main(void)
 {
 	test_dialect_arguments_are_propagated();
@@ -3761,6 +3831,7 @@ int main(void)
 	test_prepare_failure_releases_handle_and_transaction();
 	test_failed_prepare_rollback_marks_connection_broken();
 	test_query_cursor_does_not_drop_statement();
+	test_transaction_prepare_caches_catalog_metadata();
 	test_descriptor_aliases_are_exposed_as_utf8();
 	test_procedure_descriptor_without_source_remains_unknown();
 	test_broken_close_aborts_pending_procedure_sibling();

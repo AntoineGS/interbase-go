@@ -277,6 +277,7 @@ type Transaction struct {
 	done             bool
 	cursors          map[*Cursor]struct{}
 	blobs            map[*blobStream]struct{}
+	prepared         map[*PreparedStatement]struct{}
 }
 
 // Cursor is an explicitly owned direct result cursor.
@@ -716,19 +717,8 @@ func (t *Transaction) Query(ctx context.Context, query string, args ...any) (*Cu
 	nativeCursor, columns, err := t.native.query(ctx, query, converted, true)
 	releaseNative()
 	if err != nil {
-		evidence := nativeCancellationEvidenceOf(err)
-		parts := splitNativeExecutionError(err)
-		operationErr := a.conn.sanitizeError("direct query", parts.primary)
-		cleanupErr := a.conn.sanitizeError("", parts.cleanup)
-		operationErr = classifyNativeWriteOutcome("direct query",
-			nativeQueryMutatingOf(err), contextCancellation(ctx), operationErr,
-			cleanupErr, t.native.writeOutcomeState(), evidence)
-		operationErr = joinNativeRequestDiagnostic(operationErr,
-			a.conn.sanitizeError("", parts.request))
-		if a.conn.native.broken() {
-			t.invalidateLocked(operationErr)
-		}
-		return nil, operationErr
+		return nil, t.classifyNativeStatementFailureLocked(ctx, a, "direct query",
+			nativeQueryMutatingOf(err), err)
 	}
 	cursor := &Cursor{
 		tx:         t,
@@ -744,6 +734,25 @@ func (t *Transaction) Query(ctx context.Context, query string, args ...any) (*Cu
 		return nil, errors.Join(err, closeErr)
 	}
 	return cursor, nil
+}
+
+// classifyNativeStatementFailureLocked turns a failed native query or exec
+// into the operation's error, invalidating the transaction when the
+// connection broke. The caller holds the connection lock.
+func (t *Transaction) classifyNativeStatementFailureLocked(ctx context.Context, a *Attachment,
+	operation string, mutating bool, err error) error {
+	evidence := nativeCancellationEvidenceOf(err)
+	parts := splitNativeExecutionError(err)
+	operationErr := a.conn.sanitizeError(operation, parts.primary)
+	cleanupErr := a.conn.sanitizeError("", parts.cleanup)
+	operationErr = classifyNativeWriteOutcome(operation, mutating,
+		contextCancellation(ctx), operationErr, cleanupErr, t.native.writeOutcomeState(), evidence)
+	operationErr = joinNativeRequestDiagnostic(operationErr,
+		a.conn.sanitizeError("", parts.request))
+	if a.conn.native.broken() {
+		t.invalidateLocked(operationErr)
+	}
+	return operationErr
 }
 
 // Exec executes a non-result statement in the direct transaction.
@@ -782,18 +791,7 @@ func (t *Transaction) Exec(ctx context.Context, query string, args ...any) (int6
 	affected, err := t.native.exec(ctx, query, converted, true)
 	releaseNative()
 	if err != nil {
-		evidence := nativeCancellationEvidenceOf(err)
-		parts := splitNativeExecutionError(err)
-		operationErr := a.conn.sanitizeError("direct exec", parts.primary)
-		cleanupErr := a.conn.sanitizeError("", parts.cleanup)
-		operationErr = classifyNativeWriteOutcome("direct exec", true,
-			contextCancellation(ctx), operationErr, cleanupErr, t.native.writeOutcomeState(), evidence)
-		operationErr = joinNativeRequestDiagnostic(operationErr,
-			a.conn.sanitizeError("", parts.request))
-		if a.conn.native.broken() {
-			t.invalidateLocked(operationErr)
-		}
-		return 0, operationErr
+		return 0, t.classifyNativeStatementFailureLocked(ctx, a, "direct exec", true, err)
 	}
 	if err := contextError(ctx); err != nil {
 		// Native execution completed successfully before the context was
@@ -1247,7 +1245,7 @@ func (t *Transaction) Info(ctx context.Context, code byte) (InfoItem, error) {
 		return InfoItem{}, operationErr
 	}
 	if t.distributed != nil {
-		items, parseErr := parseInfoItems(response, code)
+		items, parseErr := parseRepeatedInfoItems(response, code)
 		if parseErr != nil {
 			return InfoItem{}, parseErr
 		}
@@ -1836,7 +1834,15 @@ func (a *Attachment) retainTransactionLocked(transaction *Transaction) {
 }
 
 func (t *Transaction) closeCursorsLocked() error {
-	if t == nil || len(t.cursors) == 0 {
+	if t == nil {
+		return nil
+	}
+	cursorsErr := t.closeNativeCursorsLocked()
+	return errors.Join(cursorsErr, t.closePreparedLocked())
+}
+
+func (t *Transaction) closeNativeCursorsLocked() error {
+	if len(t.cursors) == 0 {
 		return nil
 	}
 	nativeCursors := make([]*nativeCursor, 0, len(t.cursors))
@@ -2129,10 +2135,10 @@ func parseInfoItem(response []byte, requested byte) (InfoItem, error) {
 	return InfoItem{Code: response[0], Data: append([]byte(nil), response[3:end]...)}, nil
 }
 
-// parseInfoItems parses the complete repeated-item response returned by the
+// parseRepeatedInfoItems parses the complete repeated-item response returned by the
 // native information API. A transaction-info request can contain one item per
 // participant; callers must not silently discard all but the first item.
-func parseInfoItems(response []byte, requested byte) ([]InfoItem, error) {
+func parseRepeatedInfoItems(response []byte, requested byte) ([]InfoItem, error) {
 	if len(response) == 0 {
 		return nil, errors.New("interbase: empty information response")
 	}
@@ -2176,7 +2182,7 @@ func parseInfoItems(response []byte, requested byte) ([]InfoItem, error) {
 // accepts complete native information frames. Payload-only fallback is unsafe
 // for recovery identifiers and is intentionally not supported.
 func parseInfoItemsOrPayload(response []byte, requested byte) ([]InfoItem, error) {
-	return parseInfoItems(response, requested)
+	return parseRepeatedInfoItems(response, requested)
 }
 
 func parseRecoveryDatabaseInfo(response []byte) (InfoItem, error) {

@@ -198,6 +198,7 @@ type nativeConnection struct {
 	writeOutcomeStateOverride func() nativeWriteOutcomeState
 	prepareOverride           func(string) (*nativeStatement, error)
 	databaseInfoOverride      func(byte) ([]byte, error)
+	databaseInfoItemsOverride func([]byte) ([]byte, error)
 	clientVersionOverride     func() (string, error)
 	commitRetainingOverride   func() error
 	rollbackRetainingOverride func() error
@@ -775,6 +776,7 @@ type nativeStatement struct {
 	inputMetadataOverride     func(int) (nativeInputMetadata, error)
 	planOverride              func() (string, error)
 	descriptionOverride       func() (StatementDescriptor, error)
+	outputsOverride           func() ([]OutputDescriptor, error)
 }
 
 type nativeInputMetadata struct {
@@ -817,6 +819,7 @@ func (s *nativeStatement) queryMutating() bool {
 type nativeCursor struct {
 	fingerprintValueOverride func(int) (any, error)
 	indicatorOverride        func(int) (uint16, error)
+	valueOverride            func(int) (driver.Value, error)
 	ptr                      *C.ib_cursor
 	nextOverride             func() (bool, error)
 	nextContextOverride      func(*nativeCancelOperation) (bool, error)
@@ -1267,6 +1270,41 @@ func (s *nativeStatement) inputDescriptors() ([]InputDescriptor, error) {
 			Scale:     metadata.sqlScale,
 			Precision: metadata.sqlPrecision,
 			Nullable:  metadata.nullable,
+		}
+	}
+	return descriptors, nil
+}
+
+func (s *nativeStatement) outputDescriptors() ([]OutputDescriptor, error) {
+	release := nativegate.Global.Enter()
+	defer release()
+	if s != nil && s.outputsOverride != nil {
+		return s.outputsOverride()
+	}
+	if s == nil || s.ptr == nil {
+		return nil, errors.New("interbase: native statement is unavailable")
+	}
+	count := int(C.ib_statement_num_output(s.ptr))
+	descriptors := make([]OutputDescriptor, count)
+	for index := range descriptors {
+		var metadata C.ib_output_metadata
+		var name *C.char
+		var nameLength C.size_t
+		var errorPointer *C.char
+		if C.ib_statement_output_metadata(s.ptr, C.size_t(index), &metadata, &name,
+			&nameLength, &errorPointer) != 0 {
+			return nil, takeNativeError(errorPointer)
+		}
+		if uint64(nameLength) > uint64(math.MaxInt32) {
+			return nil, errors.New("interbase: prepared output name is too long")
+		}
+		descriptors[index] = OutputDescriptor{
+			Name:     trimColumnOriginName(C.GoBytes(unsafe.Pointer(name), C.int(nameLength))),
+			Kind:     inputDescriptorKind(int(metadata.sql_type)),
+			SubType:  int(metadata.sql_subtype),
+			Scale:    int(metadata.sql_scale),
+			Length:   int(metadata.length),
+			Nullable: metadata.nullable != 0,
 		}
 	}
 	return descriptors, nil
@@ -1911,6 +1949,59 @@ func (c *nativeConnection) databaseInfo(item byte) ([]byte, error) {
 	return c.info(item, false)
 }
 
+// databaseInfoItems requests several database information items in one native
+// call. The response buffer grows on isc_info_truncated up to 32767 bytes (the
+// isc_database_info short-length limit); beyond that it returns
+// errInfoResponseTooLarge.
+func (c *nativeConnection) databaseInfoItems(codes []byte) ([]byte, error) {
+	response, _, err := c.databaseInfoItemsTimed(codes)
+	return response, err
+}
+
+// databaseInfoItemsTimed is databaseInfoItems that also reports how long the
+// native call itself took, excluding admission through the native gate.
+func (c *nativeConnection) databaseInfoItemsTimed(codes []byte) ([]byte, time.Duration, error) {
+	release := nativegate.Global.Enter()
+	defer release()
+	started := time.Now()
+	response, err := c.databaseInfoItemsAdmitted(codes)
+	return response, time.Since(started), err
+}
+
+func (c *nativeConnection) databaseInfoItemsAdmitted(codes []byte) ([]byte, error) {
+	if c != nil && c.databaseInfoItemsOverride != nil {
+		response, err := c.databaseInfoItemsOverride(codes)
+		return append([]byte(nil), response...), err
+	}
+	if c == nil || c.ptr == nil {
+		return nil, errors.New("native connection is unavailable")
+	}
+	if len(codes) == 0 || len(codes) > 255 {
+		return nil, errors.New("invalid database information item list")
+	}
+	var responsePointer *C.char
+	var responseLength C.size_t
+	var errorPointer *C.char
+	result := C.ib_connection_database_info_items(c.ptr,
+		(*C.uchar)(unsafe.Pointer(&codes[0])), C.size_t(len(codes)),
+		&responsePointer, &responseLength, &errorPointer)
+	if result != 0 {
+		err := takeNativeError(errorPointer)
+		if result == 2 {
+			return nil, errors.Join(errInfoResponseTooLarge, err)
+		}
+		return nil, err
+	}
+	if responsePointer == nil {
+		return nil, errors.New("native information response is unavailable")
+	}
+	defer C.free(unsafe.Pointer(responsePointer))
+	if uint64(responseLength) > uint64(math.MaxInt32) {
+		return nil, errors.New("native information response is too long")
+	}
+	return C.GoBytes(unsafe.Pointer(responsePointer), C.int(responseLength)), nil
+}
+
 func (c *nativeConnection) transactionInfo(item byte) ([]byte, error) {
 	return c.info(item, true)
 }
@@ -2378,6 +2469,9 @@ func (c *nativeCursor) indicator(index int) (uint16, error) {
 }
 
 func (c *nativeCursor) value(index int) (driver.Value, error) {
+	if c != nil && c.valueOverride != nil {
+		return c.valueOverride(index)
+	}
 	release := nativegate.Global.Enter()
 	defer release()
 	if c == nil || c.ptr == nil {

@@ -180,6 +180,18 @@ struct ib_statement {
 	char *query;
 	size_t query_length;
 	int statement_type;
+	/* Direct-transaction statements run the catalog queries that enrich
+	 * column metadata once, at prepare, and copy the result to every cursor,
+	 * so an execution runs only the statement itself. The statement owns
+	 * these arrays of metadata_count entries; they are freed with it. */
+	int metadata_cached;
+	/* Direct-transaction statements decode like direct queries: BLOBs as
+	 * references and arrays allowed. */
+	int allow_arrays;
+	size_t metadata_count;
+	ib_column_metadata *cached_metadata;
+	short *cached_blob_charsets;
+	unsigned char *cached_blob_charset_known;
 	ib_cursor *active_cursor;
 	ib_statement *next;
 };
@@ -1379,10 +1391,63 @@ static void ib_status_text(const ISC_STATUS *status, char *text)
 	text[used] = '\0';
 }
 
+#define IB_STATUS_CODES_LENGTH 320U
+#define IB_STATUS_CODES_MAX 16U
+
+/*
+ * Render ", gds <code> <code>..., exception <number>" for the isc_arg_gds codes
+ * of the vector in order, and the number that follows isc_except. Empty when
+ * the vector carries neither. Only numbers are written, never status strings.
+ */
+static void ib_status_codes(const ISC_STATUS *status, char *text, size_t size)
+{
+	size_t index;
+	size_t used;
+	size_t codes;
+	int have_number;
+	ISC_STATUS number;
+	int written;
+
+	text[0] = '\0';
+	used = 0U;
+	codes = 0U;
+	have_number = 0;
+	number = 0;
+	for (index = 0U; status != NULL && index + 1U < IB_STATUS_VECTOR_LENGTH;) {
+		if (status[index] == isc_arg_end) {
+			break;
+		}
+		if (status[index] == isc_arg_gds) {
+			if (codes < IB_STATUS_CODES_MAX) {
+				written = snprintf(text + used, size - used, "%s%" PRIdPTR,
+					codes == 0U ? ", gds " : " ", (intptr_t) status[index + 1U]);
+				if (written < 0 || (size_t) written >= size - used) {
+					text[used] = '\0';
+					break;
+				}
+				used += (size_t) written;
+				++codes;
+			}
+			if (status[index + 1U] == isc_except && !have_number &&
+				index + 3U < IB_STATUS_VECTOR_LENGTH &&
+				status[index + 2U] == isc_arg_number) {
+				number = status[index + 3U];
+				have_number = 1;
+			}
+		}
+		index += status[index] == isc_arg_cstring ? 3U : 2U;
+	}
+	if (have_number) {
+		(void) snprintf(text + used, size - used, ", exception %" PRIdPTR,
+			(intptr_t) number);
+	}
+}
+
 static int ib_fail_status(char **error, const char *operation,
 	ISC_STATUS *status)
 {
 	char sql_message[IB_SQL_MESSAGE_LENGTH];
+	char codes[IB_STATUS_CODES_LENGTH];
 	char status_text[IB_STATUS_TEXT_LIMIT + 1U];
 	char message[IB_STATUS_TEXT_LIMIT + 512U];
 	ISC_STATUS primary_status;
@@ -1390,14 +1455,15 @@ static int ib_fail_status(char **error, const char *operation,
 	int has_primary_status;
 
 	has_primary_status = ib_primary_status(status, &primary_status);
+	ib_status_codes(status, codes, sizeof(codes));
 	sqlcode = 0;
 	sql_message[0] = '\0';
 	ib_status_text(status, status_text);
 	if (status_text[0] != '\0' && has_primary_status) {
 		sqlcode = isc_sqlcode(status);
 		(void) snprintf(message, sizeof(message),
-			"%s failed (SQLCODE %" PRIdMAX ", native status %" PRIdPTR "): %s",
-			operation, (intmax_t) sqlcode, (intptr_t) primary_status,
+			"%s failed (SQLCODE %" PRIdMAX ", native status %" PRIdPTR "%s): %s",
+			operation, (intmax_t) sqlcode, (intptr_t) primary_status, codes,
 			status_text);
 		return ib_fail(error, message);
 	}
@@ -1418,13 +1484,13 @@ static int ib_fail_status(char **error, const char *operation,
 	}
 	if (has_primary_status && sql_message[0] != '\0') {
 		(void) snprintf(message, sizeof(message),
-			"%s failed (SQLCODE %" PRIdMAX ", native status %" PRIdPTR "): %s",
-			operation, (intmax_t) sqlcode, (intptr_t) primary_status,
+			"%s failed (SQLCODE %" PRIdMAX ", native status %" PRIdPTR "%s): %s",
+			operation, (intmax_t) sqlcode, (intptr_t) primary_status, codes,
 			sql_message);
 	} else if (has_primary_status) {
 		(void) snprintf(message, sizeof(message),
-			"%s failed (SQLCODE %" PRIdMAX ", native status %" PRIdPTR ")",
-			operation, (intmax_t) sqlcode, (intptr_t) primary_status);
+			"%s failed (SQLCODE %" PRIdMAX ", native status %" PRIdPTR "%s)",
+			operation, (intmax_t) sqlcode, (intptr_t) primary_status, codes);
 	} else {
 		(void) snprintf(message, sizeof(message),
 			"%s failed (SQLCODE 0, native status unavailable)", operation);
@@ -6406,10 +6472,82 @@ static int ib_cursor_describe_metadata(ib_cursor *cursor, ib_cancel_slot *cancel
 	if (ib_cursor_describe_column_names(cursor, error) != 0) {
 		return -1;
 	}
+	if (cursor->prepared != NULL && cursor->prepared->metadata_cached) {
+		ib_statement *statement = cursor->prepared;
+		size_t count = (size_t) cursor->output->sqld;
+
+		if (count != statement->metadata_count) {
+			return ib_fail(error, "cached output metadata does not match the result");
+		}
+		if (count != 0U) {
+			memcpy(cursor->metadata, statement->cached_metadata,
+				count * sizeof(*cursor->metadata));
+			memcpy(cursor->blob_charsets, statement->cached_blob_charsets,
+				count * sizeof(*cursor->blob_charsets));
+			memcpy(cursor->blob_charset_known, statement->cached_blob_charset_known,
+				count * sizeof(*cursor->blob_charset_known));
+		}
+		return 0;
+	}
 	if (cursor->statement_type == isc_info_sql_stmt_exec_procedure) {
 		return ib_procedure_metadata_catalog(cursor, cancel, generation, error);
 	}
 	return ib_metadata_catalog(cursor, cancel, generation, error);
+}
+
+/* ib_statement_cache_metadata runs the column-metadata enrichment of a
+ * prepared statement once, in the statement's transaction, and keeps a copy
+ * on the statement. The enrichment is optional: on failure nothing is cached
+ * and each execution enriches its own cursor, as before. */
+static void ib_statement_cache_metadata(ib_statement *statement)
+{
+	ib_cursor descriptor;
+	char *catalog_error;
+	size_t count;
+
+	if (statement == NULL || statement->output == NULL ||
+		statement->output->sqld < 0 || statement->connection == NULL ||
+		statement->connection->transaction == NULL) {
+		return;
+	}
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.connection = statement->connection;
+	descriptor.prepared = statement;
+	descriptor.transaction = statement->connection->transaction;
+	descriptor.statement_type = statement->statement_type;
+	catalog_error = NULL;
+	descriptor.output = ib_clone_sqlda(statement->output, &catalog_error);
+	if (descriptor.output == NULL ||
+		ib_cursor_describe_metadata(&descriptor, NULL, 0U, &catalog_error) != 0) {
+		free(catalog_error);
+		ib_cursor_free_parts(&descriptor);
+		return;
+	}
+	free(catalog_error);
+	count = (size_t) descriptor.output->sqld;
+	if (count != 0U) {
+		statement->cached_metadata = descriptor.metadata;
+		statement->cached_blob_charsets = descriptor.blob_charsets;
+		statement->cached_blob_charset_known = descriptor.blob_charset_known;
+		descriptor.metadata = NULL;
+		descriptor.blob_charsets = NULL;
+		descriptor.blob_charset_known = NULL;
+	}
+	statement->metadata_count = count;
+	statement->metadata_cached = 1;
+	ib_cursor_free_parts(&descriptor);
+}
+
+static void ib_statement_free_metadata_cache(ib_statement *statement)
+{
+	free(statement->cached_metadata);
+	free(statement->cached_blob_charsets);
+	free(statement->cached_blob_charset_known);
+	statement->cached_metadata = NULL;
+	statement->cached_blob_charsets = NULL;
+	statement->cached_blob_charset_known = NULL;
+	statement->metadata_count = 0U;
+	statement->metadata_cached = 0;
 }
 
 static void ib_failed_query_cleanup(ib_cursor *cursor, char **error)
@@ -6521,6 +6659,7 @@ static int ib_statement_close_internal(ib_statement *statement, char **error)
 	free(statement->query);
 	statement->query = NULL;
 	statement->query_length = 0U;
+	ib_statement_free_metadata_cache(statement);
 	ib_statement_unregister(statement);
 	statement->connection = NULL;
 	free(statement);
@@ -7294,6 +7433,90 @@ int ib_connection_transaction_info(ib_connection *connection, unsigned char item
 {
 	return ib_information_response(connection, item, 1, response,
 		response_length, error);
+}
+
+/* Requests several database information items in one isc_database_info call.
+ * The buffer starts at 512 bytes and doubles on isc_info_truncated up to
+ * SHRT_MAX, the limit of the API's short buffer length. Past that limit the
+ * call returns 2 so the caller can fall back to one item per call. */
+int ib_connection_database_info_items(ib_connection *connection,
+	const unsigned char *items, size_t item_count,
+	char **response, size_t *response_length, char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	char request[255];
+	char *buffer;
+	size_t capacity;
+	size_t cursor;
+	size_t payload_length;
+	int truncated;
+
+	if (response == NULL || response_length == NULL) {
+		return ib_fail(error, "information response storage is unavailable");
+	}
+	*response = NULL;
+	*response_length = 0U;
+	if (connection == NULL || connection->database == NULL || connection->broken) {
+		return ib_fail(error, "connection is unavailable");
+	}
+	if (items == NULL || item_count == 0U || item_count > 255U) {
+		return ib_fail(error, "invalid database information item list");
+	}
+	memcpy(request, items, item_count);
+	capacity = 512U;
+	for (;;) {
+		buffer = (char *) calloc(capacity, 1U);
+		if (buffer == NULL) {
+			return ib_fail(error, "out of memory allocating information response");
+		}
+		memset(status, 0, sizeof(status));
+		result = isc_database_info(status, &connection->database,
+			(short) item_count, request, (short) capacity, buffer);
+		if (result != 0) {
+			free(buffer);
+			return ib_fail_status(error, "database information", status);
+		}
+		/* Walk the item records to find the terminator; a record that
+		 * runs past the buffer or an explicit marker means truncation. */
+		truncated = 0;
+		cursor = 0U;
+		for (;;) {
+			if (cursor >= capacity) {
+				truncated = 1;
+				break;
+			}
+			if ((unsigned char) buffer[cursor] == isc_info_end) {
+				break;
+			}
+			if ((unsigned char) buffer[cursor] == isc_info_truncated ||
+				capacity - cursor < 3U) {
+				truncated = 1;
+				break;
+			}
+			payload_length = (size_t) (unsigned char) buffer[cursor + 1U] |
+				((size_t) (unsigned char) buffer[cursor + 2U] << 8U);
+			if (payload_length > capacity - cursor - 3U) {
+				truncated = 1;
+				break;
+			}
+			cursor += 3U + payload_length;
+		}
+		if (!truncated) {
+			*response = buffer;
+			*response_length = cursor + 1U;
+			return 0;
+		}
+		free(buffer);
+		if (capacity >= (size_t) SHRT_MAX) {
+			ib_fail(error, "information response exceeds the native limit");
+			return 2;
+		}
+		capacity *= 2U;
+		if (capacity > (size_t) SHRT_MAX) {
+			capacity = (size_t) SHRT_MAX;
+		}
+	}
 }
 
 ib_bindings *ib_bindings_new(size_t count, char **error)
@@ -8080,6 +8303,7 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 	statement->connection = connection;
 	statement->query = prepared_query;
 	statement->query_length = prepared_query_length;
+	statement->allow_arrays = allow_arrays != 0;
 	prepared_query = NULL;
 	prepare_transaction = NULL;
 	owns_transaction = 0;
@@ -8296,6 +8520,42 @@ int ib_statement_output_origin(const ib_statement *statement, size_t index,
 	*field_length = variable->sqlname_length > 0 ? (size_t) variable->sqlname_length : 0U;
 	if (*relation_length > METADATALENGTH || *field_length > METADATALENGTH) {
 		return ib_fail(error, "prepared output metadata name is too long");
+	}
+	return 0;
+}
+
+int ib_statement_output_metadata(const ib_statement *statement, size_t index,
+	ib_output_metadata *metadata, const char **name, size_t *name_length,
+	char **error)
+{
+	const XSQLVAR *variable;
+	short alias_length;
+
+	if (statement == NULL || statement->output == NULL || metadata == NULL ||
+		name == NULL || name_length == NULL || statement->output->sqld < 0 ||
+		index >= (size_t) statement->output->sqld) {
+		return ib_fail(error, "invalid prepared output metadata index");
+	}
+	variable = &statement->output->sqlvar[index];
+	metadata->sql_type = ib_sql_type(variable);
+	metadata->sql_subtype = variable->sqlsubtype;
+	metadata->sql_scale = variable->sqlscale;
+	metadata->length = variable->sqllen;
+	metadata->nullable = (variable->sqltype & 1) != 0;
+	alias_length = variable->aliasname_length;
+	if (alias_length > METADATALENGTH) {
+		alias_length = METADATALENGTH;
+	}
+	if (alias_length > 0) {
+		*name = variable->aliasname;
+		*name_length = (size_t) alias_length;
+	} else {
+		alias_length = variable->sqlname_length;
+		if (alias_length > METADATALENGTH) {
+			alias_length = METADATALENGTH;
+		}
+		*name = variable->sqlname;
+		*name_length = alias_length > 0 ? (size_t) alias_length : 0U;
 	}
 	return 0;
 }
@@ -8532,8 +8792,10 @@ ib_cursor *ib_statement_query(ib_statement *statement,
 	} else {
 		cursor->owns_transaction = 1;
 	}
+	cursor->allow_arrays = statement->allow_arrays;
 	cursor->input = ib_clone_sqlda(statement->input, error);
-	if (cursor->input == NULL || ib_bind_input(cursor, bindings, error) != 0) {
+	if (cursor->input == NULL ||
+		ib_bind_input_mode(cursor, bindings, cursor->allow_arrays, error) != 0) {
 		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
 		return NULL;
@@ -8541,7 +8803,7 @@ ib_cursor *ib_statement_query(ib_statement *statement,
 	cursor->output = ib_clone_sqlda(statement->output, error);
 	if (cursor->output == NULL || ib_cursor_describe_metadata(cursor, cancel,
 		generation, error) != 0 ||
-		ib_validate_output_types(cursor->output, error) != 0 ||
+		ib_validate_output_types_mode(cursor->output, cursor->allow_arrays, error) != 0 ||
 		ib_allocate_output(cursor, error) != 0) {
 		ib_cancel_slot_complete(cancel, generation);
 		ib_failed_query_cleanup(cursor, error);
@@ -10073,6 +10335,7 @@ ib_statement *ib_transaction_prepare(ib_transaction *transaction,
 	}
 	statement = ib_statement_prepare_mode(&transaction->view, query, query_length,
 		allow_arrays, cancel, generation, error);
+	ib_statement_cache_metadata(statement);
 	ib_transaction_sync(transaction);
 	return statement;
 }

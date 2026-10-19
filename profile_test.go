@@ -108,12 +108,12 @@ func TestProfilePanicReleasesNativeGate(t *testing.T) {
 
 func testProfilePanicReleasesNativeGateInChild(t *testing.T) {
 	native := introspectionTestNative(3)
-	native.databaseInfoOverride = func(code byte) ([]byte, error) {
+	native.databaseInfoItemsOverride = perCodeInfoItems(func(code byte) ([]byte, error) {
 		if (code >= 5 && code <= 8) || (code >= 23 && code <= 30) {
 			return introspectionInfoPayload(code, nil), nil
 		}
 		return nil, errors.New("unexpected database information code")
-	}
+	})
 	native.beginTransactionOverride = func([]byte) (*nativeTransaction, error) {
 		return &nativeTransaction{
 			prepareContextOverride: func(string, bool, *nativeCancelOperation) (*nativeStatement, error) {

@@ -16,17 +16,28 @@ const (
 )
 
 type token struct {
-	kind  tokenKind
-	text  string
-	start int
-	end   int
-	line  int
-	depth int
+	kind   tokenKind
+	text   string
+	start  int // byte offset
+	end    int
+	line   int // 1-based
+	column int // 1-based byte column within line
+	depth  int
 }
 
 func lex(input string) []token {
+	return lexDialect(input, 3)
+}
+
+// lexDialect tokenizes input; in SQL dialect 1 double-quoted text is a string
+// literal rather than a quoted identifier.
+func lexDialect(input string, dialect int) []token {
 	tokens := make([]token, 0)
-	line, depth := 1, 0
+	line, lineStart, depth := 1, 0, 0
+	quotedKind := tokenQuotedIdentifier
+	if dialect == 1 {
+		quotedKind = tokenString
+	}
 
 	for i := 0; i < len(input); {
 		if input[i] == '-' && i+1 < len(input) && input[i+1] == '-' {
@@ -47,63 +58,65 @@ func lex(input string) []token {
 			} else {
 				i = len(input)
 			}
-			line = countLines(input, start, i, line)
+			line, lineStart = countLines(input, start, i, line, lineStart)
 			continue
 		}
 
 		if isASCIIWhitespace(input[i]) {
 			start := i
 			i++
-			line = countLines(input, start, i, line)
+			line, lineStart = countLines(input, start, i, line, lineStart)
 			continue
 		}
 
-		start, tokenLine := i, line
+		start, tokenLine, tokenColumn := i, line, i-lineStart+1
+		add := func(kind tokenKind, text string, end, depth int) {
+			tokens = append(tokens, token{kind: kind, text: text, start: start, end: end, line: tokenLine, column: tokenColumn, depth: depth})
+		}
 		switch input[i] {
 		case '\'':
 			text, next := readDelimited(input, i, '\'')
-			line = countLines(input, i, next, line)
-			tokens = append(tokens, token{kind: tokenString, text: text, start: i, end: next, line: tokenLine, depth: depth})
+			line, lineStart = countLines(input, i, next, line, lineStart)
+			add(tokenString, text, next, depth)
 			i = next
 		case '"':
 			text, next := readDelimited(input, i, '"')
-			line = countLines(input, i, next, line)
-			tokens = append(tokens, token{kind: tokenQuotedIdentifier, text: text, start: i, end: next, line: tokenLine, depth: depth})
+			line, lineStart = countLines(input, i, next, line, lineStart)
+			add(quotedKind, text, next, depth)
 			i = next
 		case ':':
 			if i+1 < len(input) && isIdentifierStartAt(input, i+1) {
 				i++
 				nameStart := i
 				i = scanIdentifier(input, i)
-				tokens = append(tokens, token{kind: tokenParameter, text: input[nameStart:i], start: start, end: i, line: tokenLine, depth: depth})
+				add(tokenParameter, input[nameStart:i], i, depth)
 			} else {
 				i++
-				tokens = append(tokens, token{kind: tokenPunctuation, text: input[start:i], start: start, end: i, line: tokenLine, depth: depth})
+				add(tokenPunctuation, input[start:i], i, depth)
 			}
 		case '(':
 			i++
-			tokens = append(tokens, token{kind: tokenPunctuation, text: "(", start: start, end: i, line: tokenLine, depth: depth})
+			add(tokenPunctuation, "(", i, depth)
 			depth++
 		case ')':
-			tokenDepth := depth
 			i++
-			tokens = append(tokens, token{kind: tokenPunctuation, text: ")", start: start, end: i, line: tokenLine, depth: tokenDepth})
+			add(tokenPunctuation, ")", i, depth)
 			if depth > 0 {
 				depth--
 			}
 		default:
 			if isIdentifierStartAt(input, i) {
 				i = scanIdentifier(input, i)
-				tokens = append(tokens, token{kind: tokenIdentifier, text: input[start:i], start: start, end: i, line: tokenLine, depth: depth})
+				add(tokenIdentifier, input[start:i], i, depth)
 			} else if input[i] >= '0' && input[i] <= '9' {
 				i++
 				for i < len(input) && input[i] >= '0' && input[i] <= '9' {
 					i++
 				}
-				tokens = append(tokens, token{kind: tokenNumber, text: input[start:i], start: start, end: i, line: tokenLine, depth: depth})
+				add(tokenNumber, input[start:i], i, depth)
 			} else {
 				i++
-				tokens = append(tokens, token{kind: tokenPunctuation, text: input[start:i], start: start, end: i, line: tokenLine, depth: depth})
+				add(tokenPunctuation, input[start:i], i, depth)
 			}
 		}
 	}
@@ -191,6 +204,17 @@ func normalizedName(t token) string {
 	return asciiUpper(t.text)
 }
 
+// NormalizeName normalizes a caller-supplied object name as a name in PSQL
+// text is normalized: upper-cased unless double-quoted, in which case the
+// quotes are removed and the name kept exactly.
+func NormalizeName(name string) string {
+	name = strings.TrimSpace(name)
+	if tokens := lex(name); len(tokens) == 1 && isNameToken(tokens[0]) {
+		return normalizedName(tokens[0])
+	}
+	return asciiUpper(name)
+}
+
 func asciiUpper(value string) string {
 	bytes := []byte(value)
 	for i, b := range bytes {
@@ -220,16 +244,20 @@ func asciiEqualFold(left, right string) bool {
 	return true
 }
 
-func countLines(input string, start, end, line int) int {
+// countLines advances line and the byte offset where it starts over
+// input[start:end]; CRLF, LF and a lone CR each end a line.
+func countLines(input string, start, end, line, lineStart int) (int, int) {
 	for i := start; i < end; i++ {
 		switch input[i] {
 		case '\n':
 			line++
+			lineStart = i + 1
 		case '\r':
 			if i+1 >= len(input) || input[i+1] != '\n' {
 				line++
+				lineStart = i + 1
 			}
 		}
 	}
-	return line
+	return line, lineStart
 }

@@ -10,6 +10,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // TableCounters contains cumulative record activity for one relation.
@@ -59,6 +60,18 @@ func ReadActivity(ctx context.Context, pooled *sql.Conn) (Activity, error) {
 	return result, nil
 }
 
+var (
+	errInfoTruncated        = errors.New("interbase: information response is truncated")
+	errInfoResponseTooLarge = errors.New("interbase: information response exceeds the native limit")
+	errInfoItemUnsupported  = errors.New("interbase: information request returned an error item")
+)
+
+var (
+	pageActivityCodes     = []byte{5, 6, 7, 8}
+	relationActivityCodes = []byte{23, 24, 25, 26, 27, 28, 29, 30}
+	activityInfoCodes     = append(append([]byte(nil), pageActivityCodes...), relationActivityCodes...)
+)
+
 // readActivity reads the cumulative activity counters from the attachment.
 // It intentionally does not open a transaction so callers can bracket their
 // own execute/fetch steps with short snapshots.
@@ -68,39 +81,51 @@ func (c *conn) readActivity(ctx context.Context) (Activity, error) {
 	}
 	c.lockDirect()
 	defer c.mu.Unlock()
+	return c.readActivityLocked(ctx)
+}
+
+// readActivityLocked is readActivity for a caller that already holds the
+// connection lock. It issues one native info call.
+func (c *conn) readActivityLocked(ctx context.Context) (Activity, error) {
+	activity, _, err := c.readActivitySnapshotLocked(ctx)
+	return activity, err
+}
+
+// readActivitySnapshotLocked is readActivityLocked that also reports whether
+// the server returned every page counter item; absent items read as zero.
+func (c *conn) readActivitySnapshotLocked(ctx context.Context) (Activity, bool, error) {
+	if err := contextError(ctx); err != nil {
+		return Activity{}, false, err
+	}
 	if c.closed || c.native == nil || c.native.broken() {
-		return Activity{}, driver.ErrBadConn
+		return Activity{}, false, driver.ErrBadConn
 	}
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
-		return Activity{}, err
+		return Activity{}, false, err
 	}
 	defer releaseNative()
 
-	readInfo := func(code byte) (InfoItem, error) {
-		if err := contextError(ctx); err != nil {
-			return InfoItem{}, err
-		}
-		response, err := c.native.databaseInfo(code)
-		if err != nil {
-			return InfoItem{}, fmt.Errorf("interbase: activity counter info %d: %w", code,
-				c.sanitizeError("activity counters", err))
-		}
-		if len(response) == 1 && response[0] == infoEnd {
-			if err := contextError(ctx); err != nil {
-				return InfoItem{}, err
-			}
-			return InfoItem{Code: code}, nil
-		}
-		item, err := parseInfoItem(response, code)
-		if err != nil {
-			return InfoItem{}, err
-		}
-		if err := contextError(ctx); err != nil {
-			return InfoItem{}, err
-		}
-		return item, nil
+	items, err := c.readActivityItems(ctx)
+	if err != nil {
+		return Activity{}, false, err
 	}
+	if err := contextError(ctx); err != nil {
+		return Activity{}, false, err
+	}
+	complete := true
+	for _, code := range pageActivityCodes {
+		if _, ok := items[code]; !ok {
+			complete = false
+		}
+	}
+	activity, err := decodeActivityItems(items)
+	return activity, complete, err
+}
+
+// decodeActivityItems decodes page and relation counters from info items.
+func decodeActivityItems(items map[byte]InfoItem) (Activity, error) {
+	var err error
 
 	activity := Activity{
 		Tables: make(map[int]TableCounters),
@@ -115,10 +140,7 @@ func (c *conn) readActivity(ctx context.Context) (Activity, error) {
 		{code: 7, set: func(value int64) { activity.Pages.Fetches = value }},
 		{code: 8, set: func(value int64) { activity.Pages.Marks = value }},
 	} {
-		response, err := readInfo(item.code)
-		if err != nil {
-			return Activity{}, err
-		}
+		response := items[item.code]
 		var value uint64
 		if len(response.Data) != 0 {
 			value, err = response.Uint64()
@@ -145,11 +167,7 @@ func (c *conn) readActivity(ctx context.Context) (Activity, error) {
 		{code: 29, set: func(counters *TableCounters, value int64) { counters.Purges = value }},
 		{code: 30, set: func(counters *TableCounters, value int64) { counters.Expunges = value }},
 	} {
-		response, err := readInfo(item.code)
-		if err != nil {
-			return Activity{}, err
-		}
-		counts, err := parseRelationCounts(response.Data)
+		counts, err := parseRelationCounts(items[item.code].Data)
 		if err != nil {
 			return Activity{}, fmt.Errorf("interbase: decode activity counter %d: %w", item.code, err)
 		}
@@ -160,6 +178,117 @@ func (c *conn) readActivity(ctx context.Context) (Activity, error) {
 		}
 	}
 	return activity, nil
+}
+
+// readActivityItems fetches all activity items in one native call. Items the
+// server omits are absent from the result and read as zero. When the combined
+// response exceeds the native buffer limit it falls back to one call per
+// item, and remembers that for the connection: the response only grows, so
+// later snapshots go straight to per-item reads.
+func (c *conn) readActivityItems(ctx context.Context) (map[byte]InfoItem, error) {
+	if !c.activityPerItem {
+		response, err := c.native.databaseInfoItems(activityInfoCodes)
+		if err == nil {
+			return parseInfoItems(response, activityInfoCodes)
+		}
+		if !errors.Is(err, errInfoResponseTooLarge) {
+			return nil, fmt.Errorf("interbase: activity counter info: %w", c.sanitizeError("activity counters", err))
+		}
+		c.activityPerItem = true
+	}
+	items := make(map[byte]InfoItem, len(activityInfoCodes))
+	for _, code := range activityInfoCodes {
+		if err := contextError(ctx); err != nil {
+			return nil, err
+		}
+		single, err := c.native.databaseInfoItems([]byte{code})
+		if err != nil {
+			return nil, fmt.Errorf("interbase: activity counter info %d: %w", code,
+				c.sanitizeError("activity counters", err))
+		}
+		parsed, err := parseInfoItems(single, []byte{code})
+		if err != nil {
+			return nil, err
+		}
+		for key, item := range parsed {
+			items[key] = item
+		}
+	}
+	return items, nil
+}
+
+// probeRoundTrip times one minimal single-item info call (isc_info_reads) as a
+// network baseline. The caller holds the connection lock. Only the native call
+// is timed.
+func (c *conn) probeRoundTrip(ctx context.Context) (time.Duration, error) {
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
+	if c.closed || c.native == nil || c.native.broken() {
+		return 0, driver.ErrBadConn
+	}
+	releaseNative, err := enterNativeContext(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer releaseNative()
+
+	_, elapsed, err := c.native.databaseInfoItemsTimed([]byte{pageActivityCodes[0]})
+	if err != nil {
+		return 0, fmt.Errorf("interbase: round-trip probe: %w", c.sanitizeError("round-trip probe", err))
+	}
+	if err := contextError(ctx); err != nil {
+		return 0, err
+	}
+	return elapsed, nil
+}
+
+// parseInfoItems parses a multi-item database information response into a map
+// keyed by item code. Only the requested codes are accepted; a requested item
+// the server omitted is simply absent. A truncated response is reported as
+// errInfoTruncated.
+func parseInfoItems(response []byte, codes []byte) (map[byte]InfoItem, error) {
+	if len(response) == 0 {
+		return nil, errors.New("interbase: empty information response")
+	}
+	requested := make(map[byte]struct{}, len(codes))
+	for _, code := range codes {
+		requested[code] = struct{}{}
+	}
+	items := make(map[byte]InfoItem, len(codes))
+	position := 0
+	for position < len(response) && response[position] != infoEnd {
+		code := response[position]
+		switch code {
+		case infoTruncated:
+			return nil, errInfoTruncated
+		case infoError:
+			return nil, errInfoItemUnsupported
+		}
+		if _, ok := requested[code]; !ok {
+			return nil, fmt.Errorf("interbase: information response code %d was not requested", code)
+		}
+		if _, duplicate := items[code]; duplicate {
+			return nil, fmt.Errorf("interbase: information response repeats item %d", code)
+		}
+		if len(response)-position < 3 {
+			return nil, errors.New("interbase: malformed information response header")
+		}
+		start := position + 3
+		end := start + int(binary.LittleEndian.Uint16(response[position+1:position+3]))
+		if end > len(response) {
+			return nil, errors.New("interbase: malformed information response length")
+		}
+		items[code] = InfoItem{Code: code, Data: append([]byte(nil), response[start:end]...)}
+		position = end
+	}
+	if position >= len(response) {
+		return nil, errors.New("interbase: information response has no terminator")
+	}
+	if position+1 != len(response) {
+		return nil, errors.New("interbase: information response contains trailing data")
+	}
+	return items, nil
 }
 
 func parseRelationCounts(item []byte) (map[int]int64, error) {

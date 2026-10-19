@@ -254,7 +254,7 @@ func FuzzInformationResponseParsing(f *testing.F) {
 				t.Fatalf("parsed item = %#v for request %d", item, requested)
 			}
 		}
-		items, err := parseInfoItems(response, requested)
+		items, err := parseRepeatedInfoItems(response, requested)
 		if err == nil {
 			if len(items) == 0 {
 				t.Fatal("parseInfoItems returned no items without an error")

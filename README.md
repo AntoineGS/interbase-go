@@ -213,6 +213,60 @@ attachment:
 - `PlanRoutine(ctx, conn, ref)` derives prepare-only plans for stored-routine statements.
 - `Profile(ctx, conn, query, options)` times one execution, discards fetched rows, and always rolls back.
 
+### Line profiling
+
+`AnalyzeLineProfile` and `LineProfile` measure a stored procedure per source
+line. The profiler does not use server-side tracing: it parses the procedure
+body (`psql`) and re-executes it statement by statement on the client,
+evaluating control flow, variables and expressions locally and sending each
+SQL statement to the server, so every line gets its own timings and counters.
+
+```go
+analysis, err := interbase.AnalyzeLineProfile(ctx, conn, "SELECT * FROM MY_PROC(1)", 3, nil)
+// analysis.Problems lists reasons the routine cannot be emulated;
+// analysis.MayWrite tells whether the run needs a read-write transaction.
+result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
+	SQL: "SELECT * FROM MY_PROC(1)", Dialect: 3, ReadOnly: !analysis.MayWrite,
+})
+```
+
+- `AnalyzeLineProfile` never executes routine code. It reads metadata in a
+  short read-only transaction and returns problems (unsupported constructs
+  such as `EXECUTE STATEMENT`), the callees and `MayWrite`.
+- The entry statement is `EXECUTE PROCEDURE p [(args)]` or
+  `SELECT * | columns FROM p [(args)]` with constant arguments.
+- Measurements are per node, per line and per routine. `Adjusted` time is
+  `Raw` time minus the measured round-trip baseline of the attachment
+  (`Before`/`After` probes), so it approximates server time. Counters (server
+  calls, round trips, rows, pages, per-table activity) are those of this
+  attachment only. Work done by the profiler itself (prepares, savepoints,
+  snapshots, setup, BLOB reads) is reported in separate overhead buckets and
+  never counted in line metrics.
+- Transaction envelope: read-committed, read-only unless the analysis says the
+  routine may write, and always rolled back. Effects that are not
+  transactional, such as generator increments, external tables, events and
+  UDFs with side effects, are not undone.
+- `StepInto` lists procedures to emulate when called in a supported shape, so
+  their lines are profiled too; other calls run natively and are reported in
+  `NativeCallSites`.
+- Limitations: the emulator covers the supported PSQL subset; unsupported
+  routines are refused up front with line and column. A run ends as
+  `completed`, `failed` (with `FailedAt`) or `canceled` (context done).
+- The profiler prepares each statement once per run with
+  `Transaction.Prepare` and re-executes the returned `PreparedStatement`
+  (`Exec`, `Query`, `Outputs`, `Close`) with new parameters. Callers can use
+  the same API directly to run a statement repeatedly in one transaction
+  without preparing it again.
+
+Live checks are env-gated; see `lineprofile_live_test.go` for
+`INTERBASE_LP_CORPUS`, `INTERBASE_LP_SQL`, `INTERBASE_LP_STEP_INTO` and
+`INTERBASE_LP_IGNORE_COLUMNS` (output columns excluded from the comparison with
+a native, rolled-back run, such as generator-fed identifiers). They connect
+with `INTERBASE_DATABASE`, `INTERBASE_USER`, `INTERBASE_PASSWORD`, optional
+`INTERBASE_DIALECT` and optional `INTERBASE_CHARSET`, the connection character
+set (for example `NONE`, so that text is compared as the stored bytes; empty
+uses the driver default, UTF-8).
+
 ### Explicit direct API
 
 Use `Open` when the application needs an explicitly owned attachment and the

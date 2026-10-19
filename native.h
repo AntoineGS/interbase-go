@@ -168,6 +168,14 @@ typedef struct ib_input_metadata {
 	int nullable;
 } ib_input_metadata;
 
+typedef struct ib_output_metadata {
+	int sql_type;
+	int sql_subtype;
+	int sql_scale;
+	int length;
+	int nullable;
+} ib_output_metadata;
+
 ib_connection *ib_connection_open(const char *database, size_t database_length,
 	const char *user, size_t user_length, const char *password,
 	size_t password_length, const char *role, size_t role_length,
@@ -207,6 +215,9 @@ int ib_connection_rollback_retaining(ib_connection *connection, char **error);
 int ib_connection_database_info(ib_connection *connection, uint8_t item,
 	char **response, size_t *response_length, char **error);
 int ib_connection_transaction_info(ib_connection *connection, uint8_t item,
+	char **response, size_t *response_length, char **error);
+int ib_connection_database_info_items(ib_connection *connection,
+	const unsigned char *items, size_t item_count,
 	char **response, size_t *response_length, char **error);
 
 ib_transaction *ib_transaction_begin(ib_connection *connection,
@@ -304,6 +315,9 @@ int ib_statement_num_output(const ib_statement *statement);
 int ib_statement_output_origin(const ib_statement *statement, size_t index,
 	const char **relation, size_t *relation_length,
 	const char **field, size_t *field_length, char **error);
+int ib_statement_output_metadata(const ib_statement *statement, size_t index,
+	ib_output_metadata *metadata, const char **name, size_t *name_length,
+	char **error);
 int ib_statement_exec(ib_statement *statement, const ib_bindings *bindings,
 	ib_cancel_slot *cancel, uint64_t generation, int64_t *rows_affected,
 	char **error);
