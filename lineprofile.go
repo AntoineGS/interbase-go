@@ -372,6 +372,8 @@ func beginRun(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileOption
 // rollback failure.
 func warmUp(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileOptions, columns []string,
 	stepInto map[string]bool, rolledBack *bool) (outcomeErr, txErr error) {
+	// Before is left zero on purpose: the pass's classification is discarded,
+	// and sharing the measured baseline would leak into it.
 	discarded := &LineProfileResult{
 		ReadOnly: opts.ReadOnly, Columns: columns,
 		Routines: []LineProfileRoutine{newRoutineProfile(plan.entry)},

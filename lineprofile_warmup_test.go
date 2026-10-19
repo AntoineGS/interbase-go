@@ -13,11 +13,13 @@ import (
 // each begin ("begin ro" or "begin rw"), each rollback and the first info
 // call (baseline probe or snapshot) after another event.
 type lineProfileWarmUpFake struct {
-	conn   *conn
-	events []string
-	counts []*lineProfileFakeCounts
-	execs  [][]string // statements executed per transaction
-	rows   int
+	conn      *conn
+	events    []string
+	counts    []*lineProfileFakeCounts
+	execs     [][]string // statements executed per transaction
+	rows      int
+	infoCalls int
+	beginErr  error // fails the first begin
 	// warmUpNext, when set, replaces the first transaction's fetch;
 	// warmUpExec its exec.
 	warmUpNext func() (bool, error)
@@ -28,17 +30,32 @@ func newLineProfileWarmUpFake() *lineProfileWarmUpFake {
 	f := &lineProfileWarmUpFake{rows: 2}
 	native := &nativeConnection{
 		brokenOverride: func() bool { return false },
+		// The page counters grow with every info call, so a delta of the
+		// warm-up pass leaking into the measured result would show.
 		databaseInfoItemsOverride: func(codes []byte) ([]byte, error) {
 			if n := len(f.events); n > 0 && f.events[n-1] != "info" {
 				f.events = append(f.events, "info")
 			}
-			return lineProfileAllPagesInfo(codes)
+			f.infoCalls++
+			var items [][]byte
+			for _, code := range codes {
+				if code < 5 || code > 8 {
+					continue
+				}
+				items = append(items, infoItemRecord(code, byte(f.infoCalls), byte(f.infoCalls>>8), 0, 0))
+			}
+			return infoItemsFrame(items...), nil
 		},
 	}
 	native.beginTransactionOverride = func(tpb []byte) (*nativeTransaction, error) {
 		mode := "begin rw"
 		if len(tpb) > 1 && tpb[1] == 8 {
 			mode = "begin ro"
+		}
+		if f.beginErr != nil && len(f.counts) == 0 {
+			err := f.beginErr
+			f.beginErr = nil
+			return nil, err
 		}
 		f.events = append(f.events, mode)
 		index := len(f.counts)
@@ -214,5 +231,20 @@ func TestLineProfileWarmUpCancelEndsTheCall(t *testing.T) {
 		if node.Metrics.Hits != 0 {
 			t.Fatalf("node %d keeps warm-up hits %d", node.ID, node.Metrics.Hits)
 		}
+	}
+}
+
+func TestLineProfileWarmUpBeginFailureContinuesTheRun(t *testing.T) {
+	f := newLineProfileWarmUpFake()
+	f.beginErr = errors.New("LP warm-up begin failure")
+	result, outcomeErr, err := f.run(t, context.Background(), LineProfileOptions{WarmUp: true})
+	if outcomeErr != nil || err != nil {
+		t.Fatalf("run = %v, %v; want the measured run to go on", outcomeErr, err)
+	}
+	if result.WarmUpErr == nil || !strings.Contains(result.WarmUpErr.Error(), "LP warm-up begin failure") {
+		t.Fatalf("WarmUpErr = %v", result.WarmUpErr)
+	}
+	if len(f.counts) != 1 || !f.counts[0].rolledBack || result.Rows != 2 || !result.RolledBack {
+		t.Fatalf("transactions %d, rows %d, rolled back %v", len(f.counts), result.Rows, result.RolledBack)
 	}
 }
