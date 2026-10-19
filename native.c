@@ -3721,6 +3721,29 @@ static int ib_blob_lookup_bind_descriptor(ib_cursor *cursor, size_t parameter_in
 	return ib_blob_lookup_descriptor(cursor, &destination, descriptor, error);
 }
 
+/* ib_cursor_known_blob_charset reports the text BLOB character set the
+ * procedure catalog supplied for an output column, if any. */
+static int ib_cursor_known_blob_charset(const ib_cursor *cursor,
+	const XSQLVAR *variable, short *charset)
+{
+	short index;
+
+	if (cursor == NULL || cursor->output == NULL || cursor->blob_charsets == NULL ||
+		cursor->blob_charset_known == NULL || variable == NULL) {
+		return 0;
+	}
+	for (index = 0; index < cursor->output->sqld; index++) {
+		if (&cursor->output->sqlvar[index] == variable) {
+			if (cursor->blob_charset_known[index] == 0) {
+				return 0;
+			}
+			*charset = cursor->blob_charsets[index];
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int ib_cursor_blob_ref(ib_cursor *cursor, const XSQLVAR *variable,
 	ib_value_view *view, char **error)
 {
@@ -3756,6 +3779,9 @@ static int ib_cursor_blob_ref(ib_cursor *cursor, const XSQLVAR *variable,
 		} else {
 			ib_blob_descriptor(&descriptor, variable->sqlsubtype, 0);
 		}
+	} else if (variable->sqlsubtype == 1 &&
+		ib_cursor_known_blob_charset(cursor, variable, &blob_charset)) {
+		ib_blob_descriptor(&descriptor, 1, blob_charset);
 	} else if (variable->sqlname_length > 0 && variable->relname_length > 0) {
 		if (ib_blob_lookup_descriptor(cursor, variable, &descriptor, error) != 0) {
 			return -1;
@@ -5925,7 +5951,7 @@ static int ib_procedure_catalog_apply_row(ib_cursor *cursor,
 }
 
 static int ib_catalog_apply_row(ib_cursor *cursor, const ib_cursor *catalog,
-	char **error)
+	unsigned char *matched, char **error)
 {
 	char relation[METADATALENGTH + 1U];
 	char field[METADATALENGTH + 1U];
@@ -6029,6 +6055,9 @@ static int ib_catalog_apply_row(ib_cursor *cursor, const ib_cursor *catalog,
 			memcmp(source_field, field, field_length) != 0) {
 			continue;
 		}
+		if (matched != NULL) {
+			matched[index] = 1;
+		}
 		cursor->metadata[index].sql_type = ib_metadata_type_code(sql_type);
 		cursor->metadata[index].sql_subtype = field_subtype;
 		if ((sql_type == SQL_TEXT || sql_type == SQL_VARYING) &&
@@ -6059,8 +6088,14 @@ static int ib_catalog_apply_row(ib_cursor *cursor, const ib_cursor *catalog,
 	return 0;
 }
 
+/* ib_procedure_metadata_catalog reads procedure output parameters from the
+ * catalog. With relation_matched (a SELECT), only text BLOB columns that no
+ * relation catalog row matched are looked up: those are outputs of a
+ * selectable procedure, whose character set isc_blob_lookup_desc2 cannot
+ * resolve because it only knows relation fields. */
 static int ib_procedure_metadata_catalog(ib_cursor *cursor,
-	ib_cancel_slot *cancel, uint64_t generation, char **error)
+	const unsigned char *relation_matched, ib_cancel_slot *cancel,
+	uint64_t generation, char **error)
 {
 	char *catalog_query;
 	size_t catalog_query_length;
@@ -6093,6 +6128,10 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 		int fatal_error;
 		XSQLVAR *variable = &cursor->output->sqlvar[index];
 
+		if (relation_matched != NULL && (relation_matched[index] ||
+			ib_sql_type(variable) != SQL_BLOB || variable->sqlsubtype != 1)) {
+			continue;
+		}
 		procedure_result = ib_descriptor_name(variable->relname,
 			variable->relname_length, procedure_name, sizeof(procedure_name),
 			&procedure_name_length, error);
@@ -6266,8 +6305,8 @@ procedure_catalog_done:
 	return 0;
 }
 
-static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
-	uint64_t generation, char **error)
+static int ib_metadata_catalog(ib_cursor *cursor, unsigned char *matched,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	char **relation_names;
 	size_t *relation_lengths;
@@ -6405,7 +6444,8 @@ static int ib_metadata_catalog(ib_cursor *cursor, ib_cancel_slot *cancel,
 		if (has_row == 0) {
 			break;
 		}
-		if (ib_catalog_apply_row(cursor, catalog_cursor, &catalog_error) != 0) {
+		if (ib_catalog_apply_row(cursor, catalog_cursor, matched,
+			&catalog_error) != 0) {
 			result = -1;
 			fatal_error = fatal_error ||
 				ib_catalog_error_requires_propagation(catalog_error);
@@ -6490,9 +6530,41 @@ static int ib_cursor_describe_metadata(ib_cursor *cursor, ib_cancel_slot *cancel
 		return 0;
 	}
 	if (cursor->statement_type == isc_info_sql_stmt_exec_procedure) {
-		return ib_procedure_metadata_catalog(cursor, cancel, generation, error);
+		return ib_procedure_metadata_catalog(cursor, NULL, cancel, generation,
+			error);
 	}
-	return ib_metadata_catalog(cursor, cancel, generation, error);
+	{
+		unsigned char *matched;
+		int result;
+		short index;
+		int has_candidate;
+
+		matched = NULL;
+		if (cursor->output->sqld > 0) {
+			matched = (unsigned char *) calloc((size_t) cursor->output->sqld,
+				sizeof(*matched));
+			if (matched == NULL) {
+				return ib_fail(error, "out of memory allocating catalog matches");
+			}
+		}
+		result = ib_metadata_catalog(cursor, matched, cancel, generation, error);
+		has_candidate = 0;
+		for (index = 0; result == 0 && index < cursor->output->sqld; index++) {
+			const XSQLVAR *variable = &cursor->output->sqlvar[index];
+
+			if (!matched[index] && ib_sql_type(variable) == SQL_BLOB &&
+				variable->sqlsubtype == 1 && variable->relname_length > 0 &&
+				variable->sqlname_length > 0) {
+				has_candidate = 1;
+			}
+		}
+		if (has_candidate) {
+			result = ib_procedure_metadata_catalog(cursor, matched, cancel,
+				generation, error);
+		}
+		free(matched);
+		return result;
+	}
 }
 
 /* ib_statement_cache_metadata runs the column-metadata enrichment of a
@@ -9749,7 +9821,11 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	if (override_charset == 0 && variable->sqlsubtype == 1 &&
 		variable->sqlname_length > 0 &&
 		variable->relname_length > 0) {
-		if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
+		short known_charset;
+
+		if (ib_cursor_known_blob_charset(cursor, variable, &known_charset)) {
+			ib_blob_descriptor(&source_descriptor, 1, known_charset);
+		} else if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
 			error) != 0) {
 			return NULL;
 		}
