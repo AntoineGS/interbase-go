@@ -1383,3 +1383,30 @@ func TestLineProfileExceedsPrecision(t *testing.T) {
 		}
 	}
 }
+
+// TestLineProfileBlobConversionMessage checks the -413 message of a date or
+// time assigned to a BLOB variable, written as the server writes the value
+// (probed natively, dialects 1 and 3).
+func TestLineProfileBlobConversionMessage(t *testing.T) {
+	at := time.Date(2020, 1, 2, 3, 4, 5, 123400000, time.UTC)
+	midnight := time.Date(2020, 1, 2, 0, 0, 0, 0, time.UTC)
+	clock := time.Date(1900, 1, 1, 3, 4, 5, 123400000, time.UTC)
+	for _, tt := range []struct {
+		value   time.Time
+		word    string
+		dialect int
+		want    string
+	}{
+		{midnight, "DATE", 3, `"2020-01-02"`},
+		{at, "TIMESTAMP", 3, `"2020-01-02 03:04:05.1234"`},
+		{clock, "TIME", 3, `"03:04:05.1234"`},
+		{midnight, "DATE", 1, `"2-JAN-2020"`},
+		{at, "DATE", 1, `"2-JAN-2020 3:04:05.1234"`},
+	} {
+		var nativeErr *Error
+		if err := errBlobConversion(tt.value, tt.word, tt.dialect); !errors.As(err, &nativeErr) ||
+			nativeErr.Message != "conversion error from string "+tt.want || nativeErr.SQLCode != -413 {
+			t.Errorf("%s dialect %d: %v, want message with %s", tt.word, tt.dialect, err, tt.want)
+		}
+	}
+}

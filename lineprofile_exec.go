@@ -432,7 +432,10 @@ func (r *lpRun) catchable(err error) bool {
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
-// matches reports whether one of h's conditions matches err.
+// matches reports whether one of h's conditions matches err. WHEN GDSCODE
+// matches the first status code only, as InterBase does (verified natively:
+// the second code of a user exception, isc_random, or of a transliteration
+// failure is not matched).
 func (r *lpRun) matches(h *psql.Handler, err error) bool {
 	var nativeErr *Error
 	if !errors.As(err, &nativeErr) {
@@ -690,7 +693,22 @@ func (r *lpRun) execProcedure(f *lpFrame, n *psql.Node, node *LineProfileNode) e
 	if len(rows) == 0 || len(n.Returning) == 0 {
 		return nil
 	}
-	return r.assignRow(f, node, n.Returning, rows[0], outputs, nil)
+	row := rows[0]
+	if len(n.Returning) > len(row) || len(row) != len(outputs) {
+		return fmt.Errorf("interbase: line profile: %d targets for %d columns", len(n.Returning), len(row))
+	}
+	// The outputs are parameters: a BLOB one is held as in a variable.
+	for i, name := range n.Returning {
+		if target, ok := f.vars[name]; ok && outputs[i].Kind == "BLOB" {
+			if err := blobVariableInto(cellValue(row[i]), "BLOB", target); err != nil {
+				return err
+			}
+		}
+		if err := r.assign(f, node, name, cellValue(row[i]), outputs[i], false); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func procedureName(name string, quoted bool) string {

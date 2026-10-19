@@ -334,6 +334,11 @@ func (r *lpRun) stepExecute(f *lpFrame, n *psql.Node, node *LineProfileNode, cal
 	}
 	for i, target := range n.Returning {
 		out := callee.outputs[i]
+		if v, ok := f.vars[target]; ok {
+			if err := blobVariableInto(g.vars[out.name].value, out.typeText, v); err != nil {
+				return err
+			}
+		}
 		if err := r.assignTyped(f, node, target, g.vars[out.name].value, out.typeText); err != nil {
 			return err
 		}

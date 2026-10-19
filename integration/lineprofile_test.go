@@ -465,6 +465,99 @@ BEGIN
   SELECT N92 FROM LP_PRICES WHERE ID = :ID INTO :N42;
   SUSPEND;
 END`,
+		// ibg-b6o: BLOB parity edges, as probed natively.
+		"CREATE TABLE LP_BLOBSW (ID INTEGER, B BLOB SUB_TYPE TEXT CHARACTER SET WIN1252)",
+		"CREATE TABLE LP_BLOBSX (ID INTEGER, B BLOB SUB_TYPE TEXT CHARACTER SET NONE)",
+		"INSERT INTO LP_BLOBSX VALUES (1, 'Caf\xe9 blob')",
+		`CREATE PROCEDURE LP_BRAW (K INTEGER) RETURNS (R VARCHAR(40) CHARACTER SET OCTETS) AS
+DECLARE VARIABLE XN BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  SELECT B FROM LP_BLOBSX WHERE ID = 1 INTO :XN;
+  IF (K = 1) THEN
+  BEGIN
+    INSERT INTO LP_BLOBS8 (ID, B) VALUES (63, :XN);
+    SELECT CAST(B AS VARCHAR(40) CHARACTER SET OCTETS) FROM LP_BLOBS8 WHERE ID = 63 INTO :R;
+  END
+  IF (K = 2) THEN
+  BEGIN
+    INSERT INTO LP_BLOBSW (ID, B) VALUES (64, :XN);
+    SELECT CAST(B AS VARCHAR(40) CHARACTER SET OCTETS) FROM LP_BLOBSW WHERE ID = 64 INTO :R;
+  END
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BCHAR (K INTEGER) RETURNS (R VARCHAR(80) CHARACTER SET OCTETS) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  IF (K = 1) THEN X = CAST('ab' AS CHAR(5));
+  IF (K = 2) THEN X = CAST('ab' AS CHAR(5) CHARACTER SET UTF8);
+  IF (K = 3) THEN X = CAST('ab' AS CHAR(5) CHARACTER SET WIN1252);
+  IF (K = 4) THEN SELECT U3 FROM LP_PADS WHERE ID = 2 INTO :X;
+  IF (K = 5) THEN SELECT C3 FROM LP_PADS WHERE ID = 2 INTO :X;
+  INSERT INTO LP_BLOBSX VALUES (70 + :K, :X);
+  SELECT '[' || CAST(B AS VARCHAR(40) CHARACTER SET OCTETS) || ']' FROM LP_BLOBSX WHERE ID = 70 + :K INTO :R;
+  SUSPEND;
+END`,
+		"CREATE PROCEDURE LP_BOUT_T RETURNS (B BLOB SUB_TYPE TEXT CHARACTER SET NONE) AS BEGIN B = 'abcdefghij'; END",
+		"CREATE PROCEDURE LP_BSEL_T (K INTEGER) RETURNS (B BLOB SUB_TYPE TEXT CHARACTER SET NONE) AS BEGIN B = 'abcdefghij'; SUSPEND; END",
+		`CREATE PROCEDURE LP_BTEXT (K INTEGER) RETURNS (R VARCHAR(40) CHARACTER SET NONE, Q VARCHAR(5) CHARACTER SET NONE) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  X = 'abcdefghij';
+  R = 'start';
+  SUSPEND;
+  IF (K = 1) THEN R = X;
+  IF (K = 2) THEN EXECUTE PROCEDURE LP_BOUT_T RETURNING_VALUES :R;
+  IF (K = 3) THEN EXECUTE PROCEDURE LP_BOUT_T RETURNING_VALUES :Q;
+  IF (K = 4) THEN SELECT B FROM LP_BSEL_T(1) INTO :Q;
+  IF (K = 5) THEN FOR SELECT B FROM LP_BSEL_T(1) INTO :R DO SUSPEND;
+  IF (K = 6) THEN X = NULL;
+  IF (K = 6) THEN R = X;
+  IF (X IS NULL) THEN Q = 'null'; ELSE Q = 'set';
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BISNULL RETURNS (R VARCHAR(10)) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  X = 42;
+  IF (X IS NULL) THEN R = 'null'; ELSE R = 'notnull';
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BDATE (K INTEGER) RETURNS (R VARCHAR(10)) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  R = 'start';
+  IF (K = 1) THEN X = CAST('2020-01-02' AS DATE);
+  IF (K = 2) THEN X = CAST('2020-01-02 03:04:05.1234' AS TIMESTAMP);
+  IF (K = 3) THEN X = CAST('2020-01-02 13:04:05' AS TIMESTAMP);
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_BNUM (K INTEGER) RETURNS (R VARCHAR(40)) AS
+DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  R = 'start';
+  IF (K = 1) THEN X = CAST(5 AS NUMERIC(18,0));
+  IF (K = 2) THEN X = CAST(0 AS NUMERIC(18,0));
+  IF (K = 3) THEN X = CAST(1.5 AS NUMERIC(18,2));
+  IF (K = 4) THEN X = CAST(0 AS NUMERIC(18,2));
+  R = 'assigned';
+  SUSPEND;
+  INSERT INTO LP_BLOBSX VALUES (80 + :K, :X);
+  SELECT '[' || CAST(B AS VARCHAR(40)) || ']' FROM LP_BLOBSX WHERE ID = 80 + :K INTO :R;
+  SUSPEND;
+END`,
+		// ibg-85p: WHEN GDSCODE matches the first status code only.
+		`CREATE PROCEDURE LP_GDS2 RETURNS (R VARCHAR(20)) AS
+BEGIN
+  R = 'none';
+  BEGIN
+    BEGIN
+      EXCEPTION LP_EX;
+    WHEN GDSCODE random DO R = 'second';
+    END
+  WHEN GDSCODE except DO R = 'first';
+  END
+  SUSPEND;
+END`,
 		"CREATE PROCEDURE LP_WIDE_OUT RETURNS (V " + wide + ") AS BEGIN V = " + wideValue + "; END",
 		`CREATE PROCEDURE LP_WIDE_IN (K INTEGER) RETURNS (D DOUBLE PRECISION, T VARCHAR(30), N NUMERIC(15,4)) AS
 BEGIN
@@ -958,6 +1051,7 @@ func TestLineProfileDifferential(t *testing.T) {
 				{name: "numeric conversions", sql: "select * from LP_NUMS"},
 				{name: "BLOB variable into another charset", sql: "select * from LP_BLOBCOPY(1)"},
 				{name: "BLOB variable as procedure input", sql: "select * from LP_BLOBCALL(1)"},
+				{name: "WHEN GDSCODE matches the first status code", sql: "select * from LP_GDS2", unexecuted: []string{"'second'"}},
 				{name: "scaled value wider than its precision", sql: "select * from LP_WIDE_IN(0)", unexecuted: []string{"RETURNING_VALUES :N"}},
 				{name: "scaled value wider than its precision, stepped", sql: "select * from LP_WIDE_IN(0)", unexecuted: []string{"RETURNING_VALUES :N"},
 					stepInto: []string{"LP_WIDE_OUT"}},
@@ -1044,6 +1138,19 @@ func TestLineProfileDifferential(t *testing.T) {
 				{name: "native read-only procedure cursor", sql: "select * from LP_MK_RCALLER", check: lpCheckRowByRow(false)},
 			}
 			for _, c := range lpBlobFetchCases() {
+				tests = append(tests, struct {
+					name        string
+					sql         string
+					localLines  []string
+					unexecuted  []string
+					skipHits    bool
+					defaultKeep bool
+					stepInto    []string
+					failAt      string
+					check       func(t *testing.T, result interbase.LineProfileResult)
+				}{name: c.name, sql: c.sql, skipHits: true, stepInto: c.stepInto, failAt: c.failAt})
+			}
+			for _, c := range lpBlobEdgeCases() {
 				tests = append(tests, struct {
 					name        string
 					sql         string
@@ -1251,6 +1358,29 @@ func TestLineProfileAnalysis(t *testing.T) {
 			}
 			if tt.callee != "" && (len(analysis.Callees) != 1 || analysis.Callees[0].Name != tt.callee || !analysis.Callees[0].Parses) {
 				t.Fatalf("callees = %+v, want %s", analysis.Callees, tt.callee)
+			}
+		})
+	}
+}
+
+// TestLineProfileBlobDateMessage checks ibg-b6o: assigning a date or time to
+// a BLOB variable fails with the server's message, the value written as the
+// server writes it in each dialect.
+func TestLineProfileBlobDateMessage(t *testing.T) {
+	for _, dialect := range []int{3, 1} {
+		t.Run(fmt.Sprintf("dialect %d", dialect), func(t *testing.T) {
+			conn, ctx := lpFixture(t, dialect)
+			for k := 1; k <= 3; k++ {
+				query := fmt.Sprintf("select * from LP_BDATE(%d)", k)
+				_, nativeErr := lpNative(t, ctx, conn, query)
+				result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: query, Dialect: dialect})
+				var native, emulated *interbase.Error
+				if err != nil || !errors.As(nativeErr, &native) || !errors.As(result.Err, &emulated) {
+					t.Fatalf("%s: emulated %v (%v), native %v", query, result.Err, err, nativeErr)
+				}
+				if emulated.SQLCode != native.SQLCode || emulated.Message != native.Message {
+					t.Fatalf("%s: emulated %q (SQLCODE %d), native %q (SQLCODE %d)", query, emulated.Message, emulated.SQLCode, native.Message, native.SQLCode)
+				}
 			}
 		})
 	}
@@ -1836,6 +1966,44 @@ func lpBlobFetchCases() []lpBlobFetchCase {
 					lpBlobFetchCase{name: "BLOB fetch caught " + shape + column + suffix, sql: "select * from LP_BFW_" + shape + column, stepInto: step})
 			}
 		}
+	}
+	return cases
+}
+
+// lpBlobEdgeCases are the differential cases of ibg-b6o, as probed
+// natively: BLOB content is written without transliteration; a CHAR value
+// fills a BLOB with its full width in bytes; a BLOB variable or output
+// parameter assigned to a text variable fails with SQLCODE -902, while a
+// BLOB column selected into one is cut to its length; IS NULL on a BLOB
+// variable holding an integer is false; a date assigned to a BLOB fails
+// with SQLCODE -413.
+func lpBlobEdgeCases() []lpBlobFetchCase {
+	cases := []lpBlobFetchCase{
+		{name: "BLOB edge: bad BLOB IS NULL", sql: "select * from LP_BISNULL"},
+		{name: "BLOB edge: text BLOB from a stepped procedure cut to a text target", sql: "select * from LP_BTEXT(4)", stepInto: []string{"LP_BSEL_T"}},
+		{name: "BLOB edge: text BLOB rows from a stepped procedure", sql: "select * from LP_BTEXT(5)", stepInto: []string{"LP_BSEL_T"}},
+		{name: "BLOB edge: BLOB output parameter into text, stepped", sql: "select * from LP_BTEXT(2)", stepInto: []string{"LP_BOUT_T"},
+			failAt: "IF (K = 2)"},
+	}
+	for k := 1; k <= 2; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: raw bytes %d", k), sql: fmt.Sprintf("select * from LP_BRAW(%d)", k)})
+	}
+	for k := 1; k <= 5; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: CHAR width %d", k), sql: fmt.Sprintf("select * from LP_BCHAR(%d)", k)})
+	}
+	for k := 0; k <= 6; k++ {
+		failAt := ""
+		if k >= 1 && k <= 3 {
+			failAt = fmt.Sprintf("IF (K = %d)", k)
+		}
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: BLOB into text %d", k), sql: fmt.Sprintf("select * from LP_BTEXT(%d)", k), failAt: failAt})
+	}
+	for k := 1; k <= 4; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: exact numeric %d", k), sql: fmt.Sprintf("select * from LP_BNUM(%d)", k)})
+	}
+	for k := 1; k <= 3; k++ {
+		cases = append(cases, lpBlobFetchCase{name: fmt.Sprintf("BLOB edge: date %d", k), sql: fmt.Sprintf("select * from LP_BDATE(%d)", k),
+			failAt: fmt.Sprintf("IF (K = %d)", k)})
 	}
 	return cases
 }

@@ -21,6 +21,9 @@ const (
 	localIntKind
 	localStringKind
 	localTruthKind
+	// localOpaqueKind is a non-NULL value outside the local subset: only
+	// IS NULL evaluates it locally.
+	localOpaqueKind
 )
 
 // localFamily is the type family of a local value; a NULL read from a
@@ -520,6 +523,13 @@ func (r *lpRun) evalValue(f *lpFrame, node *LineProfileNode, e *psql.Expr, targe
 			}
 		}
 	}
+	if v, ok := e.Local.(psql.LocalVar); ok {
+		if source, ok := f.vars[v.Name]; ok {
+			if err := blobVariableInto(source.value, source.typ.Text, target); err != nil {
+				return nil, err
+			}
+		}
+	}
 	text := "SELECT CAST((" + e.ServerText + ") AS " + castType(target.typ.Text) + ") FROM RDB$DATABASE"
 	if isBlobType(target.typ.Text) {
 		// DSQL cannot CAST to BLOB. A BLOB variable copies its content; any
@@ -595,7 +605,16 @@ func (r *lpRun) blobValue(value any, sourceType string) (any, error) {
 		word = word[:i]
 	}
 	switch word {
-	case "CHAR", "CHARACTER", "VARCHAR":
+	case "CHAR", "CHARACTER":
+		if s, ok := value.(string); ok && !strings.Contains(normalized, "VARYING") {
+			// The BLOB gets the value's full width in bytes, blank padded:
+			// CHAR(5) CHARACTER SET UTF8 fills 20 bytes (verified natively).
+			if width := r.textWidth(sourceType); len(s) < width {
+				return s + strings.Repeat(" ", width-len(s)), nil
+			}
+		}
+		return value, nil
+	case "VARCHAR":
 		return value, nil
 	case "SMALLINT", "INTEGER", "INT", "BIGINT", "NUMERIC", "DECIMAL":
 		if i, ok := value.(int64); ok && !strings.Contains(normalized, ",") || ok && strings.HasSuffix(normalized, ",0)") {
@@ -608,7 +627,7 @@ func (r *lpRun) blobValue(value any, sourceType string) (any, error) {
 	case "FLOAT", "DOUBLE":
 		return nil, errBlobInternal()
 	case "DATE", "TIME", "TIMESTAMP":
-		return nil, errBlobConversion(value)
+		return nil, errBlobConversion(value, word, r.plan.dialect)
 	}
 	return nil, fatal(fmt.Errorf("interbase: line profile: assigning a %s value to a BLOB variable is not supported", sourceType))
 }
@@ -621,17 +640,59 @@ func errBlobInternal() error {
 		Message: "internal error", gdsCodes: []int64{bugCheck}}
 }
 
-// errBlobConversion is the error PSQL raises assigning a date or time value
-// to a BLOB variable. The server writes the value in its own format; the
-// message here may format it differently.
-func errBlobConversion(value any) error {
+// errBlobConversion is the error PSQL raises assigning a date or time value,
+// of type word (DATE, TIME or TIMESTAMP), to a BLOB variable, with the value
+// written as the server writes it (verified natively): 2020-01-02,
+// 03:04:05.1234 and 2020-01-02 03:04:05.1234 in dialect 3; in dialect 1,
+// where DATE has a time, 2-JAN-2020, with " 3:04:05.1234" when the time is
+// not midnight.
+func errBlobConversion(value any, word string, dialect int) error {
 	const convertError = 335544334 // isc_convert_error
 	text := fmt.Sprint(value)
 	if t, ok := value.(time.Time); ok {
-		text = t.Format("2006-01-02 15:04:05.0000")
+		clock := fmt.Sprintf("%02d:%02d:%02d.%04d", t.Hour(), t.Minute(), t.Second(), t.Nanosecond()/100000)
+		switch {
+		case dialect == 1:
+			text = fmt.Sprintf("%d-%s-%d", t.Day(), strings.ToUpper(t.Format("Jan")), t.Year())
+			if t.Hour() != 0 || t.Minute() != 0 || t.Second() != 0 || t.Nanosecond() != 0 {
+				text += fmt.Sprintf(" %d:%02d:%02d.%04d", t.Hour(), t.Minute(), t.Second(), t.Nanosecond()/100000)
+			}
+		case word == "DATE":
+			text = t.Format("2006-01-02")
+		case word == "TIME":
+			text = clock
+		default:
+			text = t.Format("2006-01-02 ") + clock
+		}
 	}
 	return &Error{Operation: "line profile BLOB assignment", SQLCode: -413, NativeCode: convertError,
 		Message: fmt.Sprintf("conversion error from string %q", text), gdsCodes: []int64{convertError}}
+}
+
+// errBlobVariable is the error PSQL raises assigning the BLOB held in a
+// variable or an output parameter (not a statement's column) to a variable
+// of type typeText: the internal error (SQLCODE -902) for a text variable,
+// as verified natively, dialects 1 and 3. Other targets fail natively too,
+// with other errors, which the emulator does not reproduce: the run fails
+// as unsupported.
+func errBlobVariable(typeText string) error {
+	switch word := strings.Fields(normalizeType(typeText) + " ")[0]; {
+	case strings.HasPrefix(word, "CHAR") || strings.HasPrefix(word, "VARCHAR"):
+		return errBlobInternal()
+	}
+	return fatal(fmt.Errorf("interbase: line profile: assigning a BLOB variable to a %s variable is not supported", typeText))
+}
+
+// blobVariableInto reports the error of assigning value, held in a variable
+// or output parameter of type sourceType, to target, or nil when the
+// assignment is not of a BLOB value to a non-BLOB variable. A NULL BLOB
+// assigns NULL (verified natively).
+func blobVariableInto(value any, sourceType string, target *lpVar) error {
+	if _, bad := value.(lpBadBlob); bad || value == nil || !isBlobType(sourceType) || isBlobType(target.typ.Text) {
+		// An integer taken as a BLOB id fails on use (checkBlobArgs).
+		return nil
+	}
+	return errBlobVariable(target.typ.Text)
 }
 
 // errBlobNotFound is the error PSQL raises using a BLOB variable that holds
@@ -726,6 +787,13 @@ func (r *lpRun) store(node *LineProfileNode, target *lpVar, value any, sourceTyp
 		target.value = held
 		return nil
 	}
+	if isBlobType(sourceType) {
+		cut, err := r.blobColumnText(value, sourceType, target)
+		if err != nil {
+			return err
+		}
+		value = cut
+	}
 	text := "SELECT CAST(? AS " + targetType + ") FROM RDB$DATABASE"
 	if sourceType != "" && !isBlobType(sourceType) {
 		source := "CAST(? AS " + sourceType + ")"
@@ -755,6 +823,37 @@ func (r *lpRun) store(node *LineProfileNode, target *lpVar, value any, sourceTyp
 	return err
 }
 
+// textWidth returns the width in bytes of a CHAR(n) or VARCHAR(n) type text:
+// n times the maximum bytes per character of its character set.
+func (r *lpRun) textWidth(typeText string) int {
+	length, perChar := r.textLength(typeText)
+	return length * perChar
+}
+
+// textLength returns the length n of a CHAR(n) or VARCHAR(n) type text (0
+// when it has none) and the maximum bytes per character of its character
+// set (the database default when the text has none; 1 for an unknown one).
+func (r *lpRun) textLength(typeText string) (length, perChar int) {
+	normalized := r.declaredType(typeText)
+	open := strings.IndexByte(normalized, '(')
+	if open < 0 {
+		return 0, 1
+	}
+	if _, err := fmt.Sscanf(normalized[open:], "(%d)", &length); err != nil {
+		return 0, 1
+	}
+	perChar = 1
+	if i := strings.Index(normalized, " CHARACTER SET "); i >= 0 {
+		name := strings.Fields(normalized[i+len(" CHARACTER SET "):])[0]
+		for _, charset := range r.plan.charsets {
+			if strings.EqualFold(charset.name, name) {
+				perChar = charset.bytesPerChar
+			}
+		}
+	}
+	return length, perChar
+}
+
 // exceedsPrecision reports whether a decimal string, as a scaled integer
 // is held, has more significant digits than the precision of a NUMERIC or
 // DECIMAL type text: InterBase stores such a value (a NUMERIC(18,2) holds
@@ -768,6 +867,35 @@ func exceedsPrecision(value, typeText string) bool {
 	}
 	digits := strings.TrimLeft(strings.NewReplacer("-", "", "+", "", ".", "").Replace(value), "0")
 	return len(digits) > precision
+}
+
+// blobColumnText converts a BLOB column's value, as a statement converts a
+// BLOB it selects into a text variable: a text BLOB is cut to the
+// variable's length, without error (verified natively). It is done here for
+// a variable whose character set has one byte per character; other targets
+// fail the run as unsupported (natively a numeric target fails with
+// SQLCODE -413). The driver would otherwise refuse a value longer than the
+// parameter.
+func (r *lpRun) blobColumnText(value any, sourceType string, target *lpVar) (any, error) {
+	if value == nil {
+		return nil, nil
+	}
+	if _, bad := value.(lpBadBlob); bad {
+		return value, nil
+	}
+	normalized := normalizeType(sourceType)
+	text := strings.Contains(normalized, "SUB_TYPE 1") || strings.Contains(normalized, "SUB_TYPE TEXT")
+	word := strings.Fields(normalizeType(target.typ.Text) + " ")[0]
+	length, perChar := r.textLength(target.typ.Text)
+	s, isString := value.(string)
+	if !text || !isString || perChar != 1 || length == 0 ||
+		!strings.HasPrefix(word, "CHAR") && !strings.HasPrefix(word, "VARCHAR") {
+		return nil, fatal(fmt.Errorf("interbase: line profile: converting a %s value to %s is not supported", sourceType, target.typ.Text))
+	}
+	if len(s) > length {
+		s = s[:length]
+	}
+	return s, nil
 }
 
 // declaredType normalizes a declared type, adding the database default
