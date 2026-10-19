@@ -313,7 +313,8 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   `Transaction.Prepare` and re-executes the returned `PreparedStatement`
   (`Exec`, `Query`, `Outputs`, `Close`) with new parameters. Callers can use
   the same API directly to run a statement repeatedly in one transaction
-  without preparing it again.
+  without preparing it again. `Exec` of a statement that produces a result
+  set returns `ErrPreparedStatementReturnsRows`.
 
 Live checks are env-gated; see `lineprofile_live_test.go` for
 `INTERBASE_LP_CORPUS`, `INTERBASE_LP_SQL`, `INTERBASE_LP_STEP_INTO` and

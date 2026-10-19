@@ -12,6 +12,10 @@ var (
 	// errPreparedStatementUnsupported is returned by Prepare for a statement
 	// kind it does not run, such as COMMIT or SET GENERATOR.
 	errPreparedStatementUnsupported = errors.New("interbase: prepared statement type is unsupported")
+
+	// ErrPreparedStatementReturnsRows is returned by PreparedStatement.Exec
+	// for a statement that produces a result set; run it with Query.
+	ErrPreparedStatementReturnsRows = errors.New("interbase: prepared exec: statement produces a result set; use Query instead")
 )
 
 // OutputDescriptor is one output column description returned by the server
@@ -218,6 +222,9 @@ func (s *PreparedStatement) Exec(ctx context.Context, args ...any) (int64, error
 	}
 	if err := validateDirectArguments(converted, t); err != nil {
 		return 0, err
+	}
+	if s.returnsRows {
+		return 0, ErrPreparedStatementReturnsRows
 	}
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {

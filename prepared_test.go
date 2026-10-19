@@ -160,6 +160,19 @@ func TestDirectPreparedStatementQueryRequiresRows(t *testing.T) {
 	}
 }
 
+func TestDirectPreparedStatementExecRejectsRows(t *testing.T) {
+	tx, _ := newPreparedTestTransaction(t, true)
+	statement, err := tx.Prepare(context.Background(), "SELECT V FROM LP_T WHERE ID = ?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const message = "interbase: prepared exec: statement produces a result set; use Query instead"
+	_, err = statement.Exec(context.Background(), int64(1))
+	if !errors.Is(err, ErrPreparedStatementReturnsRows) || err.Error() != message {
+		t.Fatalf("Exec error = %v, want ErrPreparedStatementReturnsRows with %q", err, message)
+	}
+}
+
 type statementFailureOutcome struct {
 	canceled  bool
 	deadline  bool
@@ -196,7 +209,9 @@ func TestPreparedStatementFailuresClassifyLikeDirectStatements(t *testing.T) {
 					}
 					return scenario.err
 				}
-				tx, _ := newPreparedTestTransaction(t, true)
+				// Exec of a result-set statement is rejected before the native
+				// call, so the exec scenarios prepare a non-row statement.
+				tx, _ := newPreparedTestTransaction(t, operation == "query")
 				tx.attachment.conn.native.brokenOverride = func() bool { return armed && scenario.broken }
 				tx.native.queryContextOverride = func(string, []argument, bool, *nativeCancelOperation) (*nativeCursor, []string, error) {
 					return nil, nil, fail()

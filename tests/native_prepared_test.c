@@ -171,6 +171,7 @@ static int failed_drop_left_handle;
 static int describe_user_column_relation;
 static int describe_user_charset_identifier;
 static int describe_user_column_alias;
+static int describe_user_relation_too_long;
 static int describe_procedure_decimal;
 static int describe_procedure_source;
 static int describe_input_metadata_case;
@@ -193,7 +194,8 @@ enum overlap_kind {
 	OVERLAP_TRANSIENT_EXECUTE = 5,
 	OVERLAP_TRANSIENT_EXECUTE2 = 6,
 	OVERLAP_CATALOG_EXECUTE2 = 7,
-	OVERLAP_DISTRIBUTED_EXECUTE = 8
+	OVERLAP_DISTRIBUTED_EXECUTE = 8,
+	OVERLAP_DIRECT_PREPARE = 9
 };
 static pthread_mutex_t overlap_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t overlap_condition = PTHREAD_COND_INITIALIZER;
@@ -699,6 +701,7 @@ static void reset_mocks(void)
 	describe_user_column_relation = 0;
 	describe_user_charset_identifier = 0;
 	describe_user_column_alias = 0;
+	describe_user_relation_too_long = 0;
 	describe_procedure_decimal = 0;
 	describe_procedure_source = 0;
 	describe_input_metadata_case = 0;
@@ -799,6 +802,9 @@ static void *overlap_operation_worker(void *argument)
 	if (call->kind == OVERLAP_EXECUTE) {
 		call->result = (ib_statement_exec)(call->statement, call->bindings,
 			call->slot, call->generation, &call->rows_affected, &call->error);
+	} else if (call->kind == OVERLAP_DIRECT_PREPARE) {
+		call->statement = (ib_transaction_prepare)(call->transaction, call->query,
+			call->query_length, 1, call->slot, call->generation, &call->error);
 	} else if (call->kind == OVERLAP_PREPARE) {
 		call->statement = (ib_statement_prepare)(call->connection, call->query,
 			call->query_length, call->slot, call->generation, &call->error);
@@ -1142,6 +1148,10 @@ ISC_STATUS ISC_EXPORT test_dsql_describe(ISC_STATUS *status,
 		output->sqlvar[0].sqlname_length = 2;
 		output->sqlvar[0].sqlname[0] = 'I';
 		output->sqlvar[0].sqlname[1] = 'D';
+	}
+	if (describe_user_relation_too_long && statement_type == isc_info_sql_stmt_select) {
+		/* An over-long descriptor name makes the relation list fail. */
+		output->sqlvar[0].relname_length = (short) (METADATALENGTH + 1U);
 	}
 	if (describe_user_charset_identifier && statement_type == isc_info_sql_stmt_select) {
 		static const unsigned char relation[] = {0x8e};
@@ -1751,8 +1761,11 @@ ISC_STATUS ISC_EXPORT test_dsql_free_statement(ISC_STATUS *status,
 	if (option != DSQL_cancel && overlap_is_enabled()) {
 		overlap_cleanup_event();
 	}
+	/* A catalog handle is unpublished and dropped while its operation's slot
+	 * stays active; only user statement cleanup must follow completion. */
 	if (expected_cancel_slot != NULL && statement != NULL &&
-		*statement == expected_cancel_statement && option != DSQL_cancel) {
+		*statement == expected_cancel_statement && option != DSQL_cancel &&
+		!is_catalog_statement(statement)) {
 		check_cancel_complete("prepared cancellation slot was not complete before statement cleanup");
 	}
 	if (*statement == catalog_statement) {
@@ -3812,6 +3825,424 @@ static void test_transaction_prepare_caches_catalog_metadata(void)
 	free(connection);
 }
 
+
+static struct ib_statement *prepare_direct_select(ib_transaction *transaction,
+	ib_cancel_slot *slot, uint64_t generation, char **error)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+
+	return (ib_transaction_prepare)(transaction, query, sizeof(query) - 1U, 1,
+		slot, generation, error);
+}
+
+static ib_transaction *begin_direct_transaction(ib_connection *connection)
+{
+	static const char tpb[] = {isc_tpb_version3, isc_tpb_read, isc_tpb_read_committed,
+		isc_tpb_rec_version};
+	ib_transaction *transaction;
+	char *error = NULL;
+
+	transaction = ib_transaction_begin(connection, tpb, sizeof(tpb), &error);
+	check(transaction != NULL && error == NULL, "direct transaction start failed");
+	ib_error_free(error);
+	return transaction;
+}
+
+static void end_direct_transaction(ib_transaction *transaction,
+	ib_connection *connection)
+{
+	char *error = NULL;
+
+	if (transaction != NULL) {
+		(void) ib_transaction_rollback(transaction, &error);
+		ib_error_free(error);
+		ib_transaction_free(transaction);
+	}
+	free(connection);
+}
+
+/* The prepare-time catalog enrichment runs under the operation's cancellation
+ * slot: the catalog handle is published while it executes, and a native
+ * cancellation of the catalog query fails Prepare instead of being hidden. */
+static void test_transaction_prepare_catalog_is_cancelable(void)
+{
+	ib_connection *connection;
+	ib_transaction *transaction;
+	struct ib_statement *statement;
+	ib_cancel_slot *slot;
+	char *error = NULL;
+	uint64_t generation;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_relation = 1;
+	connection = new_connection();
+	transaction = begin_direct_transaction(connection);
+	slot = ib_cancel_slot_new(&error);
+	check(slot != NULL && error == NULL, "catalog cancellation slot allocation failed");
+	ib_error_free(error);
+	error = NULL;
+	if (transaction == NULL || slot == NULL) {
+		ib_cancel_slot_free(slot);
+		end_direct_transaction(transaction, connection);
+		return;
+	}
+
+	/* allocate call 1 is the user statement, call 2 the catalog statement. */
+	generation = ib_cancel_slot_begin(slot, &error);
+	ib_error_free(error);
+	error = NULL;
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = (isc_stmt_handle) &statement_tokens[2];
+	statement = prepare_direct_select(transaction, slot, generation, &error);
+	check(statement != NULL && error == NULL, "cancelable direct prepare failed");
+	ib_error_free(error);
+	error = NULL;
+	check(execute2_publication_calls == 1,
+		"prepare-time catalog query did not run under the cancellation slot");
+	check_cancel_complete("direct prepare left its cancellation slot active");
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	if (statement != NULL) {
+		check(ib_statement_close(statement, &error) == 0 && error == NULL,
+			"cancelable direct statement close failed");
+		ib_error_free(error);
+		error = NULL;
+	}
+
+	/* A cancelled catalog query surfaces from Prepare and frees the statement. */
+	free_statement_calls = 0;
+	generation = ib_cancel_slot_begin(slot, &error);
+	ib_error_free(error);
+	error = NULL;
+	overlap_reset(OVERLAP_CATALOG_EXECUTE2, 1, 0);
+	overlap_release_native();
+	statement = prepare_direct_select(transaction, slot, generation, &error);
+	check(statement == NULL, "cancelled prepare-time catalog query was swallowed");
+	check(error != NULL && ib_error_has_native_status(error, isc_cancelled),
+		"cancelled prepare-time catalog query lost its native status");
+	check(free_statement_calls == 1, "cancelled prepare did not free its statement");
+	check(!connection->broken, "cancelled catalog query retired the connection");
+	check(connection->statements == NULL, "cancelled prepare left a registered statement");
+	ib_error_free(error);
+	error = NULL;
+	overlap_reset(OVERLAP_NONE, 0, 0);
+	if (statement != NULL) {
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+	}
+	ib_cancel_slot_free(slot);
+	end_direct_transaction(transaction, connection);
+}
+
+/* A cancellation requested while the prepare-time catalog query runs targets
+ * the catalog handle and fails Prepare once the request has returned. */
+static void test_cancel_overlap_transaction_prepare_catalog(void)
+{
+	static const char query[] = "SELECT ID FROM T WHERE ID = ?";
+	ib_connection *connection;
+	ib_transaction *transaction;
+	ib_cancel_slot *slot;
+	struct overlap_operation_call operation;
+	struct overlap_cancel_call cancel;
+	char *error = NULL;
+	uint64_t generation;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_relation = 1;
+	connection = new_connection();
+	transaction = begin_direct_transaction(connection);
+	slot = ib_cancel_slot_new(&error);
+	ib_error_free(error);
+	error = NULL;
+	if (transaction == NULL || slot == NULL) {
+		ib_cancel_slot_free(slot);
+		end_direct_transaction(transaction, connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	check(generation != 0U && error == NULL,
+		"direct prepare overlap slot begin failed");
+	ib_error_free(error);
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = OVERLAP_DIRECT_PREPARE;
+	operation.transaction = transaction;
+	operation.query = query;
+	operation.query_length = sizeof(query) - 1U;
+	operation.slot = slot;
+	operation.generation = generation;
+	memset(&cancel, 0, sizeof(cancel));
+	cancel.slot = slot;
+	cancel.generation = generation;
+	overlap_reset(OVERLAP_CATALOG_EXECUTE2, 1, 0);
+	run_delayed_cancel_transient(&operation, &cancel, 0,
+		"direct prepare completed before delayed cancellation");
+	check(operation.statement == NULL && operation.error != NULL &&
+		ib_error_has_native_status(operation.error, isc_cancelled),
+		"prepare-time catalog cancellation was swallowed");
+	check(overlap_cancel_statement == catalog_statement,
+		"prepare-time catalog cancellation did not target the catalog handle");
+	check(connection->statements == NULL,
+		"cancelled direct prepare left a registered statement");
+	ib_error_free(operation.error);
+	ib_error_free(cancel.error);
+	overlap_reset(OVERLAP_NONE, 0, 0);
+	ib_cancel_slot_free(slot);
+	end_direct_transaction(transaction, connection);
+}
+
+/* A fatal catalog error (here a catalog handle that cannot be dropped) fails
+ * Prepare: the statement is freed and the error is reported. */
+static void test_transaction_prepare_surfaces_fatal_catalog_error(void)
+{
+	ib_connection *connection;
+	ib_transaction *transaction;
+	struct ib_statement *statement;
+	char *error = NULL;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_relation = 1;
+	fail_catalog_drop = 1;
+	connection = new_connection();
+	transaction = begin_direct_transaction(connection);
+	if (transaction == NULL) {
+		free(connection);
+		return;
+	}
+	statement = prepare_direct_select(transaction, NULL, 0U, &error);
+	check(statement == NULL, "fatal prepare-time catalog error was swallowed");
+	check(error != NULL && strstr(error, "close statement") != NULL,
+		"fatal prepare-time catalog error lost its diagnostic");
+	check(free_statement_calls == 1, "fatal catalog prepare did not free its statement");
+	check(connection->statements == NULL, "fatal catalog prepare left a registered statement");
+	check(connection->broken, "catalog drop failure did not retire the connection");
+	ib_error_free(error);
+	error = NULL;
+	if (statement != NULL) {
+		(void) ib_statement_close(statement, &error);
+		ib_error_free(error);
+	}
+	end_direct_transaction(transaction, connection);
+}
+
+/* A non-fatal catalog failure keeps Prepare usable but is not cached: the
+ * next execution enriches its cursor again. */
+static void test_transaction_prepare_does_not_cache_catalog_failure(void)
+{
+	int procedure;
+
+	for (procedure = 0; procedure <= 1; procedure++) {
+		ib_connection *connection;
+		ib_transaction *transaction;
+		struct ib_statement *statement;
+		ib_bindings *bindings;
+		ib_cursor *cursor;
+		char *error = NULL;
+		int catalog_before;
+
+		reset_mocks();
+		if (procedure) {
+			statement_type = isc_info_sql_stmt_exec_procedure;
+			describe_procedure_source = 1;
+		} else {
+			statement_type = isc_info_sql_stmt_select;
+			describe_user_column_relation = 1;
+		}
+		/* prepare call 1 is the user statement, call 2 the catalog query. */
+		fail_prepare_on_call = 2;
+		connection = new_connection();
+		transaction = begin_direct_transaction(connection);
+		if (transaction == NULL) {
+			free(connection);
+			return;
+		}
+		statement = prepare_direct_select(transaction, NULL, 0U, &error);
+		check(statement != NULL && error == NULL,
+			"non-fatal prepare-time catalog failure failed Prepare");
+		ib_error_free(error);
+		error = NULL;
+		check(statement != NULL && !statement->metadata_cached,
+			procedure ? "failed procedure catalog lookup was cached" :
+			"failed relation catalog lookup was cached");
+		catalog_before = prepare_calls;
+		bindings = new_integer_binding(1);
+		cursor = statement == NULL ? NULL :
+			ib_statement_query(statement, bindings, &error);
+		check(cursor != NULL && error == NULL, "execution after uncached catalog failed");
+		ib_error_free(error);
+		error = NULL;
+		check(prepare_calls == catalog_before + 1,
+			"execution did not re-run the uncached catalog enrichment");
+		if (cursor != NULL) {
+			(void) ib_cursor_close(cursor, &error);
+			ib_error_free(error);
+			error = NULL;
+		}
+		ib_bindings_free(bindings);
+		if (statement != NULL) {
+			(void) ib_statement_close(statement, &error);
+			ib_error_free(error);
+		}
+		end_direct_transaction(transaction, connection);
+	}
+}
+
+
+static int cancel_slot_published(ib_cancel_slot *slot)
+{
+	int published;
+
+	if (pthread_mutex_lock(&slot->mutex) != 0) {
+		abort();
+	}
+	published = slot->published;
+	if (pthread_mutex_unlock(&slot->mutex) != 0) {
+		abort();
+	}
+	return published;
+}
+
+/* The prepare-time enrichment publishes its catalog handle while the catalog
+ * query runs, and returns with nothing published: the user's prepared
+ * statement is idle, so a cancellation landing before the slot completes
+ * must not reach it. */
+static void test_prepare_enrichment_leaves_no_handle_published(void)
+{
+	ib_connection *connection;
+	ib_transaction *transaction;
+	struct ib_statement *statement;
+	ib_cancel_slot *slot;
+	char *error = NULL;
+	uint64_t generation;
+	int result;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_relation = 1;
+	connection = new_connection();
+	transaction = begin_direct_transaction(connection);
+	slot = ib_cancel_slot_new(&error);
+	ib_error_free(error);
+	error = NULL;
+	if (transaction == NULL || slot == NULL) {
+		ib_cancel_slot_free(slot);
+		end_direct_transaction(transaction, connection);
+		return;
+	}
+	statement = prepare_direct_select(transaction, NULL, 0U, &error);
+	check(statement != NULL && error == NULL, "enrichment publication prepare failed");
+	ib_error_free(error);
+	error = NULL;
+	if (statement == NULL) {
+		ib_cancel_slot_free(slot);
+		end_direct_transaction(transaction, connection);
+		return;
+	}
+	ib_statement_free_metadata_cache(statement);
+	generation = ib_cancel_slot_begin(slot, &error);
+	ib_error_free(error);
+	error = NULL;
+	expected_cancel_slot = slot;
+	expected_cancel_generation = generation;
+	expected_cancel_statement = (isc_stmt_handle)
+		&statement_tokens[(allocate_calls + 1) % (int) sizeof(statement_tokens)];
+	execute2_publication_calls = 0;
+	result = ib_statement_cache_metadata(statement, slot, generation, &error);
+	check(result == 0 && error == NULL && statement->metadata_cached,
+		"prepare-time enrichment under a slot failed");
+	ib_error_free(error);
+	error = NULL;
+	check(execute2_publication_calls == 1,
+		"cancellation during enrichment did not target the catalog handle");
+	check(!cancel_slot_published(slot),
+		"prepare-time enrichment left a statement handle published");
+	ib_cancel_slot_complete(slot, generation);
+	expected_cancel_slot = NULL;
+	expected_cancel_generation = 0U;
+	expected_cancel_statement = NULL;
+	check(ib_statement_close(statement, &error) == 0 && error == NULL,
+		"enrichment publication statement close failed");
+	ib_error_free(error);
+	ib_cancel_slot_free(slot);
+	end_direct_transaction(transaction, connection);
+}
+
+/* With a slot (as Transaction.Prepare runs), an optional catalog step that
+ * falls back marks the enrichment degraded: nothing is cached and the next
+ * execution enriches again. */
+static void test_transaction_prepare_with_slot_does_not_cache_fallback(void)
+{
+	ib_connection *connection;
+	ib_transaction *transaction;
+	struct ib_statement *statement;
+	ib_cancel_slot *slot;
+	ib_bindings *bindings;
+	ib_cursor *cursor;
+	char *error = NULL;
+	uint64_t generation;
+	int catalog_before;
+
+	reset_mocks();
+	statement_type = isc_info_sql_stmt_select;
+	describe_user_column_relation = 1;
+	describe_user_relation_too_long = 1;
+	connection = new_connection();
+	transaction = begin_direct_transaction(connection);
+	slot = ib_cancel_slot_new(&error);
+	ib_error_free(error);
+	error = NULL;
+	if (transaction == NULL || slot == NULL) {
+		ib_cancel_slot_free(slot);
+		end_direct_transaction(transaction, connection);
+		return;
+	}
+	generation = ib_cancel_slot_begin(slot, &error);
+	ib_error_free(error);
+	error = NULL;
+	statement = prepare_direct_select(transaction, slot, generation, &error);
+	check(statement != NULL && error == NULL,
+		"catalog fallback under a slot failed Prepare");
+	ib_error_free(error);
+	error = NULL;
+	check(statement != NULL && !statement->metadata_cached,
+		"catalog fallback under a slot was cached");
+	check(prepare_calls == 1, "relation-list fallback still ran a catalog query");
+	if (statement == NULL) {
+		ib_cancel_slot_free(slot);
+		end_direct_transaction(transaction, connection);
+		return;
+	}
+	/* The condition clears (a valid relation name), so the next execution's
+	 * own enrichment runs the catalog query it skipped at prepare. */
+	statement->output->sqlvar[0].relname_length = 1;
+	catalog_before = prepare_calls;
+	bindings = new_integer_binding(1);
+	generation = ib_cancel_slot_begin(slot, &error);
+	ib_error_free(error);
+	error = NULL;
+	cursor = (ib_statement_query)(statement, bindings, slot, generation, &error);
+	check(cursor != NULL && error == NULL, "execution after a slot fallback failed");
+	ib_error_free(error);
+	error = NULL;
+	check(prepare_calls == catalog_before + 1,
+		"execution did not re-run the enrichment skipped at prepare");
+	if (cursor != NULL) {
+		(void) ib_cursor_close(cursor, &error);
+		ib_error_free(error);
+		error = NULL;
+	}
+	ib_cancel_slot_complete(slot, generation);
+	ib_bindings_free(bindings);
+	(void) ib_statement_close(statement, &error);
+	ib_error_free(error);
+	ib_cancel_slot_free(slot);
+	end_direct_transaction(transaction, connection);
+}
+
 int main(void)
 {
 	test_dialect_arguments_are_propagated();
@@ -3832,6 +4263,12 @@ int main(void)
 	test_failed_prepare_rollback_marks_connection_broken();
 	test_query_cursor_does_not_drop_statement();
 	test_transaction_prepare_caches_catalog_metadata();
+	test_transaction_prepare_catalog_is_cancelable();
+	test_cancel_overlap_transaction_prepare_catalog();
+	test_transaction_prepare_surfaces_fatal_catalog_error();
+	test_transaction_prepare_does_not_cache_catalog_failure();
+	test_prepare_enrichment_leaves_no_handle_published();
+	test_transaction_prepare_with_slot_does_not_cache_fallback();
 	test_descriptor_aliases_are_exposed_as_utf8();
 	test_procedure_descriptor_without_source_remains_unknown();
 	test_broken_close_aborts_pending_procedure_sibling();
