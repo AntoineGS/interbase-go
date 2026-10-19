@@ -236,13 +236,19 @@ func groupSites(sites []callSite) []Callee {
 			callees = append(callees, Callee{Name: site.name, Quoted: site.quoted})
 		}
 		c := &callees[i]
-		if n := len(c.Lines); n == 0 || c.Lines[n-1] != site.line {
-			c.Lines = append(c.Lines, site.line)
-		}
+		c.Lines = append(c.Lines, site.line)
 		c.StepInShape = c.StepInShape || site.stepInShape
 	}
 	for i := range callees {
-		sort.Ints(callees[i].Lines)
+		lines := callees[i].Lines
+		sort.Ints(lines)
+		unique := lines[:1]
+		for _, line := range lines[1:] {
+			if line != unique[len(unique)-1] {
+				unique = append(unique, line)
+			}
+		}
+		callees[i].Lines = unique
 	}
 	sort.SliceStable(callees, func(i, j int) bool {
 		return callees[i].Lines[0] < callees[j].Lines[0]
@@ -1011,10 +1017,17 @@ func (p *parser) parseExecProc() *Node {
 	if p.kw(end, "RETURNING_VALUES") {
 		listEnd := p.scanTo(end+1, p.semicolon)
 		start, stop := end+1, listEnd
-		if p.punct(start, "(") && stop-1 > start && p.punct(stop-1, ")") {
+		toks := p.toks
+		if p.punct(start, "(") && stop-1 > start && matchingClose(p.toks[:stop], start) == stop-1 {
+			// InterBase accepts the list in parentheses (verified natively);
+			// its targets are then one level deeper.
 			start, stop = start+1, stop-1
+			toks = append([]token(nil), p.toks...)
+			for i := start; i < stop; i++ {
+				toks[i].depth--
+			}
 		}
-		last, ok := intoTargetListEnd(p.toks, p.src, start, stop)
+		last, ok := intoTargetListEnd(toks, p.src, start, stop)
 		if !ok || last+1 != stop {
 			p.problemAt(end, "malformed RETURNING_VALUES list")
 			p.skipStatement()

@@ -809,3 +809,49 @@ func TestRoutineFunctionCallsAreNotProcedures(t *testing.T) {
 		t.Fatal("MayWrite() = false, want true")
 	}
 }
+
+func TestParseRoutineReturningValuesParentheses(t *testing.T) {
+	body := strings.Join([]string{
+		"DECLARE VARIABLE a INTEGER;",
+		"DECLARE VARIABLE b INTEGER;",
+		"begin",
+		"execute procedure p_two 1, 2 returning_values (:a, :b);",
+		"execute procedure p_two(1, 2) returning_values (a);",
+		"execute procedure p_two (1, 2) returning_values :a, b;",
+		"end",
+	}, "\n")
+	r := parseClean(t, body, ParseOptions{})
+	for i, want := range [][]string{{"A", "B"}, {"A"}, {"A", "B"}} {
+		n := r.Body.Children[i]
+		if n.Proc == nil || len(n.Proc.Args) != 2 || !reflect.DeepEqual(n.Returning, want) {
+			t.Fatalf("statement %d: Proc %+v Returning %v, want 2 args and %v", i, n.Proc, n.Returning, want)
+		}
+	}
+}
+
+func TestParseRoutineMalformedPositions(t *testing.T) {
+	for _, tt := range []struct {
+		body         string
+		line, column int
+		message      string
+	}{
+		{"begin\n  x = 1;\n  execute procedure p 1 returning_values (:a, 1);\nend", 3, 25, "malformed RETURNING_VALUES list"},
+		{"begin\n  execute procedure p 1 returning_values :a +;\nend", 2, 25, "malformed RETURNING_VALUES list"},
+		{"begin\n  execute procedure p 1 returning_values ();\nend", 2, 25, "malformed RETURNING_VALUES list"},
+		{"begin\n\n    execute procedure p(1,,2);\nend", 3, 23, "malformed EXECUTE PROCEDURE argument list"},
+		{"begin\n  execute procedure;\nend", 2, 3, "EXECUTE PROCEDURE without a procedure name"},
+	} {
+		_, problems := ParseRoutine(tt.body, ParseOptions{})
+		if len(problems) != 1 || problems[0].Line != tt.line || problems[0].Column != tt.column || problems[0].Message != tt.message {
+			t.Errorf("ParseRoutine(%q) problems = %+v, want %q at %d:%d", tt.body, problems, tt.message, tt.line, tt.column)
+		}
+	}
+}
+
+func TestRoutineCalleeLinesAreSortedAndUnique(t *testing.T) {
+	r := &Routine{calls: []callSite{{name: "P", line: 5}, {name: "P", line: 3}, {name: "P", line: 5}, {name: "Q", line: 4}, {name: "P", line: 3}}}
+	want := []Callee{{Name: "P", Lines: []int{3, 5}}, {Name: "Q", Lines: []int{4}}}
+	if got := r.Callees(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("Callees() = %+v, want %+v", got, want)
+	}
+}

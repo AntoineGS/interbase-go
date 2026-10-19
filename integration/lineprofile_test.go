@@ -580,6 +580,13 @@ BEGIN
   EXECUTE PROCEDURE LP_RET :R RETURNING_VALUES :R, :Q;
   SUSPEND;
 END`,
+		`CREATE PROCEDURE LP_CALLER_P RETURNS (R INTEGER, Q SMALLINT) AS
+BEGIN
+  EXECUTE PROCEDURE LP_RET 4 RETURNING_VALUES (:R, :Q);
+  SUSPEND;
+  EXECUTE PROCEDURE LP_RET (5) RETURNING_VALUES (Q, R);
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_MANY RETURNS (I INTEGER) AS
 BEGIN
   I = 0;
@@ -1070,6 +1077,8 @@ func TestLineProfileDifferential(t *testing.T) {
 							t.Fatalf("variable argument SQL = %q", byVariable.SQL)
 						}
 					}},
+				{name: "returning values in parentheses", sql: "select * from LP_CALLER_P"},
+				{name: "returning values in parentheses, stepped", sql: "select * from LP_CALLER_P", stepInto: []string{"LP_RET"}},
 				{name: "WHEN without errors from the callee", sql: "select * from LP_WHEN(0)",
 					unexecuted: []string{"'not reached 1'", "'not reached 2'", "'-other'", "'-inner'", "'-outer'", "'-any'"},
 					check:      lpCheckSavepoints},
