@@ -220,6 +220,12 @@ func TestIntrospectionOnClosedConn(t *testing.T) {
 // TestIntrospectionPlanInsideWritableTransaction carries both the
 // transaction-selection check and the load-bearing safety check, because both
 // need the same writable explicit transaction.
+//
+// InterBase rejects DML and SELECT on a table created in the same uncommitted
+// transaction (SQLCODE -204, "Table unknown"), so the probe table is committed
+// before the transaction starts. A stored procedure, unlike a table, is usable
+// in the transaction that created it and invisible elsewhere until commit,
+// which makes it the uncommitted object for the transaction-selection proof.
 func TestIntrospectionPlanInsideWritableTransaction(t *testing.T) {
 	fixture, cfg, cleanup := createFixture(t, 3)
 	first := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 3,
@@ -227,6 +233,11 @@ func TestIntrospectionPlanInsideWritableTransaction(t *testing.T) {
 	second := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "", 3,
 		interbase.TransactionOptions{})
 	ctx := readContext(t)
+
+	if _, err := first.ExecContext(ctx,
+		"CREATE TABLE GO_INTROSPECTION_TXPROBE (ID INTEGER NOT NULL PRIMARY KEY, TEXT_VALUE VARCHAR(32))"); err != nil {
+		t.Fatalf("create probe table: %v", err)
+	}
 
 	pooled, err := first.Conn(ctx)
 	if err != nil {
@@ -246,30 +257,53 @@ func TestIntrospectionPlanInsideWritableTransaction(t *testing.T) {
 	}()
 
 	if _, err := tx.ExecContext(ctx,
-		"CREATE TABLE GO_INTROSPECTION_TXPROBE (ID INTEGER NOT NULL PRIMARY KEY, TEXT_VALUE VARCHAR(32))"); err != nil {
-		t.Fatalf("create probe table: %v", err)
-	}
-	if _, err := tx.ExecContext(ctx,
 		"INSERT INTO GO_INTROSPECTION_TXPROBE (ID, TEXT_VALUE) VALUES (1, 'sentinel')"); err != nil {
 		t.Fatalf("insert probe sentinel: %v", err)
 	}
+	if _, err := tx.ExecContext(ctx, `CREATE PROCEDURE GO_INTROSPECTION_TXPROC AS
+BEGIN
+  INSERT INTO GO_INTROSPECTION_TXPROBE (ID, TEXT_VALUE) VALUES (3, 'procedure');
+END`); err != nil {
+		t.Fatalf("create probe procedure: %v", err)
+	}
 
-	// Transaction-selection proof: the table and row are still uncommitted, so
-	// a Plan that started its own implicit transaction could not see the
-	// metadata and prepare would fail with an unknown-table error.
+	// Transaction-selection proof: the procedure is still uncommitted, so a
+	// Plan that started its own implicit transaction could not see it and
+	// prepare would fail with an unknown-procedure error. The control below
+	// shows that another transaction indeed cannot see it.
+	otherConn, err := second.Conn(ctx)
+	if err != nil {
+		t.Fatalf("second DB.Conn(): %v", err)
+	}
+	if _, err := interbase.Plan(ctx, otherConn, "EXECUTE PROCEDURE GO_INTROSPECTION_TXPROC"); err == nil {
+		t.Fatal("Plan(EXECUTE PROCEDURE) outside the creating transaction succeeded; the uncommitted procedure is not a valid transaction-selection probe")
+	}
+	if err := otherConn.Close(); err != nil {
+		t.Fatalf("second sql.Conn.Close(): %v", err)
+	}
+	// The procedure form also matters on its own because the execution path
+	// does treat procedures specially: ib_connection_query re-prepares an
+	// implicit procedure under a write transaction, while
+	// ib_statement_prepare_mode has no such branch.
+	procedurePlan, err := interbase.Plan(ctx, pooled, "EXECUTE PROCEDURE GO_INTROSPECTION_TXPROC")
+	if err != nil {
+		t.Fatalf("pooled Plan(EXECUTE PROCEDURE) inside the writable transaction: %v", err)
+	}
+	t.Logf("plan for EXECUTE PROCEDURE GO_INTROSPECTION_TXPROC: %q", procedurePlan)
+	assertTxProbeUnchanged(t, ctx, tx, "after planning EXECUTE PROCEDURE")
+
 	plan, err := interbase.Plan(ctx, pooled,
 		"SELECT TEXT_VALUE FROM GO_INTROSPECTION_TXPROBE WHERE ID = 1")
 	if err != nil {
 		t.Fatalf("pooled Plan() inside the writable transaction: %v", err)
 	}
 	if plan == "" {
-		t.Fatal("pooled Plan() returned an empty plan for a SELECT on the uncommitted probe table")
+		t.Fatal("pooled Plan() returned an empty plan for a SELECT on the probe table")
 	}
 
 	// Safety proof: the transaction the DML would have run in is writable and
 	// reads its own uncommitted work, so an execute would be both permitted
-	// and visible. The reads go through tx because the probe table is not
-	// visible outside this transaction.
+	// and visible.
 	mutations := []string{
 		"UPDATE GO_INTROSPECTION_TXPROBE SET TEXT_VALUE = 'changed' WHERE ID = 1",
 		"DELETE FROM GO_INTROSPECTION_TXPROBE WHERE ID = 1",
@@ -284,23 +318,6 @@ func TestIntrospectionPlanInsideWritableTransaction(t *testing.T) {
 		assertTxProbeUnchanged(t, ctx, tx, fmt.Sprintf("after planning %q", statement))
 	}
 
-	// The procedure form is called out separately because the execution path
-	// does treat procedures specially: ib_connection_query re-prepares an
-	// implicit procedure under a write transaction (native.c:7486), while
-	// ib_statement_prepare_mode has no such branch.
-	if _, err := tx.ExecContext(ctx, `CREATE PROCEDURE GO_INTROSPECTION_TXPROC AS
-BEGIN
-  INSERT INTO GO_INTROSPECTION_TXPROBE (ID, TEXT_VALUE) VALUES (3, 'procedure');
-END`); err != nil {
-		t.Fatalf("create probe procedure: %v", err)
-	}
-	procedurePlan, err := interbase.Plan(ctx, pooled, "EXECUTE PROCEDURE GO_INTROSPECTION_TXPROC")
-	if err != nil {
-		t.Fatalf("pooled Plan(EXECUTE PROCEDURE): %v", err)
-	}
-	t.Logf("plan for EXECUTE PROCEDURE GO_INTROSPECTION_TXPROC: %q", procedurePlan)
-	assertTxProbeUnchanged(t, ctx, tx, "after planning EXECUTE PROCEDURE")
-
 	// A sql.ErrTxDone here would mean Plan had already completed the caller's
 	// transaction, which would make every assertion above vacuous.
 	if err := tx.Rollback(); err != nil {
@@ -308,14 +325,21 @@ END`); err != nil {
 	}
 	rolledBack = true
 
-	var relationCount int64
+	var procedureCount, rowCount int64
 	if err := second.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM RDB$RELATIONS WHERE RDB$RELATION_NAME = ?",
-		"GO_INTROSPECTION_TXPROBE").Scan(&relationCount); err != nil {
-		t.Fatalf("look up the probe table from the second attachment: %v", err)
+		"SELECT COUNT(*) FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME = ?",
+		"GO_INTROSPECTION_TXPROC").Scan(&procedureCount); err != nil {
+		t.Fatalf("look up the probe procedure from the second attachment: %v", err)
 	}
-	if relationCount != 0 {
-		t.Fatalf("GO_INTROSPECTION_TXPROBE relation count after rollback = %d, want 0", relationCount)
+	if procedureCount != 0 {
+		t.Fatalf("GO_INTROSPECTION_TXPROC procedure count after rollback = %d, want 0", procedureCount)
+	}
+	if err := second.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM GO_INTROSPECTION_TXPROBE").Scan(&rowCount); err != nil {
+		t.Fatalf("count probe rows from the second attachment: %v", err)
+	}
+	if rowCount != 0 {
+		t.Fatalf("probe row count after rollback = %d, want 0", rowCount)
 	}
 }
 

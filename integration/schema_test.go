@@ -256,7 +256,10 @@ BEGIN
   IF (NEW.ID IS NULL) THEN NEW.ID = GEN_ID(GO_SCHEMA_EXT_SEQUENCE, 1);
 END`,
 		`DECLARE EXTERNAL FUNCTION GO_SCHEMA_EXT_FUNCTION INTEGER RETURNS INTEGER BY VALUE ENTRY_POINT 'go_schema_ext_function' MODULE_NAME 'go_schema_ext_library'`,
-		`DECLARE EXTERNAL FUNCTION GO_SCHEMA_EXT_CSTRING CSTRING(80)
+		`DECLARE EXTERNAL FUNCTION GO_SCHEMA_EXT_CSTRING CSTRING(80) CHARACTER SET NONE
+RETURNS CSTRING(80) CHARACTER SET NONE FREE_IT
+ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
+		`DECLARE EXTERNAL FUNCTION GO_SCHEMA_EXT_CSTRING_DEFAULT CSTRING(80)
 RETURNS CSTRING(80) FREE_IT
 ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
 		`CREATE ROLE GO_SCHEMA_EXT_ROLE`,
@@ -425,8 +428,11 @@ ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
 	if function == nil || len(function.Arguments) == 0 {
 		t.Fatalf("external function = %#v, want argument metadata", function)
 	}
-	if _, err := function.GenerateDDL(); !errors.Is(err, catalogschema.ErrUnsupportedDDL) {
-		t.Fatalf("external function DDL error = %v, want ErrUnsupportedDDL", err)
+	// External function DDL became supported in 795f265 (schema: render UDF
+	// declarations); this pins the live catalog rendering of the fixture UDF.
+	const wantFunctionDDL = `DECLARE EXTERNAL FUNCTION "GO_SCHEMA_EXT_FUNCTION" INTEGER RETURNS INTEGER BY VALUE ENTRY_POINT 'go_schema_ext_function' MODULE_NAME 'go_schema_ext_library'`
+	if functionDDL, err := function.GenerateDDL(); err != nil || functionDDL != wantFunctionDDL {
+		t.Fatalf("external function DDL = (%q, %v), want (%q, nil)", functionDDL, err, wantFunctionDDL)
 	}
 	if returnType, err := function.ReturnType(); err != nil || returnType != "INTEGER" {
 		t.Fatalf("external function ReturnType = (%q, %v), want (\"INTEGER\", nil)", returnType, err)
@@ -454,7 +460,8 @@ ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
 	if cstringFunction == nil || len(cstringFunction.Arguments) == 0 {
 		t.Fatalf("CSTRING external function = %#v, want declared argument metadata", cstringFunction)
 	}
-	// The declared length is CSTRING(80). A mismatch here means the rule reads
+	// The declared length is CSTRING(80) under CHARACTER SET NONE, where the
+	// catalog byte length equals the declared length. A mismatch here means the rule reads
 	// the wrong catalog column; fix the column choice, never add a +/-1.
 	if returnType, err := cstringFunction.ReturnType(); err != nil || returnType != "CSTRING(80)" {
 		t.Fatalf("CSTRING ReturnType = (%q, %v), want (\"CSTRING(80)\", nil)", returnType, err)
@@ -464,6 +471,22 @@ ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
 		if err != nil || sqlType != "CSTRING(80)" {
 			t.Fatalf("CSTRING argument %d SQLType = (%q, %v), want (\"CSTRING(80)\", nil)", argument.Position.Int64, sqlType, err)
 		}
+	}
+
+	// The fixture database defaults to UTF8, so an undeclared CSTRING takes
+	// that character set (and a byte length of four per character). The
+	// catalog supplies no character-set name for function arguments, so the
+	// declaration is refused rather than rendered without its character set.
+	defaultFunction, err := catalog.Function(ctx, "GO_SCHEMA_EXT_CSTRING_DEFAULT")
+	if err != nil {
+		t.Fatalf("default-charset CSTRING external function lookup: %v", err)
+	}
+	if defaultFunction == nil || len(defaultFunction.Arguments) == 0 {
+		t.Fatalf("default-charset CSTRING external function = %#v, want declared argument metadata", defaultFunction)
+	}
+	if returnType, err := defaultFunction.ReturnType(); !errors.Is(err, catalogschema.ErrUnsupportedDDL) ||
+		!strings.Contains(err.Error(), "character set name is unavailable") {
+		t.Fatalf("default-charset CSTRING ReturnType = (%q, %v), want ErrUnsupportedDDL for the unnamed character set", returnType, err)
 	}
 
 	shadows, err := catalog.Shadows(ctx)
