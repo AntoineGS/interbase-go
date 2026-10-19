@@ -6,6 +6,9 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
+
+	"interbase-go/internal/nativegate"
 )
 
 type pendingFake struct {
@@ -280,6 +283,97 @@ func TestPrepareNextRejectsCanceledContextBeforePrepare(t *testing.T) {
 	}
 	if len(f.prepares) != 0 {
 		t.Fatalf("prepared %v", f.prepares)
+	}
+}
+
+func TestPrepareNextExecReportsKnownSuccessWhenStatementCloseFails(t *testing.T) {
+	f := &pendingFake{closeErr: errors.New("drop failed")}
+	c := f.connection()
+	const insert = "INSERT INTO T VALUES (1)"
+	if _, _, err := c.prepareNext(context.Background(), insert); err != nil {
+		t.Fatal(err)
+	}
+	result, err := c.ExecContext(context.Background(), insert, nil)
+	if err != nil {
+		t.Fatalf("a completed write reported failure: %v", err)
+	}
+	if affected, _ := result.RowsAffected(); affected != 3 {
+		t.Fatalf("affected = %d", affected)
+	}
+	if !c.closed {
+		t.Fatal("a failed statement close did not invalidate the connection")
+	}
+}
+
+func TestPrepareNextCanceledWriteWithFailedCloseIsUncertain(t *testing.T) {
+	f := &pendingFake{closeErr: errors.New("drop failed")}
+	c := f.connection()
+	const update = "UPDATE T SET X = 1"
+	if _, _, err := c.prepareNext(context.Background(), update); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f.execErr = &Error{Operation: "execute prepared statement", NativeCode: nativeCancelledCode, Message: "isc_cancelled"}
+	c.pending.native.execOverride = func([]argument) (int64, error) {
+		cancel()
+		return 0, f.execErr
+	}
+	_, err := c.ExecContext(ctx, update, nil)
+	var uncertain *UncertainOutcomeError
+	if !errors.As(err, &uncertain) {
+		t.Fatalf("error = %v, want an uncertain outcome", err)
+	}
+}
+
+func TestPrepareNextDiscardWaitsForAdmissionWithItsContext(t *testing.T) {
+	f := &pendingFake{}
+	c := f.connection()
+	if _, _, err := c.prepareNext(context.Background(), pendingSQL); err != nil {
+		t.Fatal(err)
+	}
+	release := nativegate.Global.EnterExclusive()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.QueryContext(ctx, "SELECT Y FROM T", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		release()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want the context deadline", err)
+		}
+	case <-time.After(2 * time.Second):
+		release()
+		<-done
+		t.Fatal("discarding the pending statement ignored the context while the gate was exclusive")
+	}
+	if c.pending == nil || len(f.events) != 0 {
+		t.Fatalf("an unadmitted call consumed the pending statement: events=%v", f.events)
+	}
+}
+
+func TestPrepareNextFailedDiscardInvalidatesWithoutDeadlock(t *testing.T) {
+	f := &pendingFake{closeErr: errors.New("drop failed")}
+	c := f.connection()
+	if _, _, err := c.prepareNext(context.Background(), pendingSQL); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.QueryContext(context.Background(), "SELECT Y FROM T", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !c.closed {
+			t.Fatalf("error=%v closed=%v, want a close failure that invalidates the connection", err, c.closed)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a failed discard deadlocked while the call held native admission")
 	}
 }
 

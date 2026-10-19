@@ -398,14 +398,14 @@ func (c *conn) inspectPreparedStatementLocked(ctx context.Context, query, operat
 // otherwise it closes it and returns nil.
 func (c *conn) prepareInspectedLocked(ctx context.Context, query, operation string,
 	inspect func(*nativeStatement) error, keep bool) (*nativeStatement, error) {
-	if err := c.discardPendingLocked(); err != nil {
-		return nil, err
-	}
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer releaseNative()
+	if err := c.discardPendingLocked(); err != nil {
+		return nil, c.failAdmittedLocked(releaseNative, err)
+	}
 	statement, err := c.native.prepare(ctx, query)
 	if err != nil {
 		releaseNative()

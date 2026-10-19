@@ -1105,14 +1105,14 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	if err := c.discardPendingLocked(); err != nil {
-		return nil, err
-	}
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer releaseNative()
+	if err := c.discardPendingLocked(); err != nil {
+		return nil, c.failAdmittedLocked(releaseNative, err)
+	}
 	nativeStatement, err := c.native.prepare(ctx, query)
 	if err != nil {
 		releaseNative()
@@ -1242,39 +1242,45 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	pending, err := c.takePendingLocked(query, args)
+	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	releaseNative, err := enterNativeContext(ctx)
-	if err != nil {
-		return nil, errors.Join(err, c.releaseStatementLocked(pending))
-	}
 	defer releaseNative()
+	pending, err := c.takePendingLocked(query, args)
+	if err != nil {
+		return nil, c.failAdmittedLocked(releaseNative, err)
+	}
 	var affected int64
 	if pending != nil {
 		affected, err = pending.native.exec(ctx, args)
 	} else {
 		affected, err = c.native.exec(ctx, query, args, false)
 	}
-	releaseNative()
 	if err != nil {
+		outcomeState := c.native.writeOutcomeState()
+		releaseErr := c.closeOwnedStatementLocked(pending)
+		releaseNative()
 		evidence := nativeCancellationEvidenceOf(err)
 		parts := splitNativeExecutionError(err)
 		operationErr := c.sanitizeError("exec", parts.primary)
-		cleanupErr := c.sanitizeError("", parts.cleanup)
+		cleanupErr := errors.Join(c.sanitizeError("", parts.cleanup), releaseErr)
 		operationErr = classifyNativeWriteOutcome("execute", true,
-			contextCancellation(ctx), operationErr, cleanupErr, c.native.writeOutcomeState(), evidence)
+			contextCancellation(ctx), operationErr, cleanupErr, outcomeState, evidence)
 		operationErr = joinNativeRequestDiagnostic(operationErr,
 			c.sanitizeError("", parts.request))
-		operationErr = errors.Join(operationErr, c.releaseStatementLocked(pending))
-		if c.native.broken() {
+		if releaseErr != nil || c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
 		return nil, operationErr
 	}
-	if err := c.releaseStatementLocked(pending); err != nil {
-		return nil, err
+	// The execution succeeded and, outside a transaction, already committed.
+	// A failed statement close invalidates the connection; report the known
+	// success rather than an error that could invite an unsafe retry.
+	closeErr := c.closeOwnedStatementLocked(pending)
+	releaseNative()
+	if closeErr != nil {
+		c.invalidateLocked(closeErr)
 	}
 	if err := contextError(ctx); err != nil {
 		if c.native.broken() {
@@ -1311,16 +1317,16 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	pending, err := c.takePendingLocked(query, args)
-	if err != nil {
-		return nil, err
-	}
 
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
-		return nil, errors.Join(err, c.releaseStatementLocked(pending))
+		return nil, err
 	}
 	defer releaseNative()
+	pending, err := c.takePendingLocked(query, args)
+	if err != nil {
+		return nil, c.failAdmittedLocked(releaseNative, err)
+	}
 	var nativeRows *nativeCursor
 	var columns []string
 	if pending != nil {
@@ -1328,23 +1334,24 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	} else {
 		nativeRows, columns, err = c.native.query(ctx, query, args, false)
 	}
-	releaseNative()
 	if err != nil {
+		outcomeState := c.native.writeOutcomeState()
+		releaseErr := c.closeOwnedStatementLocked(pending)
+		releaseNative()
 		evidence := nativeCancellationEvidenceOf(err)
 		parts := splitNativeExecutionError(err)
 		operationErr := c.sanitizeError("query", parts.primary)
-		cleanupErr := c.sanitizeError("", parts.cleanup)
+		cleanupErr := errors.Join(c.sanitizeError("", parts.cleanup), releaseErr)
 		operationErr = classifyNativeWriteOutcome("query", nativeQueryMutatingOf(err),
-			contextCancellation(ctx), operationErr, cleanupErr,
-			c.native.writeOutcomeState(), evidence)
+			contextCancellation(ctx), operationErr, cleanupErr, outcomeState, evidence)
 		operationErr = joinNativeRequestDiagnostic(operationErr,
 			c.sanitizeError("", parts.request))
-		operationErr = errors.Join(operationErr, c.releaseStatementLocked(pending))
-		if c.native.broken() {
+		if releaseErr != nil || c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
 		return nil, operationErr
 	}
+	releaseNative()
 	result := &rows{
 		conn:                c,
 		native:              nativeRows,

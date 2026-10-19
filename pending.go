@@ -69,7 +69,11 @@ func (p *PendingStatement) Close() error {
 		if c.closed || c.pending != p.statement {
 			return nil
 		}
-		return c.discardPendingLocked()
+		if err := c.discardPendingLocked(); err != nil {
+			c.invalidateLocked(err)
+			return err
+		}
+		return nil
 	})
 	if errors.Is(err, sql.ErrConnDone) {
 		return nil
@@ -114,7 +118,8 @@ func (c *conn) prepareNext(ctx context.Context, query string) (*stmt, StatementD
 }
 
 // takePendingLocked returns the pending statement when query and args select
-// it, and otherwise discards any pending statement.
+// it, and otherwise discards any pending statement. Like discardPendingLocked
+// it leaves invalidation after a close failure to the caller.
 func (c *conn) takePendingLocked(query string, args []argument) (*stmt, error) {
 	pending := c.pending
 	if pending == nil {
@@ -127,22 +132,40 @@ func (c *conn) takePendingLocked(query string, args []argument) (*stmt, error) {
 	return nil, c.discardPendingLocked()
 }
 
+// discardPendingLocked closes any pending statement. On a close failure the
+// caller must invalidate the connection once it holds no native admission,
+// because invalidation waits for every admitted native call.
 func (c *conn) discardPendingLocked() error {
 	pending := c.pending
 	c.pending, c.pendingQuery = nil, ""
-	return c.releaseStatementLocked(pending)
+	return c.closeOwnedStatementLocked(pending)
 }
 
-// releaseStatementLocked closes a statement the connection owns. A close
-// failure invalidates the connection, as stmt.Close does.
-func (c *conn) releaseStatementLocked(s *stmt) error {
+func (c *conn) closeOwnedStatementLocked(s *stmt) error {
 	if s == nil || c.closed {
 		return nil
 	}
 	if err := c.closeStatementLocked(s); err != nil {
-		err = c.sanitizeError("close statement", err)
-		c.invalidateLocked(err)
-		return err
+		return c.sanitizeError("close statement", err)
 	}
 	return nil
+}
+
+// releaseStatementLocked closes a statement the connection owns, for callers
+// holding no native admission. A close failure invalidates the connection, as
+// stmt.Close does.
+func (c *conn) releaseStatementLocked(s *stmt) error {
+	err := c.closeOwnedStatementLocked(s)
+	if err != nil {
+		c.invalidateLocked(err)
+	}
+	return err
+}
+
+// failAdmittedLocked releases the caller's native admission and then
+// invalidates the connection for err.
+func (c *conn) failAdmittedLocked(releaseNative func(), err error) error {
+	releaseNative()
+	c.invalidateLocked(err)
+	return err
 }
