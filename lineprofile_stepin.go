@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 
 	"interbase-go/psql"
 )
@@ -29,6 +30,9 @@ type lpCalleeKey struct {
 const (
 	lpReasonShape = "only EXECUTE PROCEDURE, or SELECT/FOR SELECT of plain output columns FROM the procedure with INTO, can be stepped into"
 	lpReasonBare  = "a procedure named in FROM without an argument list cannot be stepped into"
+	// lpReasonRunsAhead labels a native FOR SELECT over a procedure that
+	// cannot fetch one row at a time (ibg-mkx).
+	lpReasonRunsAhead = "may run ahead; step in for exact interleaving"
 )
 
 // stepIntoNames normalizes the caller's step-in procedure names
@@ -88,6 +92,129 @@ func nativeCallSites(plan *lpPlan, stepInto map[string]bool) []LineProfileCallSi
 		all = append(all, sites...)
 	}
 	return all
+}
+
+// procedureCursorText returns the text to prepare for SELECT node n. A
+// native FOR SELECT over a procedure gets FOR UPDATE when the procedure or
+// the loop body may write (ibg-mkx): the client then fetches one row at a
+// time, so the procedure runs no further ahead of the body than native PSQL
+// lets it, at the price of a round trip per row. The transaction must be
+// writable (it is whenever the routine may write). When FOR UPDATE does not
+// prepare, the plain text is used and runsAhead is the call site to label.
+func (r *lpRun) procedureCursorText(f *lpFrame, n *psql.Node, node *LineProfileNode) (string, *LineProfileCallSite) {
+	text := n.SQL.Text
+	if n.Kind != psql.NodeForSelect || r.opts.ReadOnly || hasForUpdate(text) {
+		return text, nil
+	}
+	procedure, ok := r.procedureCursorWrites(f.meta, n)
+	if !ok {
+		return text, nil
+	}
+	if _, err := r.bindQuiet(f, node, text+" FOR UPDATE", n.SQL.Params, false); err == nil {
+		return text + " FOR UPDATE", nil
+	}
+	return text, &LineProfileCallSite{Routine: f.meta.name, Line: n.Line, Procedure: procedure, Reason: lpReasonRunsAhead}
+}
+
+// procedureCursorWrites returns the first procedure that FOR SELECT node n
+// of meta selects from, and whether that cursor needs row-by-row fetches:
+// one of the procedures may write (a procedure not proved read-only by the
+// analysis is assumed to) or the loop body may write. The procedures are
+// the call sites on the lines from the statement's start to its body's
+// first line.
+func (r *lpRun) procedureCursorWrites(meta *lpRoutineMeta, n *psql.Node) (string, bool) {
+	body := n.Children[0]
+	var procedures []string
+	for _, site := range r.procedureSites(meta) {
+		if site.line >= n.Line && site.line <= body.Line {
+			procedures = append(procedures, site.name)
+		}
+	}
+	if len(procedures) == 0 {
+		return "", false
+	}
+	if r.bodyWrites(meta, body) {
+		return procedures[0], true
+	}
+	for _, name := range procedures {
+		if callee := r.plan.procs[name]; callee == nil || !callee.readsOnly {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// lpSite is a procedure reference of a routine.
+type lpSite struct {
+	name string
+	line int
+}
+
+// procedureSites lists the procedure references of meta: calls with an
+// argument list and bare FROM names that the analysis resolved to
+// procedures.
+func (r *lpRun) procedureSites(meta *lpRoutineMeta) []lpSite {
+	if sites, ok := r.sites[meta]; ok {
+		return sites
+	}
+	var sites []lpSite
+	for _, site := range meta.routine.CallSites() {
+		sites = append(sites, lpSite{name: site.Name, line: site.Line})
+	}
+	for _, source := range meta.routine.SourceNames() {
+		if _, isProcedure := r.plan.procs[source.Name]; isProcedure {
+			for _, line := range source.Lines {
+				sites = append(sites, lpSite{name: source.Name, line: line})
+			}
+		}
+	}
+	if r.sites == nil {
+		r.sites = make(map[*lpRoutineMeta][]lpSite)
+	}
+	r.sites[meta] = sites
+	return sites
+}
+
+// bodyWrites reports whether a loop body of meta may write: it contains a
+// data statement or EXECUTE PROCEDURE, or references a procedure.
+func (r *lpRun) bodyWrites(meta *lpRoutineMeta, body *psql.Node) bool {
+	for _, site := range r.procedureSites(meta) {
+		if site.line >= body.Line && site.line <= body.EndLine {
+			return true
+		}
+	}
+	var walk func(n *psql.Node) bool
+	walk = func(n *psql.Node) bool {
+		switch n.Kind {
+		case psql.NodeInsert, psql.NodeUpdate, psql.NodeDelete, psql.NodeExecProc:
+			return true
+		}
+		for _, child := range n.Children {
+			if walk(child) {
+				return true
+			}
+		}
+		for _, h := range n.Handlers {
+			if walk(h.Body) {
+				return true
+			}
+		}
+		return false
+	}
+	return walk(body)
+}
+
+// hasForUpdate reports whether a SELECT already ends with FOR UPDATE at
+// parenthesis depth 0.
+func hasForUpdate(text string) bool {
+	tokens := topLevelTokens(text)
+	for i := 1; i < len(tokens); i++ {
+		if strings.EqualFold(text[tokens[i-1].start:tokens[i-1].end], "FOR") &&
+			strings.EqualFold(text[tokens[i].start:tokens[i].end], "UPDATE") {
+			return true
+		}
+	}
+	return false
 }
 
 // stepsInto reports whether a SELECT … INTO or FOR SELECT node calls a

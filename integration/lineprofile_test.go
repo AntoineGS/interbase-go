@@ -80,6 +80,66 @@ BEGIN
   END
   SUSPEND;
 END`,
+		"CREATE TABLE LP_MK_LOG (ID INTEGER)",
+		`CREATE PROCEDURE LP_MK_GEN (N INTEGER) RETURNS (I INTEGER) AS
+BEGIN
+  I = 0;
+  WHILE (I < N) DO
+  BEGIN
+    I = I + 1;
+    INSERT INTO LP_MK_LOG VALUES (:I);
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_CALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_GEN(5) INTO :I DO
+  BEGIN
+    SELECT COUNT(*) FROM LP_MK_LOG INTO :C;
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_READ (N INTEGER) RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  I = 0;
+  WHILE (I < N) DO
+  BEGIN
+    I = I + 1;
+    SELECT COUNT(*) FROM LP_MK_LOG INTO :C;
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_WCALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I, C FROM LP_MK_READ(4) INTO :I, :C DO
+  BEGIN
+    INSERT INTO LP_MK_LOG VALUES (:I);
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_BAREW RETURNS (I INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_GEN(5) INTO :I DO
+    SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_MK_VIA (N INTEGER) RETURNS (I INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_BAREW INTO :I DO
+    IF (I <= N) THEN SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_MK_VCALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I FROM LP_MK_VIA(5) INTO :I DO
+  BEGIN
+    SELECT COUNT(*) FROM LP_MK_LOG INTO :C;
+    SUSPEND;
+  END
+END`,
+		`CREATE PROCEDURE LP_MK_RCALLER RETURNS (I INTEGER, C INTEGER) AS
+BEGIN
+  FOR SELECT I, C FROM LP_MK_READ(3) INTO :I, :C DO
+    SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_BLOBOUT RETURNS (B BLOB SUB_TYPE TEXT CHARACTER SET NONE) AS
 BEGIN
   FOR SELECT B FROM LP_BLOBS INTO :B DO
@@ -930,6 +990,11 @@ func TestLineProfileDifferential(t *testing.T) {
 							t.Fatalf("rows %d kept %d while hits %d; want 15, 10, 16", result.Rows, len(result.KeptRows), loop.Metrics.Hits)
 						}
 					}},
+				{name: "native procedure cursor that writes", sql: "select * from LP_MK_CALLER", check: lpCheckRowByRow(true)},
+				{name: "stepped procedure cursor that writes", sql: "select * from LP_MK_CALLER", stepInto: []string{"LP_MK_GEN"}},
+				{name: "native procedure cursor under a writing body", sql: "select * from LP_MK_WCALLER", check: lpCheckRowByRow(true)},
+				{name: "native procedure cursor writing through a bare procedure", sql: "select * from LP_MK_VCALLER", check: lpCheckRowByRow(true)},
+				{name: "native read-only procedure cursor", sql: "select * from LP_MK_RCALLER", check: lpCheckRowByRow(false)},
 			}
 			for _, c := range lpBlobFetchCases() {
 				tests = append(tests, struct {
@@ -1033,6 +1098,52 @@ func TestLineProfileDifferential(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+// lpCheckRowByRow checks ibg-mkx: the entry's FOR SELECT over a procedure
+// is sent with FOR UPDATE (one row per fetch) exactly when it may write, and
+// the first-hit times are consistent.
+func lpCheckRowByRow(want bool) func(t *testing.T, result interbase.LineProfileResult) {
+	return func(t *testing.T, result interbase.LineProfileResult) {
+		t.Helper()
+		routine := result.Routines[0]
+		loop := routine.Nodes[lpNodeAt(t, routine, "FOR SELECT")]
+		if got := strings.HasSuffix(loop.SQL, " FOR UPDATE"); got != want {
+			t.Fatalf("FOR SELECT sent %q, want FOR UPDATE %v", loop.SQL, want)
+		}
+		for _, site := range result.NativeCallSites {
+			t.Fatalf("unexpected native call site %+v", site)
+		}
+		t.Logf("FOR SELECT rows %d server calls %d round trips %d raw %v", loop.Metrics.Rows, loop.Metrics.ServerCalls, loop.Metrics.RoundTrips, loop.Metrics.Raw)
+		lpCheckFirstHits(t, result)
+	}
+}
+
+// lpCheckFirstHits checks the first-hit invariants: a node's first hit is
+// part of its total (all of it for a single hit), a line's is the sum of its
+// nodes', and routine totals have none.
+func lpCheckFirstHits(t *testing.T, result interbase.LineProfileResult) {
+	t.Helper()
+	for _, routine := range result.Routines {
+		lines := make(map[int]time.Duration)
+		for _, node := range routine.Nodes {
+			m := node.Metrics
+			if m.FirstRaw > m.Raw || m.FirstAdjusted > m.Adjusted || m.Hits == 1 && (m.FirstRaw != m.Raw || m.FirstAdjusted != m.Adjusted) {
+				t.Fatalf("%s node at line %d: hits %d first %v/%v total %v/%v", node.Kind, node.Line, m.Hits, m.FirstRaw, m.FirstAdjusted, m.Raw, m.Adjusted)
+			}
+			if m.Hits > 0 {
+				lines[node.Line] += m.FirstRaw
+			}
+		}
+		for line, first := range lines {
+			if routine.Lines[line].FirstRaw != first {
+				t.Fatalf("line %d first raw %v, want %v", line, routine.Lines[line].FirstRaw, first)
+			}
+		}
+		if routine.Inclusive.FirstRaw != 0 || routine.Exclusive.FirstRaw != 0 {
+			t.Fatalf("routine %s totals have first-hit times", routine.Name)
+		}
 	}
 }
 

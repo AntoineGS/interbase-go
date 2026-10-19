@@ -249,6 +249,21 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
 - `StepInto` lists procedures to emulate when called in a supported shape, so
   their lines are profiled too; other calls run natively and are reported in
   `NativeCallSites`.
+- A native `FOR SELECT` over a procedure would let the client's row
+  prefetch run the procedure ahead of the loop body. When the procedure (as
+  far as the analysis can tell) or the loop body may write, and the run is
+  read-write, the profiler sends the cursor with `FOR UPDATE`, which makes
+  the client fetch one row at a time, so the procedure and the body
+  interleave as in native PSQL. Each row then costs a round trip, counted in
+  the line's time. When `FOR UPDATE` does not prepare for that statement,
+  the plain statement runs and the call site is listed in `NativeCallSites`
+  with the reason "may run ahead; step in for exact interleaving".
+- `FirstRaw` and `FirstAdjusted` give the part of a node's (or line's) time
+  spent in its first hit. A native callee's first call in an attachment can
+  be much slower than later calls, because the server compiles it on first
+  execution; the first-hit times show that cost next to the total. Preparing
+  the call beforehand does not move it (measured), so the profiler does not
+  try to warm callees up.
 - BLOB values fetched into variables are held in client memory up to
   `MaxBlobBytes` (default 16 MiB). A larger BLOB ends the run as `failed` at
   its line with "BLOB too large to emulate"; the value is never truncated and

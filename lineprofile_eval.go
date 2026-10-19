@@ -353,14 +353,18 @@ func (r *lpRun) bindSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (bou
 		b, err := r.bind(f, node, chosen.text, n.SQL.Params)
 		return b, chosen.cast, err
 	}
-	b, err := r.bind(f, node, n.SQL.Text, n.SQL.Params)
+	base, runsAhead := r.procedureCursorText(f, n, node)
+	b, err := r.bind(f, node, base, n.SQL.Params)
 	if err != nil {
 		return b, nil, err
+	}
+	if runsAhead != nil {
+		r.result.NativeCallSites = append(r.result.NativeCallSites, *runsAhead)
 	}
 	if r.selects == nil {
 		r.selects = make(map[string]lpSelectText)
 	}
-	r.selects[key] = lpSelectText{text: n.SQL.Text}
+	r.selects[key] = lpSelectText{text: base}
 	outputs := b.stmt.Outputs()
 	types := make([]string, len(outputs))
 	needed := false
@@ -372,7 +376,7 @@ func (r *lpRun) bindSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (bou
 	if !needed {
 		return b, nil, nil
 	}
-	text, cast := castSelectItems(n.SQL.Text, types)
+	text, cast := castSelectItems(base, types)
 	if cast == nil {
 		return b, nil, nil
 	}

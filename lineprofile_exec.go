@@ -31,6 +31,7 @@ type lpRun struct {
 	statements map[string]cachedStatement
 	selects    map[string]lpSelectText // chosen SELECT text per node (R18)
 	writes     map[*psql.Node]bool     // blockWrites results
+	sites      map[*lpRoutineMeta][]lpSite
 	// stepInto holds the procedures run under emulation when called in a
 	// step-in shape (spec 6.7).
 	stepInto map[string]bool

@@ -195,10 +195,44 @@ func (plan *lpPlan) callees(ctx context.Context, tx *Transaction, meta *lpRoutin
 			}
 		}
 		callee.Parses = ok && len(calleeMeta.problems) == 0
+		if ok {
+			if err := plan.checkReadsOnly(ctx, tx, calleeMeta); err != nil {
+				return nil, false, err
+			}
+		}
 		callees = append(callees, callee)
 	}
 	sort.SliceStable(callees, func(i, j int) bool { return callees[i].Lines[0] < callees[j].Lines[0] })
 	return callees, mayWrite, nil
+}
+
+// checkReadsOnly sets meta.readsOnly when running the routine provably never
+// writes: it parses without problems, has no DML, EXECUTE PROCEDURE,
+// procedure call or GEN_ID, and none of its bare FROM names is a procedure.
+func (plan *lpPlan) checkReadsOnly(ctx context.Context, tx *Transaction, meta *lpRoutineMeta) error {
+	if meta.readsChecked {
+		return nil
+	}
+	meta.readsChecked = true
+	if meta.routine == nil || len(meta.problems) > 0 || meta.routine.MayWrite() {
+		return nil
+	}
+	sources := meta.routine.SourceNames()
+	if len(sources) > 0 {
+		candidates := make([]lookupName, len(sources))
+		for i, s := range sources {
+			candidates[i] = lookupName{name: s.Name, quoted: true}
+		}
+		procedures, err := readProcedureRefsTx(ctx, tx, candidates)
+		if err != nil {
+			return err
+		}
+		if len(procedures) > 0 {
+			return nil
+		}
+	}
+	meta.readsOnly = true
+	return nil
 }
 
 func mergeLines(a, b []int) []int {

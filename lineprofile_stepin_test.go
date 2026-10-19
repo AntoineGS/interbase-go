@@ -505,3 +505,76 @@ func TestLineProfileStepIntoNamesAreNormalized(t *testing.T) {
 		t.Fatalf("stepIntoSet() = %v, want %v", got, want)
 	}
 }
+
+// TestLineProfileNativeProcedureCursorRowByRow checks ibg-mkx: a native FOR
+// SELECT over a procedure fetches one row at a time (FOR UPDATE) when the
+// procedure or the loop body may write, so the procedure cannot run ahead of
+// the body; when FOR UPDATE does not prepare, the call site is labeled.
+func TestLineProfileNativeProcedureCursorRowByRow(t *testing.T) {
+	const reader = "BEGIN\n  FOR SELECT ID FROM LP_T INTO :X DO SUSPEND;\nEND"
+	const writer = "BEGIN\n  INSERT INTO LP_T (ID) VALUES (1);\n  SUSPEND;\nEND"
+	readBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT X FROM LP_SRC(1) INTO :Y DO\n    Y = Y + 1;\nEND"
+	writeBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT X FROM LP_SRC(1) INTO :Y DO\n    UPDATE LP_T SET A = :Y;\nEND"
+	joinBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT T.ID FROM LP_T T JOIN LP_SRC(1) S ON S.X = T.ID INTO :Y DO\n    Y = Y + 1;\nEND"
+	tableBody := "DECLARE VARIABLE Y INTEGER;\nBEGIN\n  FOR SELECT ID FROM LP_T INTO :Y DO\n    UPDATE LP_T SET A = :Y;\nEND"
+	for _, tt := range []struct {
+		name, body, callee string
+		known, readOnly    bool
+		refuse             bool
+		wantRowByRow       bool
+		wantSite           bool
+	}{
+		{name: "callee writes", body: readBody, callee: writer, known: true, wantRowByRow: true},
+		{name: "callee reads, body reads", body: readBody, callee: reader, known: true},
+		{name: "callee reads, body writes", body: writeBody, callee: reader, known: true, wantRowByRow: true},
+		{name: "callee unknown", body: readBody, wantRowByRow: true},
+		{name: "join with a writing callee", body: joinBody, callee: writer, known: true, wantRowByRow: true},
+		{name: "table only", body: tableBody, callee: writer, known: true},
+		{name: "read-only run", body: readBody, callee: writer, known: true, readOnly: true},
+		{name: "FOR UPDATE refused", body: readBody, callee: writer, known: true, refuse: true, wantSite: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var procs []lineProfileTestProc
+			if tt.known {
+				procs = []lineProfileTestProc{{name: "LP_SRC", body: tt.callee,
+					inputs: []lpParam{{"P", "INTEGER"}}, outputs: []lpParam{{"X", "INTEGER"}}}}
+			}
+			rows := 2
+			run, _ := newLineProfileStepRunRows(t, context.Background(), tt.body, procs, nil,
+				func() (bool, error) { rows--; return rows >= 0, nil })
+			if tt.known {
+				meta := run.plan.procs["LP_SRC"]
+				meta.readsOnly = tt.callee == reader
+			}
+			run.opts.ReadOnly = tt.readOnly
+			var prepared []string
+			prepare := run.tx.native.prepareContextOverride
+			run.tx.native.prepareContextOverride = func(query string, arrays bool, op *nativeCancelOperation) (*nativeStatement, error) {
+				prepared = append(prepared, query)
+				if tt.refuse && strings.HasSuffix(query, " FOR UPDATE") {
+					return nil, &Error{Operation: "prepare", SQLCode: -104, Message: "token unknown"}
+				}
+				return prepare(query, arrays, op)
+			}
+			if outcome, txErr := run.runInTransaction(); outcome != nil || txErr != nil {
+				t.Fatalf("runInTransaction() = %v, %v", outcome, txErr)
+			}
+			loop := run.result.Routines[0].Nodes[1]
+			rowByRow := strings.HasSuffix(loop.SQL, " FOR UPDATE")
+			if rowByRow != tt.wantRowByRow || loop.Metrics.Rows != 2 || loop.Metrics.Errors != 0 {
+				t.Fatalf("FOR SELECT sent %q (rows %d, errors %d), want row by row %v; prepared %q",
+					loop.SQL, loop.Metrics.Rows, loop.Metrics.Errors, tt.wantRowByRow, prepared)
+			}
+			var sites []LineProfileCallSite
+			for _, site := range run.result.NativeCallSites {
+				if site.Reason == lpReasonRunsAhead {
+					sites = append(sites, site)
+				}
+			}
+			if tt.wantSite != (len(sites) == 1) || tt.wantSite &&
+				(sites[0] != LineProfileCallSite{Routine: "LP_FAKE", Line: 3, Procedure: "LP_SRC", Reason: lpReasonRunsAhead}) {
+				t.Fatalf("run-ahead call sites %+v, want one: %v", sites, tt.wantSite)
+			}
+		})
+	}
+}

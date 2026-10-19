@@ -151,7 +151,9 @@ type LineProfileResult struct {
 }
 
 // LineProfileCallSite is a call of a procedure marked for step-in that runs
-// natively because of its shape.
+// natively because of its shape, or a native FOR SELECT over a procedure
+// that may run ahead of its loop body because it could not be fetched one
+// row at a time.
 type LineProfileCallSite struct {
 	Routine           string
 	Line              int
@@ -172,6 +174,9 @@ type lpRoutineMeta struct {
 	inputs, outputs []lpParam
 	routine         *psql.Routine
 	problems        []RoutineProblem
+	// readsOnly is set when the analysis proved that running the routine
+	// never writes (see lpPlan.checkReadsOnly); false means it may write.
+	readsOnly, readsChecked bool
 }
 
 // lpPlan is everything AnalyzeLineProfile reads, kept for the run.
