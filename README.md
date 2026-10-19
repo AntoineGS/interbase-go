@@ -293,6 +293,12 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   GENERATOR` (not transactional) and `SAVEPOINT`, `RELEASE SAVEPOINT`,
   `ROLLBACK [WORK] TO SAVEPOINT` (they would interfere with the profiler's
   own savepoints).
+- BLOB variables follow InterBase (verified natively, dialects 1 and 3): a
+  BLOB variable or BLOB output parameter assigned to a text variable fails
+  with SQLCODE -902, while a BLOB column selected into one is cut to the
+  variable's length; a CHAR value assigned to a BLOB fills its full width in
+  bytes; `IS NULL` is false for any BLOB variable holding a value. A BLOB
+  variable used inside a larger expression is not emulated exactly.
 - Limitations: the emulator covers the supported PSQL subset; unsupported
   routines are refused up front with line and column. A run ends as
   `completed`, `failed` (with `FailedAt`) or `canceled` (context done).
