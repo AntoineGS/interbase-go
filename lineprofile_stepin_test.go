@@ -629,3 +629,38 @@ func TestLineProfileNativeCallSitesOnlyInSteppedRoutines(t *testing.T) {
 		t.Fatalf("native call sites %+v, want %+v", got, want)
 	}
 }
+
+// TestLineProfileBlobColumnTextMultiByte checks that a text BLOB column
+// fits a variable with a multi-byte character set when its bytes are no
+// more than the declared length, and that a cut is still refused.
+func TestLineProfileBlobColumnTextMultiByte(t *testing.T) {
+	run := &lpRun{plan: &lpPlan{dialect: 3, charsets: map[int]lpCharset{0: {"NONE", 1}, 4: {"UTF8", 4}}}}
+	target := &lpVar{typ: psql.ParseTypeText("VARCHAR(5) CHARACTER SET UTF8")}
+	got, err := run.blobColumnText("abcde", "BLOB SUB_TYPE 1", target)
+	if err != nil || got != "abcde" {
+		t.Fatalf("blobColumnText(5 bytes) = %v, %v; want the value", got, err)
+	}
+	if _, err := run.blobColumnText("abcdef", "BLOB SUB_TYPE 1", target); !isFatal(err) {
+		t.Fatalf("blobColumnText(6 bytes) error = %v; want unsupported", err)
+	}
+}
+
+// TestLineProfileEmptyTypeText checks that an empty type text is refused,
+// not a panic.
+func TestLineProfileEmptyTypeText(t *testing.T) {
+	run := &lpRun{plan: &lpPlan{dialect: 3, charsets: map[int]lpCharset{0: {"NONE", 1}}}}
+	if err := errBlobVariable(""); !isFatal(err) {
+		t.Fatalf("errBlobVariable(\"\") = %v; want unsupported", err)
+	}
+	if _, err := run.blobColumnText("ab", "BLOB SUB_TYPE 1", &lpVar{}); !isFatal(err) {
+		t.Fatalf("blobColumnText to an empty type = %v; want unsupported", err)
+	}
+	if length, perChar := run.textLength(" "); length != 0 || perChar != 1 {
+		t.Fatalf("textLength(blank) = %d, %d", length, perChar)
+	}
+}
+
+func isFatal(err error) bool {
+	var fatalErr *lpFatalError
+	return errors.As(err, &fatalErr)
+}

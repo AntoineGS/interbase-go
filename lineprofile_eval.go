@@ -679,7 +679,7 @@ func errBlobConversion(value any, word string, dialect int) error {
 // with other errors, which the emulator does not reproduce: the run fails
 // as unsupported.
 func errBlobVariable(typeText string) error {
-	switch word := strings.Fields(normalizeType(typeText) + " ")[0]; {
+	switch word := typeWord(typeText); {
 	case strings.HasPrefix(word, "CHAR") || strings.HasPrefix(word, "VARCHAR"):
 		return errBlobInternal()
 	}
@@ -847,7 +847,7 @@ func (r *lpRun) textLength(typeText string) (length, perChar int) {
 	}
 	perChar = 1
 	if i := strings.Index(normalized, " CHARACTER SET "); i >= 0 {
-		name := strings.Fields(normalized[i+len(" CHARACTER SET "):])[0]
+		name := firstWord(normalized[i+len(" CHARACTER SET "):])
 		for _, charset := range r.plan.charsets {
 			if strings.EqualFold(charset.name, name) {
 				perChar = charset.bytesPerChar
@@ -875,8 +875,9 @@ func exceedsPrecision(value, typeText string) bool {
 // blobColumnText converts a BLOB column's value, as a statement converts a
 // BLOB it selects into a text variable: a text BLOB is cut to the
 // variable's length, without error (verified natively). It is done here for
-// a variable whose character set has one byte per character; other targets
-// fail the run as unsupported (natively a numeric target fails with
+// a variable whose character set has one byte per character, or of
+// any character set when no cut is needed; other targets fail the run as
+// unsupported (natively a numeric target fails with
 // SQLCODE -413). The driver would otherwise refuse a value longer than the
 // parameter.
 func (r *lpRun) blobColumnText(value any, sourceType string, target *lpVar) (any, error) {
@@ -888,10 +889,12 @@ func (r *lpRun) blobColumnText(value any, sourceType string, target *lpVar) (any
 	}
 	normalized := normalizeType(sourceType)
 	text := strings.Contains(normalized, "SUB_TYPE 1") || strings.Contains(normalized, "SUB_TYPE TEXT")
-	word := strings.Fields(normalizeType(target.typ.Text) + " ")[0]
+	word := typeWord(target.typ.Text)
 	length, perChar := r.textLength(target.typ.Text)
 	s, isString := value.(string)
-	if !text || !isString || perChar != 1 || length == 0 ||
+	// A multi-byte target always holds a value of no more bytes than its
+	// declared length; a cut of one would have to find a character edge.
+	if !text || !isString || length == 0 || perChar != 1 && len(s) > length ||
 		!strings.HasPrefix(word, "CHAR") && !strings.HasPrefix(word, "VARCHAR") {
 		return nil, fatal(fmt.Errorf("interbase: line profile: converting a %s value to %s is not supported", sourceType, target.typ.Text))
 	}
@@ -899,6 +902,19 @@ func (r *lpRun) blobColumnText(value any, sourceType string, target *lpVar) (any
 		s = s[:length]
 	}
 	return s, nil
+}
+
+// typeWord is the first word of a type text in its canonical spelling, or
+// "" for an empty text.
+func typeWord(typeText string) string {
+	return firstWord(normalizeType(typeText))
+}
+
+func firstWord(text string) string {
+	if fields := strings.Fields(text); len(fields) > 0 {
+		return fields[0]
+	}
+	return ""
 }
 
 // declaredType normalizes a declared type, adding the database default

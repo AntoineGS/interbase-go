@@ -515,6 +515,13 @@ BEGIN
   IF (X IS NULL) THEN Q = 'null'; ELSE Q = 'set';
   SUSPEND;
 END`,
+		`CREATE PROCEDURE LP_BUTF8 RETURNS (R VARCHAR(40) CHARACTER SET NONE) AS
+DECLARE VARIABLE U VARCHAR(10) CHARACTER SET UTF8;
+BEGIN
+  SELECT B FROM LP_BSEL_T(1) INTO :U;
+  R = U;
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_BISNULL RETURNS (R VARCHAR(10)) AS
 DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;
 BEGIN
@@ -2007,10 +2014,12 @@ func lpBlobFetchCases() []lpBlobFetchCase {
 // parameter assigned to a text variable fails with SQLCODE -902, while a
 // BLOB column selected into one is cut to its length; IS NULL on a BLOB
 // variable holding an integer is false; a date assigned to a BLOB fails
-// with SQLCODE -413.
+// with SQLCODE -413. A BLOB column fits a multi-byte text variable of at
+// least its length in bytes.
 func lpBlobEdgeCases() []lpBlobFetchCase {
 	cases := []lpBlobFetchCase{
 		{name: "BLOB edge: bad BLOB IS NULL", sql: "select * from LP_BISNULL"},
+		{name: "BLOB edge: text BLOB into a UTF8 variable it fits", sql: "select * from LP_BUTF8"},
 		{name: "BLOB edge: text BLOB from a stepped procedure cut to a text target", sql: "select * from LP_BTEXT(4)", stepInto: []string{"LP_BSEL_T"}},
 		{name: "BLOB edge: text BLOB rows from a stepped procedure", sql: "select * from LP_BTEXT(5)", stepInto: []string{"LP_BSEL_T"}},
 		{name: "BLOB edge: BLOB output parameter into text, stepped", sql: "select * from LP_BTEXT(2)", stepInto: []string{"LP_BOUT_T"},

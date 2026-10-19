@@ -711,21 +711,15 @@ func (r *lpRun) execProcedure(f *lpFrame, n *psql.Node, node *LineProfileNode) e
 		return nil
 	}
 	row := rows[0]
-	if len(n.Returning) > len(row) || len(row) != len(outputs) {
-		return fmt.Errorf("interbase: line profile: %d targets for %d columns", len(n.Returning), len(row))
-	}
 	// The outputs are parameters: a BLOB one is held as in a variable.
 	for i, name := range n.Returning {
-		if target, ok := f.vars[name]; ok && outputs[i].Kind == "BLOB" {
+		if target, ok := f.vars[name]; ok && i < len(row) && i < len(outputs) && outputs[i].Kind == "BLOB" {
 			if err := blobVariableInto(cellValue(row[i]), "BLOB", target); err != nil {
 				return err
 			}
 		}
-		if err := r.assign(f, node, name, cellValue(row[i]), outputs[i], false); err != nil {
-			return err
-		}
 	}
-	return nil
+	return r.assignRow(f, node, n.Returning, row, outputs, nil)
 }
 
 func procedureName(name string, quoted bool) string {
