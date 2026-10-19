@@ -20,7 +20,7 @@ type LineProfileOptions struct {
 	StepInto []string // procedures to emulate when called in a step-in shape (spec 6.7); names are upper-cased unless double-quoted
 	KeepRows int      // default 10
 	// MaxBlobBytes caps the bytes of a BLOB held in an emulated variable
-	// (0 means DefaultLineProfileMaxBlobBytes). A larger BLOB ends the run
+	// (0 or a negative value means DefaultLineProfileMaxBlobBytes). A larger BLOB ends the run
 	// as failed at its line ("BLOB too large to emulate"); a variable is
 	// never truncated, and WHEN handlers cannot catch the failure.
 	MaxBlobBytes int64

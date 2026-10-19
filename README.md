@@ -265,7 +265,7 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   the call beforehand does not move it (measured), so the profiler does not
   try to warm callees up.
 - BLOB values fetched into variables are held in client memory up to
-  `MaxBlobBytes` (default 16 MiB). A larger BLOB ends the run as `failed` at
+  `MaxBlobBytes` (default 16 MiB, also used for 0 or a negative value). A larger BLOB ends the run as `failed` at
   its line with "BLOB too large to emulate"; the value is never truncated and
   `WHEN` handlers cannot catch this. Kept output rows show at most 64 KiB of a
   BLOB.

@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -1247,6 +1248,28 @@ func TestLineProfileBlobReadIsBounded(t *testing.T) {
 	}
 	if !source.closed {
 		t.Fatal("BLOB reader not closed")
+	}
+}
+
+func TestLineProfileMaxBlobBytesLimits(t *testing.T) {
+	for _, tt := range []struct {
+		max, want int64
+	}{
+		{0, 16 << 20},
+		{-5, DefaultLineProfileMaxBlobBytes},
+		{100, 100},
+		{math.MaxInt64, math.MaxInt64 - 1},
+	} {
+		run := &lpRun{result: &LineProfileResult{}, countersUnavailable: true, opts: LineProfileOptions{MaxBlobBytes: tt.max}}
+		if got := run.maxBlobBytes(); got != tt.want {
+			t.Fatalf("maxBlobBytes() with MaxBlobBytes %d = %d, want %d", tt.max, got, tt.want)
+		}
+		run.openBlob = func(BlobRef) (io.ReadCloser, error) {
+			return lineProfileFakeBlobReader{Reader: strings.NewReader("hello blob"), onRead: func() {}}, nil
+		}
+		if got, err := run.holdValue(BlobRef{subtype: 1}); err != nil || got != "hello blob" {
+			t.Fatalf("holdValue() with MaxBlobBytes %d = %q, %v; want the whole BLOB", tt.max, got, err)
+		}
 	}
 }
 

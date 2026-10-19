@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"strings"
 	"time"
 
@@ -755,11 +756,17 @@ func (r *lpRun) holdValue(value any) (any, error) {
 	return r.holdBlob(ref, r.maxBlobBytes(), false)
 }
 
+// maxBlobBytes is the effective MaxBlobBytes: the default for zero or a
+// negative value, at most math.MaxInt64-1 so that a read of cap+1 bytes
+// cannot overflow.
 func (r *lpRun) maxBlobBytes() int64 {
-	if r.opts.MaxBlobBytes > 0 {
-		return r.opts.MaxBlobBytes
+	switch {
+	case r.opts.MaxBlobBytes <= 0:
+		return DefaultLineProfileMaxBlobBytes
+	case r.opts.MaxBlobBytes == math.MaxInt64:
+		return math.MaxInt64 - 1
 	}
-	return DefaultLineProfileMaxBlobBytes
+	return r.opts.MaxBlobBytes
 }
 
 // errBlobTooLarge reports a BLOB over the MaxBlobBytes cap.
