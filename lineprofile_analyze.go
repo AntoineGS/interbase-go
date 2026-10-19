@@ -429,9 +429,12 @@ func databaseCharset(ctx context.Context, tx *Transaction) (string, error) {
 }
 
 // userExceptions reads RDB$EXCEPTIONS: names to number and message, and
-// numbers back to names.
+// numbers back to names. RDB$MESSAGE is CHARACTER SET NONE, so it is read
+// as OCTETS: the message keeps its bytes, as in the server's error, on any
+// attachment character set (a CP1252 byte cannot be transliterated to UTF8).
 func userExceptions(ctx context.Context, tx *Transaction) (map[string]lpException, map[int32]string, error) {
-	cursor, err := tx.Query(ctx, "SELECT RDB$EXCEPTION_NAME, RDB$EXCEPTION_NUMBER, RDB$MESSAGE FROM RDB$EXCEPTIONS")
+	cursor, err := tx.Query(ctx, "SELECT RDB$EXCEPTION_NAME, RDB$EXCEPTION_NUMBER, "+
+		"CAST(RDB$MESSAGE AS VARCHAR(32765) CHARACTER SET OCTETS) FROM RDB$EXCEPTIONS")
 	if err != nil {
 		return nil, nil, fmt.Errorf("interbase: read exceptions: %w", err)
 	}

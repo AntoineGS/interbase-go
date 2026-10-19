@@ -1210,6 +1210,50 @@ func TestLineProfileAnalysis(t *testing.T) {
 	}
 }
 
+// TestLineProfileExceptionMessageBytes checks ibg-96o: RDB$EXCEPTIONS
+// messages are CHARACTER SET NONE, so a CP1252 byte in one cannot be
+// transliterated to a UTF8 attachment; the analysis reads the messages as
+// bytes and the emulated EXCEPTION raises the same message as the server.
+func TestLineProfileExceptionMessageBytes(t *testing.T) {
+	fixture, cfg, cleanup := createFixture(t, 3, "")
+	setup := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, "NONE", 3,
+		interbase.TransactionOptions{Isolation: sql.LevelReadCommitted})
+	ctx := readContextWithTimeout(t, 3*time.Minute)
+	for _, statement := range []string{
+		"CREATE EXCEPTION LP_X8 'Caf\xe9 failure'",
+		"CREATE PROCEDURE LP_X8R (K INTEGER) RETURNS (R INTEGER) AS BEGIN R = K; SUSPEND; IF (K > 0) THEN EXCEPTION LP_X8; END",
+	} {
+		if _, err := setup.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	for _, charset := range []string{"UTF8", "NONE"} {
+		t.Run(charset, func(t *testing.T) {
+			db := openDatabase(t, cleanup, fixture.ConnectionString(), cfg.User, cfg.Password, charset, 3,
+				interbase.TransactionOptions{Isolation: sql.LevelReadCommitted})
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatalf("db.Conn(): %v", err)
+			}
+			defer conn.Close()
+			const query = "select * from LP_X8R(1)"
+			analysis, err := interbase.AnalyzeLineProfile(ctx, conn, query, 3, nil)
+			if err != nil || len(analysis.Problems) != 0 {
+				t.Fatalf("AnalyzeLineProfile() = %+v, %v", analysis.Problems, err)
+			}
+			_, nativeErr := lpNative(t, ctx, conn, query)
+			result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: query, Dialect: 3})
+			var native, emulated *interbase.Error
+			if err != nil || !errors.As(nativeErr, &native) || !errors.As(result.Err, &emulated) {
+				t.Fatalf("LineProfile() = %v (%v); native %v", result.Err, err, nativeErr)
+			}
+			if emulated.SQLCode != native.SQLCode || emulated.Message != native.Message || !strings.Contains(native.Message, "Caf\xe9") {
+				t.Fatalf("emulated %q (SQLCODE %d), native %q (SQLCODE %d)", emulated.Message, emulated.SQLCode, native.Message, native.SQLCode)
+			}
+		})
+	}
+}
+
 func TestLineProfileCancel(t *testing.T) {
 	conn, ctx := lpFixture(t, 3)
 	runCtx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
