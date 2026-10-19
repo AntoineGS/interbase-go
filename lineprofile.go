@@ -182,6 +182,9 @@ type lpRoutineMeta struct {
 	// readsOnly is set when the analysis proved that running the routine
 	// never writes (see lpPlan.checkReadsOnly); false means it may write.
 	readsOnly, readsChecked bool
+	// sourceProcs holds the bare FROM/JOIN names that are procedures, nil
+	// until looked up (lpPlan.sourceProcedures).
+	sourceProcs map[string]bool
 }
 
 // lpPlan is everything AnalyzeLineProfile reads, kept for the run.
@@ -197,6 +200,8 @@ type lpPlan struct {
 	// exceptionNames maps numbers back to names (RDB$EXCEPTIONS).
 	exceptions     map[string]lpException
 	exceptionNames map[int32]string
+	// readProcedureRefs replaces readProcedureRefsTx in tests.
+	readProcedureRefs func(context.Context, *Transaction, []lookupName) ([]RoutineRef, error)
 }
 
 // lpException is a user exception from RDB$EXCEPTIONS.

@@ -160,25 +160,14 @@ func (plan *lpPlan) callees(ctx context.Context, tx *Transaction, meta *lpRoutin
 	for _, c := range meta.routine.Callees() {
 		add(c, c.StepInShape)
 	}
-	sources := meta.routine.SourceNames()
-	if len(sources) > 0 {
-		candidates := make([]lookupName, len(sources))
-		for i, s := range sources {
-			candidates[i] = lookupName{name: s.Name, quoted: true}
-		}
-		procedures, err := readProcedureRefsTx(ctx, tx, candidates)
-		if err != nil {
-			return nil, false, err
-		}
-		found := make(map[string]bool, len(procedures))
-		for _, p := range procedures {
-			found[p.Name] = true
-		}
-		for _, s := range sources {
-			if found[s.Name] {
-				add(s, false)
-				mayWrite = true
-			}
+	found, err := plan.sourceProcedures(ctx, tx, meta)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, s := range meta.routine.SourceNames() {
+		if found[s.Name] {
+			add(s, false)
+			mayWrite = true
 		}
 	}
 	callees := make([]LineProfileCallee, 0, len(order))
@@ -217,22 +206,45 @@ func (plan *lpPlan) checkReadsOnly(ctx context.Context, tx *Transaction, meta *l
 	if meta.routine == nil || len(meta.problems) > 0 || meta.routine.MayWrite() {
 		return nil
 	}
-	sources := meta.routine.SourceNames()
-	if len(sources) > 0 {
+	found, err := plan.sourceProcedures(ctx, tx, meta)
+	if err != nil || len(found) > 0 {
+		return err
+	}
+	meta.readsOnly = true
+	return nil
+}
+
+// sourceProcedures returns the bare FROM/JOIN names of meta that are
+// procedures, looked up in RDB$PROCEDURES once per routine.
+func (plan *lpPlan) sourceProcedures(ctx context.Context, tx *Transaction, meta *lpRoutineMeta) (map[string]bool, error) {
+	if meta.sourceProcs != nil {
+		return meta.sourceProcs, nil
+	}
+	found := make(map[string]bool)
+	if sources := meta.routine.SourceNames(); len(sources) > 0 {
 		candidates := make([]lookupName, len(sources))
 		for i, s := range sources {
 			candidates[i] = lookupName{name: s.Name, quoted: true}
 		}
-		procedures, err := readProcedureRefsTx(ctx, tx, candidates)
+		procedures, err := plan.procedureRefs(ctx, tx, candidates)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if len(procedures) > 0 {
-			return nil
+		for _, p := range procedures {
+			found[p.Name] = true
 		}
 	}
-	meta.readsOnly = true
-	return nil
+	meta.sourceProcs = found
+	return found, nil
+}
+
+// procedureRefs resolves names in RDB$PROCEDURES (readProcedureRefsTx
+// unless a test replaced it).
+func (plan *lpPlan) procedureRefs(ctx context.Context, tx *Transaction, names []lookupName) ([]RoutineRef, error) {
+	if plan.readProcedureRefs != nil {
+		return plan.readProcedureRefs(ctx, tx, names)
+	}
+	return readProcedureRefsTx(ctx, tx, names)
 }
 
 func mergeLines(a, b []int) []int {

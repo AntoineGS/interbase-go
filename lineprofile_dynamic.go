@@ -323,7 +323,7 @@ func (r *lpRun) isProcedure(name string, quoted bool) (bool, error) {
 		return known, nil
 	}
 	start := time.Now()
-	refs, err := readProcedureRefsTx(r.ctx, r.tx, []lookupName{{name: name, quoted: quoted}})
+	refs, err := r.plan.procedureRefs(r.ctx, r.tx, []lookupName{{name: name, quoted: quoted}})
 	r.result.Prepare += time.Since(start)
 	if snapErr := r.snapshot(nil); err == nil {
 		err = snapErr

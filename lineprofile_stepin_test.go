@@ -578,3 +578,36 @@ func TestLineProfileNativeProcedureCursorRowByRow(t *testing.T) {
 		})
 	}
 }
+
+func TestLineProfileSourceProceduresResolvedOncePerRoutine(t *testing.T) {
+	routine, problems := psql.ParseRoutine("DECLARE VARIABLE X INTEGER;\nBEGIN\n"+
+		"  SELECT A FROM LP_SRC INTO :X;\n"+
+		"  SELECT A FROM LP_TAB INTO :X;\n"+
+		"END", psql.ParseOptions{Dialect: 3})
+	if len(problems) != 0 {
+		t.Fatalf("parse problems: %+v", problems)
+	}
+	meta := &lpRoutineMeta{name: "LP_CALLER", routine: routine}
+	lookups := 0
+	plan := &lpPlan{dialect: 3, procs: map[string]*lpRoutineMeta{"LP_CALLER": meta}}
+	plan.readProcedureRefs = func(_ context.Context, _ *Transaction, names []lookupName) ([]RoutineRef, error) {
+		lookups++
+		if len(names) != 2 {
+			t.Fatalf("lookup of %+v, want both source names", names)
+		}
+		return nil, nil
+	}
+	if _, mayWrite, err := plan.callees(context.Background(), nil, meta, 1); err != nil || mayWrite {
+		t.Fatalf("callees() mayWrite %v, err %v", mayWrite, err)
+	}
+	if err := plan.checkReadsOnly(context.Background(), nil, meta); err != nil || !meta.readsOnly {
+		t.Fatalf("checkReadsOnly() readsOnly %v, err %v", meta.readsOnly, err)
+	}
+	if lookups != 1 {
+		t.Fatalf("source names looked up %d times, want once per routine", lookups)
+	}
+	procedures, err := plan.sourceProcedures(context.Background(), nil, meta)
+	if err != nil || len(procedures) != 0 || lookups != 1 {
+		t.Fatalf("sourceProcedures() = %v, %v after %d lookups", procedures, err, lookups)
+	}
+}
