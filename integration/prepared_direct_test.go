@@ -5,6 +5,7 @@ package integration_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -87,9 +88,8 @@ func TestDirectPreparedStatementReuse(t *testing.T) {
 			t.Fatalf("close cursor %d: %v", index+1, err)
 		}
 	}
-	if _, err := selectStatement.Exec(ctx, int64(1)); err == nil ||
-		!strings.Contains(err.Error(), "statement produces a result set; use Query instead") {
-		t.Fatalf("Exec of a SELECT statement error = %v, want the use-Query error", err)
+	if _, err := selectStatement.Exec(ctx, int64(1)); !errors.Is(err, interbase.ErrPreparedStatementReturnsRows) {
+		t.Fatalf("Exec of a SELECT statement error = %v, want ErrPreparedStatementReturnsRows", err)
 	}
 	if cursor, err := selectStatement.Query(ctx, int64(1)); err != nil {
 		t.Fatalf("Query after rejected Exec: %v", err)

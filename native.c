@@ -1394,8 +1394,11 @@ static void ib_status_text(const ISC_STATUS *status, char *text)
 	text[used] = '\0';
 }
 
+/* Every code takes at least two of the IB_STATUS_VECTOR_LENGTH slots, so a
+ * vector holds at most IB_STATUS_VECTOR_LENGTH / 2 codes. At up to 21 bytes
+ * each (separator and sign included) plus ", gds " and the exception suffix,
+ * 320 bytes always fit them; the snprintf guard below only defends the bound. */
 #define IB_STATUS_CODES_LENGTH 320U
-#define IB_STATUS_CODES_MAX 16U
 
 /*
  * Render ", gds <code> <code>..., exception <number>" for the isc_arg_gds codes
@@ -1421,16 +1424,14 @@ static void ib_status_codes(const ISC_STATUS *status, char *text, size_t size)
 			break;
 		}
 		if (status[index] == isc_arg_gds) {
-			if (codes < IB_STATUS_CODES_MAX) {
-				written = snprintf(text + used, size - used, "%s%" PRIdPTR,
-					codes == 0U ? ", gds " : " ", (intptr_t) status[index + 1U]);
-				if (written < 0 || (size_t) written >= size - used) {
-					text[used] = '\0';
-					break;
-				}
-				used += (size_t) written;
-				++codes;
+			written = snprintf(text + used, size - used, "%s%" PRIdPTR,
+				codes == 0U ? ", gds " : " ", (intptr_t) status[index + 1U]);
+			if (written < 0 || (size_t) written >= size - used) {
+				text[used] = '\0';
+				break;
 			}
+			used += (size_t) written;
+			++codes;
 			if (status[index + 1U] == isc_except && !have_number &&
 				index + 3U < IB_STATUS_VECTOR_LENGTH &&
 				status[index + 2U] == isc_arg_number) {
