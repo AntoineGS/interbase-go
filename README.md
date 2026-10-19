@@ -249,6 +249,11 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
 - `StepInto` lists procedures to emulate when called in a supported shape, so
   their lines are profiled too; other calls run natively and are reported in
   `NativeCallSites`.
+- BLOB values fetched into variables are held in client memory up to
+  `MaxBlobBytes` (default 16 MiB). A larger BLOB ends the run as `failed` at
+  its line with "BLOB too large to emulate"; the value is never truncated and
+  `WHEN` handlers cannot catch this. Kept output rows show at most 64 KiB of a
+  BLOB.
 - Limitations: the emulator covers the supported PSQL subset; unsupported
   routines are refused up front with line and column. A run ends as
   `completed`, `failed` (with `FailedAt`) or `canceled` (context done).

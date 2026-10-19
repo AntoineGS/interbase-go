@@ -69,6 +69,17 @@ BEGIN
     SUSPEND;
   END
 END`,
+		`CREATE PROCEDURE LP_BLOBCAP RETURNS (N INTEGER) AS
+DECLARE VARIABLE B BLOB SUB_TYPE TEXT CHARACTER SET NONE;
+BEGIN
+  N = 0;
+  BEGIN
+    SELECT B FROM LP_BLOBS WHERE ID = 1 INTO :B;
+    N = 1;
+  WHEN ANY DO N = 2;
+  END
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_BLOBOUT RETURNS (B BLOB SUB_TYPE TEXT CHARACTER SET NONE) AS
 BEGIN
   FOR SELECT B FROM LP_BLOBS INTO :B DO
@@ -1453,6 +1464,38 @@ func TestLineProfileKeptBlobRows(t *testing.T) {
 	}
 	if result.Rows != 1 || len(result.KeptRows) != 1 || result.KeptRows[0][0].Value != "hello blob" {
 		t.Fatalf("kept rows %#v (rows %d), want the BLOB text", result.KeptRows, result.Rows)
+	}
+}
+
+// TestLineProfileBlobCap checks LineProfileOptions.MaxBlobBytes: a BLOB at
+// the cap is held whole; a larger one fails the run at its line, even
+// inside a WHEN ANY block, and is never truncated.
+func TestLineProfileBlobCap(t *testing.T) {
+	conn, ctx := lpFixture(t, 3)
+	const length = int64(len("hello blob"))
+	for _, tt := range []struct {
+		max   int64
+		fails bool
+	}{{length, false}, {length - 1, true}, {0, false}} {
+		result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
+			SQL: "select * from LP_BLOBCAP", Dialect: 3, MaxBlobBytes: tt.max,
+		})
+		if err != nil {
+			t.Fatalf("LineProfile(max %d): %v", tt.max, err)
+		}
+		if !tt.fails {
+			if result.Outcome != interbase.LineProfileCompleted || len(result.KeptRows) != 1 || fmt.Sprint(result.KeptRows[0][0].Value) != "1" {
+				t.Fatalf("max %d: outcome %s rows %#v err %v", tt.max, result.Outcome, result.KeptRows, result.Err)
+			}
+			continue
+		}
+		want := fmt.Sprintf("BLOB too large to emulate (more than %d bytes)", tt.max)
+		if result.Outcome != interbase.LineProfileFailed || result.Err == nil || !strings.Contains(result.Err.Error(), want) ||
+			result.FailedAt == nil || result.FailedAt.Line != lpLine(t, result.Routines[0].Source, "SELECT B FROM LP_BLOBS") ||
+			result.Rows != 0 || !result.RolledBack {
+			t.Fatalf("max %d: outcome %s at %+v rows %d err %v; want failed at the SELECT, not caught",
+				tt.max, result.Outcome, result.FailedAt, result.Rows, result.Err)
+		}
 	}
 }
 

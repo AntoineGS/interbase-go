@@ -19,7 +19,15 @@ type LineProfileOptions struct {
 	ReadOnly bool     // caller's decision from AnalyzeLineProfile.MayWrite
 	StepInto []string // procedures to emulate when called in a step-in shape (spec 6.7); names are upper-cased unless double-quoted
 	KeepRows int      // default 10
+	// MaxBlobBytes caps the bytes of a BLOB held in an emulated variable
+	// (0 means DefaultLineProfileMaxBlobBytes). A larger BLOB ends the run
+	// as failed at its line ("BLOB too large to emulate"); a variable is
+	// never truncated, and WHEN handlers cannot catch the failure.
+	MaxBlobBytes int64
 }
+
+// DefaultLineProfileMaxBlobBytes is the default LineProfileOptions.MaxBlobBytes.
+const DefaultLineProfileMaxBlobBytes = 16 << 20
 
 // LineProfileAnalysis is the static analysis of an entry statement.
 type LineProfileAnalysis struct {

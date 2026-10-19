@@ -692,7 +692,7 @@ func (r *lpRun) emitRow(f *lpFrame) error {
 			return errBlobNotFound()
 		}
 		if ref, isBlob := value.(BlobRef); isBlob {
-			held, err := r.holdBlob(ref, keptBlobLimit)
+			held, err := r.holdBlob(ref, keptBlobLimit, true)
 			if err != nil {
 				return err
 			}
@@ -730,24 +730,42 @@ func truncateKeptBlob(value any) any {
 // holdValue replaces a BLOB reference fetched from the server by the BLOB's
 // content (R22): a reference dies with the transaction and binds only to a
 // BLOB parameter of the same subtype and character set, while bytes bind
-// anywhere PSQL would accept the value. Other values are returned as is.
+// anywhere PSQL would accept the value. Other values are returned as is. A
+// BLOB larger than MaxBlobBytes is never truncated: it fails the run with a
+// fatal error.
 func (r *lpRun) holdValue(value any) (any, error) {
 	ref, ok := value.(BlobRef)
 	if !ok {
 		return value, nil
 	}
-	return r.holdBlob(ref, -1)
+	return r.holdBlob(ref, r.maxBlobBytes(), false)
+}
+
+func (r *lpRun) maxBlobBytes() int64 {
+	if r.opts.MaxBlobBytes > 0 {
+		return r.opts.MaxBlobBytes
+	}
+	return DefaultLineProfileMaxBlobBytes
+}
+
+// errBlobTooLarge reports a BLOB over the MaxBlobBytes cap.
+func errBlobTooLarge(limit int64) error {
+	return fmt.Errorf("interbase: line profile: BLOB too large to emulate (more than %d bytes)", limit)
 }
 
 // holdBlob reads a BLOB — text as a string, other subtypes as bytes — up to
-// limit bytes when limit is not negative, marking a cut value. The read is
+// limit bytes. Past limit the value is cut and marked when cut is set (kept
+// rows' display); otherwise the read fails with errBlobTooLarge. The read is
 // overhead: its time goes to Blobs and an activity snapshot follows.
-func (r *lpRun) holdBlob(ref BlobRef, limit int64) (any, error) {
+func (r *lpRun) holdBlob(ref BlobRef, limit int64, cut bool) (any, error) {
 	start := time.Now()
 	data, truncated, err := r.readBlob(ref, limit)
 	r.result.Blobs += time.Since(start)
 	if snapErr := r.snapshot(nil); err == nil {
 		err = snapErr
+	}
+	if err == nil && truncated && !cut {
+		err = errBlobTooLarge(limit)
 	}
 	if err != nil {
 		return nil, fatal(err)
@@ -770,13 +788,9 @@ func (r *lpRun) readBlob(ref BlobRef, limit int64) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	var source io.Reader = reader
-	if limit >= 0 {
-		source = io.LimitReader(reader, limit+1)
-	}
-	data, readErr := io.ReadAll(source)
+	data, readErr := io.ReadAll(io.LimitReader(reader, limit+1))
 	err = errors.Join(readErr, reader.Close())
-	if limit >= 0 && int64(len(data)) > limit {
+	if int64(len(data)) > limit {
 		return data[:limit], true, err
 	}
 	return data, false, err

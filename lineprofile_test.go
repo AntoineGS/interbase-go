@@ -1075,6 +1075,99 @@ func TestLineProfileBlobReadsAreOverhead(t *testing.T) {
 	}
 }
 
+func TestLineProfileBlobOverCapFailsRun(t *testing.T) {
+	body := "DECLARE VARIABLE X BLOB SUB_TYPE TEXT CHARACTER SET NONE;\nBEGIN\n" +
+		"  BEGIN\n" +
+		"    FOR SELECT ID FROM LP_T INTO :X DO\n" +
+		"      UPDATE LP_T SET A = :X;\n" +
+		"  WHEN ANY DO X = NULL;\n" +
+		"  END\n" +
+		"END"
+	for _, tt := range []struct {
+		name    string
+		max     int64
+		content string
+		fails   bool
+	}{
+		{"at cap", 10, "0123456789", false},
+		{"over cap", 10, "0123456789A", true},
+		{"default cap", 0, "small", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rows := 1
+			run, counts := newLineProfileFakeRun(t, context.Background(), body,
+				func() (bool, error) { rows--; return rows >= 0, nil },
+				func(string) (int64, error) { return 1, nil })
+			run.tx.native.execOverride = func(string, []argument, bool) (int64, error) { return 0, nil }
+			run.opts.MaxBlobBytes = tt.max
+			counts.rowValue = BlobRef{attachment: run.tx.attachment, tx: run.tx, generation: run.tx.generation,
+				high: 1, low: 2, subtype: 1}
+			run.openBlob = func(BlobRef) (io.ReadCloser, error) {
+				return lineProfileFakeBlobReader{Reader: strings.NewReader(tt.content), onRead: func() {}}, nil
+			}
+			outcome, txErr := run.runInTransaction()
+			if txErr != nil {
+				t.Fatalf("runInTransaction() tx error = %v", txErr)
+			}
+			if !tt.fails {
+				if outcome != nil {
+					t.Fatalf("outcome = %v, want completed", outcome)
+				}
+				return
+			}
+			var result LineProfileResult
+			finishLineProfile(context.Background(), &result, outcome, nil)
+			if result.Outcome != LineProfileFailed || result.Err == nil ||
+				result.Err.Error() != "interbase: line profile: BLOB too large to emulate (more than 10 bytes)" {
+				t.Fatalf("outcome %s err %v; want failed with the BLOB-too-large error", result.Outcome, result.Err)
+			}
+			if result.FailedAt == nil || result.FailedAt.Line != 4 {
+				t.Fatalf("FailedAt = %+v, want line 4", result.FailedAt)
+			}
+			if hits := lineProfileNodeHits(run, 6); hits != 0 {
+				t.Fatalf("WHEN ANY handler ran %d times; the over-cap error must not be catchable", hits)
+			}
+		})
+	}
+}
+
+func TestLineProfileBlobReadIsBounded(t *testing.T) {
+	run := &lpRun{result: &LineProfileResult{}, countersUnavailable: true, opts: LineProfileOptions{MaxBlobBytes: 100}}
+	source := &lineProfileCountingReader{remaining: 1 << 20}
+	run.openBlob = func(BlobRef) (io.ReadCloser, error) { return source, nil }
+	_, err := run.holdValue(BlobRef{})
+	if err == nil || !strings.Contains(err.Error(), "BLOB too large to emulate (more than 100 bytes)") {
+		t.Fatalf("holdBlobCapped() error = %v", err)
+	}
+	var fatalErr *lpFatalError
+	if !errors.As(err, &fatalErr) {
+		t.Fatalf("error %v is not fatal", err)
+	}
+	if source.read > 101 {
+		t.Fatalf("read %d bytes for a 100-byte cap; the read must stop after cap+1", source.read)
+	}
+	if !source.closed {
+		t.Fatal("BLOB reader not closed")
+	}
+}
+
+type lineProfileCountingReader struct {
+	remaining, read int
+	closed          bool
+}
+
+func (r *lineProfileCountingReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	n := min(len(p), r.remaining)
+	r.remaining -= n
+	r.read += n
+	return n, nil
+}
+
+func (r *lineProfileCountingReader) Close() error { r.closed = true; return nil }
+
 // wrapFakePrepare records the arguments every executed statement binds.
 func wrapFakePrepare(prepare func(string, bool, *nativeCancelOperation) (*nativeStatement, error),
 	bound *[]any) func(string, bool, *nativeCancelOperation) (*nativeStatement, error) {
