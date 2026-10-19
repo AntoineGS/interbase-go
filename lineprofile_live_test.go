@@ -27,6 +27,7 @@ import (
 //	INTERBASE_LP_IGNORE_COLUMNS  comma-separated output columns excluded from
 //	                           the native comparison (columns fed by generators,
 //	                           whose increments are not rolled back)
+//	INTERBASE_LP_WARMUP=1      run the statement test with LineProfileOptions.WarmUp
 
 func lpLiveDB(t *testing.T) (*sql.DB, int) {
 	t.Helper()
@@ -225,6 +226,7 @@ func TestLiveLineProfileStatement(t *testing.T) {
 	t.Logf("routine=%s mayWrite=%v callees=%d", analysis.Routine, analysis.MayWrite, len(analysis.Callees))
 	result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
 		SQL: entry, Dialect: dialect, ReadOnly: !analysis.MayWrite, StepInto: stepInto, KeepRows: 10,
+		WarmUp: os.Getenv("INTERBASE_LP_WARMUP") == "1",
 	})
 	if cerr := conn.Close(); cerr != nil {
 		t.Errorf("close connection: %v", cerr)
@@ -233,6 +235,7 @@ func TestLiveLineProfileStatement(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("outcome=%s err=%v rolledBack=%v readOnly=%v", result.Outcome, result.Err, result.RolledBack, result.ReadOnly)
+	t.Logf("warmUp=%v warmUpErr=%v", result.WarmUp, result.WarmUpErr)
 	if result.FailedAt != nil {
 		t.Logf("failedAt=%s:%d", result.FailedAt.Routine, result.FailedAt.Line)
 	}
@@ -262,7 +265,7 @@ func TestLiveLineProfileStatement(t *testing.T) {
 		lines = lines[:15]
 	}
 	for _, l := range lines {
-		t.Logf("top line %s:%d hits=%d adjusted=%v raw=%v serverCalls=%d rows=%d", l.routine, l.line, l.m.Hits, l.m.Adjusted, l.m.Raw, l.m.ServerCalls, l.m.Rows)
+		t.Logf("top line %s:%d hits=%d adjusted=%v firstAdjusted=%v raw=%v serverCalls=%d rows=%d", l.routine, l.line, l.m.Hits, l.m.Adjusted, l.m.FirstAdjusted, l.m.Raw, l.m.ServerCalls, l.m.Rows)
 	}
 	if result.Outcome != interbase.LineProfileCompleted {
 		t.Fatalf("line profile did not complete: %s: %v", result.Outcome, result.Err)

@@ -281,7 +281,19 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   be much slower than later calls, because the server compiles it on first
   execution; the first-hit times show that cost next to the total. Preparing
   the call beforehand does not move it (measured), so the profiler does not
-  try to warm callees up.
+  try to warm callees up one by one.
+- `WarmUp` (opt-in, default off) executes the entry statement once natively
+  before the measured run, on the same attachment, so first-use costs are
+  paid outside the measurement: `SELECT * FROM p(args)` with every row
+  fetched and discarded, or `EXECUTE PROCEDURE p(args)`. The statement thus
+  executes twice in total, each time in its own read-committed transaction
+  (read-only when `ReadOnly`) that is always rolled back; effects that are
+  not transactional, such as generator increments and UDF side effects,
+  happen twice. Its time is reported separately in `WarmUp`, never in a
+  line or another overhead bucket, and the baselines and counters start
+  after it. A warm-up failure is reported in `WarmUpErr` and the measured
+  run still goes on; a cancel or deadline during the warm-up ends the call
+  as `canceled`.
 - BLOB values fetched into variables are held in client memory up to
   `MaxBlobBytes` (default 16 MiB, also used for 0 or a negative value). A
   larger BLOB ends the run as `failed` at its line with "BLOB too large to
