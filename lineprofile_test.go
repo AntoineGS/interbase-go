@@ -424,7 +424,43 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 	next func() (bool, error), exec func(query string) (int64, error)) (*lpRun, *lineProfileFakeCounts) {
 	t.Helper()
 	counts := &lineProfileFakeCounts{}
-	native := &nativeTransaction{
+	native := newLineProfileFakeNative(counts, next, exec)
+	connection := &conn{native: &nativeConnection{
+		brokenOverride:            func() bool { return false },
+		databaseInfoItemsOverride: lineProfileAllPagesInfo,
+	}}
+	attachment := &Attachment{conn: connection, generation: 1}
+	tx := &Transaction{attachment: attachment, native: native, generation: 1, cursors: make(map[*Cursor]struct{})}
+	attachment.directTx = tx
+
+	plan := newLineProfileFakePlan(t, body)
+	result := &LineProfileResult{Routines: []LineProfileRoutine{newRoutineProfile(plan.entry)}}
+	return &lpRun{
+		ctx: ctx, conn: connection, tx: tx, plan: plan, opts: LineProfileOptions{KeepRows: 10},
+		result: result, statements: make(map[string]cachedStatement),
+	}, counts
+}
+
+// newLineProfileFakePlan is the plan of a selectable entry procedure LP_FAKE
+// with body and no parameters.
+func newLineProfileFakePlan(t *testing.T, body string) *lpPlan {
+	t.Helper()
+	routine, problems := psql.ParseRoutine(body, psql.ParseOptions{Dialect: 3})
+	if len(problems) != 0 {
+		t.Fatalf("parse problems: %+v", problems)
+	}
+	meta := &lpRoutineMeta{name: "LP_FAKE", routine: routine}
+	plan := &lpPlan{dialect: 3, entry: meta, procs: map[string]*lpRoutineMeta{"LP_FAKE": meta}}
+	plan.analysis.Entry = psql.EntryCall{Procedure: "LP_FAKE", Selectable: true}
+	return plan
+}
+
+// newLineProfileFakeNative is a fake native transaction: SELECT statements
+// return rows from next, other statements run exec; counts records its
+// statements, cursors and rollback.
+func newLineProfileFakeNative(counts *lineProfileFakeCounts, next func() (bool, error),
+	exec func(query string) (int64, error)) *nativeTransaction {
+	return &nativeTransaction{
 		cancelSlotOverride: &fakeCancelSlot{},
 		commitOverride:     func() error { return nil },
 		rollbackOverride: func() error {
@@ -537,26 +573,6 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 			return statement, nil
 		},
 	}
-	connection := &conn{native: &nativeConnection{
-		brokenOverride:            func() bool { return false },
-		databaseInfoItemsOverride: lineProfileAllPagesInfo,
-	}}
-	attachment := &Attachment{conn: connection, generation: 1}
-	tx := &Transaction{attachment: attachment, native: native, generation: 1, cursors: make(map[*Cursor]struct{})}
-	attachment.directTx = tx
-
-	routine, problems := psql.ParseRoutine(body, psql.ParseOptions{Dialect: 3})
-	if len(problems) != 0 {
-		t.Fatalf("parse problems: %+v", problems)
-	}
-	meta := &lpRoutineMeta{name: "LP_FAKE", routine: routine}
-	plan := &lpPlan{dialect: 3, entry: meta, procs: map[string]*lpRoutineMeta{"LP_FAKE": meta}}
-	plan.analysis.Entry = psql.EntryCall{Procedure: "LP_FAKE", Selectable: true}
-	result := &LineProfileResult{Routines: []LineProfileRoutine{newRoutineProfile(meta)}}
-	return &lpRun{
-		ctx: ctx, conn: connection, tx: tx, plan: plan, opts: LineProfileOptions{KeepRows: 10},
-		result: result, statements: make(map[string]cachedStatement),
-	}, counts
 }
 
 const lineProfileFakeBody = "DECLARE VARIABLE X INTEGER;\nBEGIN\n" +
@@ -1466,7 +1482,7 @@ func TestLineProfileRefusesDialectMismatch(t *testing.T) {
 			t.Fatal(err)
 		}
 		analysis, err := AnalyzeLineProfile(context.Background(), pooled, "EXECUTE PROCEDURE LP_P", tt.connection, nil)
-		_, runErr := LineProfile(context.Background(), pooled, LineProfileOptions{SQL: "EXECUTE PROCEDURE LP_P", Dialect: tt.connection})
+		_, runErr := LineProfile(context.Background(), pooled, LineProfileOptions{SQL: "EXECUTE PROCEDURE LP_P", Dialect: tt.connection, WarmUp: true})
 		pooled.Close()
 		if tt.connection == tt.database {
 			if err == nil || begins != 2 || errors.Is(runErr, ErrLineProfileRefused) {

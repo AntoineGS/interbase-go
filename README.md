@@ -281,7 +281,20 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   be much slower than later calls, because the server compiles it on first
   execution; the first-hit times show that cost next to the total. Preparing
   the call beforehand does not move it (measured), so the profiler does not
-  try to warm callees up.
+  try to warm callees up one by one.
+- `WarmUp` (opt-in, default off) runs one discarded profile pass before
+  the measured run, on the same attachment, so first-use costs, such as the
+  slow first call of a native callee, are paid outside the measurement (a
+  native execution of the entry statement does not remove them, measured).
+  The pass emulates the entry exactly as the measured run does, in its own
+  read-committed transaction (read-only when `ReadOnly`) that is always
+  rolled back; everything it measures is discarded. The routine thus runs
+  twice, and effects that are not transactional, such as generator
+  increments and UDF side effects, happen twice. Its time is reported
+  separately in `WarmUp`, never in a line or another overhead bucket, and
+  the baselines and counters start after it. A warm-up failure is reported
+  in `WarmUpErr` and the measured run still goes on; a cancel or deadline
+  during the warm-up ends the call as `canceled`.
 - BLOB values fetched into variables are held in client memory up to
   `MaxBlobBytes` (default 16 MiB, also used for 0 or a negative value). A
   larger BLOB ends the run as `failed` at its line with "BLOB too large to
