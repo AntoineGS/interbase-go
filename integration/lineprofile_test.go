@@ -745,6 +745,7 @@ END`,
 		ddl = append(ddl, fmt.Sprintf("INSERT INTO LP_BIG VALUES (%d)", i))
 	}
 	ddl = append(ddl, lpBlobFetchDDL()...)
+	ddl = append(ddl, lpDynamicDDL()...)
 	for _, statement := range ddl {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			t.Fatalf("%s: %v", strings.SplitN(statement, "\n", 2)[0], err)
@@ -1009,6 +1010,19 @@ func TestLineProfileDifferential(t *testing.T) {
 					check       func(t *testing.T, result interbase.LineProfileResult)
 				}{name: c.name, sql: c.sql, skipHits: true, stepInto: c.stepInto, failAt: c.failAt})
 			}
+			for _, c := range lpDynamicCases() {
+				tests = append(tests, struct {
+					name        string
+					sql         string
+					localLines  []string
+					unexecuted  []string
+					skipHits    bool
+					defaultKeep bool
+					stepInto    []string
+					failAt      string
+					check       func(t *testing.T, result interbase.LineProfileResult)
+				}{name: c.name, sql: c.sql, skipHits: true, failAt: c.failAt, check: c.check})
+			}
 			for _, tt := range tests {
 				t.Run(tt.name, func(t *testing.T) {
 					nativeRows, nativeErr := lpNative(t, ctx, conn, tt.sql)
@@ -1161,6 +1175,7 @@ func TestLineProfileAnalysis(t *testing.T) {
 		{sql: "select * from LP_BARE_USER", mayWrite: true, callee: "LP_NOARGS"},
 		{sql: "select * from LP_WHEN(0)", mayWrite: true, callee: "LP_RAISE"},
 		{sql: "select * from LP_EXC(0)"},
+		{sql: "select * from LP_ES_FOR", mayWrite: true},
 		{sql: "select * from LP_ITEMS", problem: "table or view"},
 		{sql: "select * from LP_MISSING(1)", problem: "does not exist"},
 		{sql: "select * from LP_SCALARS", problem: "0 arguments"},

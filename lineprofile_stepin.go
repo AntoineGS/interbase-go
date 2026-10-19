@@ -176,7 +176,8 @@ func (r *lpRun) procedureSites(meta *lpRoutineMeta) []lpSite {
 }
 
 // bodyWrites reports whether a loop body of meta may write: it contains a
-// data statement or EXECUTE PROCEDURE, or references a procedure.
+// data statement, EXECUTE PROCEDURE or EXECUTE STATEMENT, or references a
+// procedure.
 func (r *lpRun) bodyWrites(meta *lpRoutineMeta, body *psql.Node) bool {
 	for _, site := range r.procedureSites(meta) {
 		if site.line >= body.Line && site.line <= body.EndLine {
@@ -186,7 +187,7 @@ func (r *lpRun) bodyWrites(meta *lpRoutineMeta, body *psql.Node) bool {
 	var walk func(n *psql.Node) bool
 	walk = func(n *psql.Node) bool {
 		switch n.Kind {
-		case psql.NodeInsert, psql.NodeUpdate, psql.NodeDelete, psql.NodeExecProc:
+		case psql.NodeInsert, psql.NodeUpdate, psql.NodeDelete, psql.NodeExecProc, psql.NodeExecStmt, psql.NodeForExecStmt:
 			return true
 		}
 		for _, child := range n.Children {

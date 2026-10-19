@@ -92,7 +92,12 @@ type LineProfileNode struct {
 	Line, EndLine int
 	SQL           string // last SQL text sent for this node ("" when evaluated locally only)
 	Local         int64  // evaluations and conversions done locally; conversions done by an in-statement CAST (R18) are not counted
-	Metrics       LineMetrics
+	// DynamicSQL is the last statement text an EXECUTE STATEMENT or FOR
+	// EXECUTE STATEMENT node evaluated, and DynamicTexts the number of
+	// distinct texts it evaluated in the run; SQL is the text sent for it.
+	DynamicSQL   string
+	DynamicTexts int
+	Metrics      LineMetrics
 }
 
 // LineProfileRoutine is one profiled routine: the entry routine, or the

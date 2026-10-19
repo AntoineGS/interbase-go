@@ -14,6 +14,7 @@ func FuzzParseRoutine(f *testing.F) {
 		"begin\nexecute procedure p(:a, 'b') returning_values :c;\nend",
 		"begin\n/* a /* b */ x = \"NOW\";\nwhen sqlcode -803, gdscode lock_conflict do exit;\nend",
 		"begin\nexecute statement 'x';\nupdate t set a = 1 where current of c;\nend",
+		"begin\nfor execute statement 'select a from t ' || :s into :a do suspend;\nexecute statement ('x') into a, :b;\nend",
 		"begin ((( end",
 	}
 	for _, seed := range seeds {

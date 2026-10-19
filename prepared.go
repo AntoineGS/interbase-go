@@ -3,13 +3,15 @@ package interbase
 import (
 	"context"
 	"errors"
-	"fmt"
 )
 
 var (
 	errPreparedStatementClosed     = errors.New("interbase: prepared statement is closed")
 	errPreparedStatementCursorOpen = errors.New("interbase: prepared statement has an open cursor")
 	errPreparedStatementNoRows     = errors.New("interbase: prepared statement does not return rows")
+	// errPreparedStatementUnsupported is returned by Prepare for a statement
+	// kind it does not run, such as COMMIT or SET GENERATOR.
+	errPreparedStatementUnsupported = errors.New("interbase: prepared statement type is unsupported")
 )
 
 // OutputDescriptor is one output column description returned by the server
@@ -32,6 +34,7 @@ type PreparedStatement struct {
 	inputs      []InputDescriptor
 	outputs     []OutputDescriptor
 	returnsRows bool
+	kind        string // StatementDescriptor.Kind
 }
 
 // Prepare prepares one statement in the direct transaction. The statement
@@ -84,9 +87,9 @@ func (t *Transaction) Prepare(ctx context.Context, query string) (*PreparedState
 			return a.conn.sanitizeError("describe prepared statement", err)
 		}
 		if description.Kind == "unsupported" {
-			return fmt.Errorf("interbase: prepared statement type %q is unsupported", description.Kind)
+			return errPreparedStatementUnsupported
 		}
-		prepared.returnsRows = description.ReturnsRows
+		prepared.returnsRows, prepared.kind = description.ReturnsRows, description.Kind
 		if prepared.inputs, err = statement.inputDescriptors(); err != nil {
 			return a.conn.sanitizeError("describe prepared inputs", err)
 		}

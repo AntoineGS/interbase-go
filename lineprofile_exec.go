@@ -51,6 +51,14 @@ type lpRun struct {
 	// countersUnavailable is set once the server cannot supply activity
 	// counters; node Pages and Tables are then cleared (R16).
 	countersUnavailable bool
+	// dynamic holds the EXECUTE STATEMENT texts prepared per node, least
+	// recently used first (their statements are in statements);
+	// dynamicTexts the hashes of the distinct texts each node evaluated;
+	// procedureNames the source names of dynamic texts found to be
+	// procedures.
+	dynamic        map[string][]string
+	dynamicTexts   map[*LineProfileNode]map[uint64]struct{}
+	procedureNames map[string]bool
 }
 
 // runInTransaction runs the entry routine inside the run's transaction and
@@ -249,6 +257,10 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 		return lpContinue, nil
 	case psql.NodeExecProc:
 		return lpContinue, r.execProcedure(f, n, node)
+	case psql.NodeExecStmt:
+		return lpContinue, r.execStatement(f, n, node)
+	case psql.NodeForExecStmt:
+		return r.forExecStatement(f, n, node)
 	case psql.NodeSuspend:
 		if f.suspend != nil {
 			return lpContinue, f.suspend(f.row())
@@ -456,15 +468,16 @@ func handlesAny(h *psql.Handler) bool {
 }
 
 // blockWrites reports whether a block may change data, so that undoing it
-// can matter: it contains a data statement, EXECUTE PROCEDURE or an
-// expression with a subquery (which may select from a procedure).
+// can matter: it contains a data statement, EXECUTE PROCEDURE, EXECUTE
+// STATEMENT or an expression with a subquery (which may select from a
+// procedure).
 func (r *lpRun) blockWrites(n *psql.Node) bool {
 	if writes, ok := r.writes[n]; ok {
 		return writes
 	}
 	var walk func(n *psql.Node) bool
 	walk = func(n *psql.Node) bool {
-		if n.SQL != nil || n.Kind == psql.NodeExecProc || exprSelects(n.Value) || exprSelects(n.Cond) {
+		if n.SQL != nil || writesDynamically(n.Kind) || exprSelects(n.Value) || exprSelects(n.Cond) {
 			return true
 		}
 		for _, child := range n.Children {

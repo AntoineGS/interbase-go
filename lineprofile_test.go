@@ -397,7 +397,17 @@ type lineProfileFakeCounts struct {
 	rolledBack                                bool
 	onPrepare, onCursorClose                  func()       // optional server-side effects of a prepare and of a cursor close
 	rowValue                                  driver.Value // fetched column value; nil means int64(1)
+	// Optional per-statement behavior: valueFor overrides the fetched value,
+	// outputsFor the output descriptors and prepareErr fails the prepare;
+	// prepares counts prepares by statement text.
+	valueFor   func(query string) driver.Value
+	outputsFor func(query string) []OutputDescriptor
+	prepareErr func(query string) error
+	prepares   map[string]int
 }
+
+// lineProfileFakeNull, returned by valueFor, makes the fake fetch a NULL.
+type lineProfileFakeNull struct{}
 
 func lineProfileAllPagesInfo([]byte) ([]byte, error) {
 	return infoItemsFrame(infoItemRecord(5, 0, 0, 0, 0), infoItemRecord(6, 0, 0, 0, 0),
@@ -421,7 +431,16 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 		handleStateOverride: func() nativeHandleState { return nativeHandleConsumed },
 		freeOverride:        func() {},
 		prepareContextOverride: func(query string, _ bool, _ *nativeCancelOperation) (*nativeStatement, error) {
+			if counts.prepareErr != nil {
+				if err := counts.prepareErr(query); err != nil {
+					return nil, err
+				}
+			}
 			counts.prepared++
+			if counts.prepares == nil {
+				counts.prepares = make(map[string]int)
+			}
+			counts.prepares[query]++
 			if counts.onPrepare != nil {
 				counts.onPrepare()
 			}
@@ -432,6 +451,10 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 					kind := "update"
 					if isSelect {
 						kind = "select"
+					} else if strings.HasPrefix(strings.ToUpper(query), "EXECUTE PROCEDURE") {
+						kind = "procedure"
+					} else if strings.HasPrefix(strings.ToUpper(query), "COMMIT") || strings.HasPrefix(strings.ToUpper(query), "SET ") {
+						kind = "unsupported"
 					}
 					return StatementDescriptor{Kind: kind, ReturnsRows: isSelect, InputCount: inputs}, nil
 				},
@@ -440,6 +463,11 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 				outputsOverride: func() ([]OutputDescriptor, error) {
 					if !isSelect {
 						return nil, nil
+					}
+					if counts.outputsFor != nil {
+						if outputs := counts.outputsFor(query); outputs != nil {
+							return outputs, nil
+						}
 					}
 					if _, blob := counts.rowValue.(BlobRef); blob {
 						return []OutputDescriptor{{Name: "ID", Kind: "BLOB", SubType: 1, Nullable: true}}, nil
@@ -455,10 +483,29 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 						}
 						return nil
 					}
+					// valueFor is asked once per fetched row.
+					var current driver.Value
 					return &nativeCursor{
-						nextOverride:      next,
-						indicatorOverride: func(int) (uint16, error) { return 0, nil },
+						nextOverride: func() (bool, error) {
+							hasRow, err := next()
+							if current = nil; hasRow && counts.valueFor != nil {
+								current = counts.valueFor(query)
+							}
+							return hasRow, err
+						},
+						indicatorOverride: func(int) (uint16, error) {
+							if _, null := current.(lineProfileFakeNull); null {
+								return nullIndicator, nil
+							}
+							return 0, nil
+						},
 						valueOverride: func(int) (driver.Value, error) {
+							if _, null := current.(lineProfileFakeNull); null {
+								return nil, nil
+							}
+							if current != nil {
+								return current, nil
+							}
 							if counts.rowValue != nil {
 								return counts.rowValue, nil
 							}
