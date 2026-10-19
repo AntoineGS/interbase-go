@@ -217,6 +217,9 @@ struct ib_cursor {
 	int server_cursor_open;
 	int statement_type;
 	int procedure;
+	/* Set when optional catalog enrichment failed and was skipped, so the
+	 * result must not be cached on a prepared statement. */
+	int metadata_degraded;
 	int output_pending;
 	int fetched;
 	int allow_arrays;
@@ -1522,7 +1525,8 @@ static int ib_catalog_error_requires_propagation(const char *error)
 		strstr(error, "pthread_") != NULL;
 }
 
-static int ib_catalog_fallback_if_optional(ib_cancel_slot *cancel, char **error)
+static int ib_catalog_fallback_if_optional(ib_cursor *cursor,
+	ib_cancel_slot *cancel, char **error)
 {
 	if (cancel == NULL || ib_catalog_error_requires_propagation(
 		error == NULL ? NULL : *error)) {
@@ -1532,6 +1536,7 @@ static int ib_catalog_fallback_if_optional(ib_cancel_slot *cancel, char **error)
 		free(*error);
 		*error = NULL;
 	}
+	cursor->metadata_degraded = 1;
 	return 1;
 }
 
@@ -6106,7 +6111,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 	}
 	if (ib_procedure_catalog_query_text(&catalog_query, &catalog_query_length,
 		error) != 0) {
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6139,7 +6144,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 			variable->sqlname_length, parameter_name, sizeof(parameter_name),
 			&parameter_name_length, error);
 		if (procedure_result < 0 || parameter_result < 0) {
-			if (ib_catalog_fallback_if_optional(cancel, error)) {
+			if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 				free(catalog_query);
 				return 0;
 			}
@@ -6152,7 +6157,7 @@ static int ib_procedure_metadata_catalog(ib_cursor *cursor,
 		catalog_cursor = (ib_cursor *) calloc(1U, sizeof(*catalog_cursor));
 		if (catalog_cursor == NULL) {
 			(void) ib_fail(error, "out of memory allocating procedure catalog cursor");
-			if (ib_catalog_fallback_if_optional(cancel, error)) {
+			if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 				free(catalog_query);
 				return 0;
 			}
@@ -6297,6 +6302,7 @@ procedure_catalog_done:
 			/* Procedure catalog metadata is an enhancement; preserve the query
 			 * result when the catalog is unavailable. */
 			free(catalog_error);
+			cursor->metadata_degraded = 1;
 			continue;
 		}
 		free(catalog_error);
@@ -6327,7 +6333,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, unsigned char *matched,
 	relation_count = 0U;
 	if (ib_catalog_relation_list(cursor, &relation_names, &relation_lengths,
 		&relation_count, error) != 0) {
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6340,7 +6346,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, unsigned char *matched,
 	if (ib_catalog_query_text(relation_count, &catalog_query, &catalog_query_length,
 		error) != 0) {
 		ib_free_catalog_relations(relation_names, relation_lengths, relation_count);
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6350,7 +6356,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, unsigned char *matched,
 		(void) ib_fail(error, "out of memory allocating catalog cursor");
 		free(catalog_query);
 		ib_free_catalog_relations(relation_names, relation_lengths, relation_count);
-		if (ib_catalog_fallback_if_optional(cancel, error)) {
+		if (ib_catalog_fallback_if_optional(cursor, cancel, error)) {
 			return 0;
 		}
 		return -1;
@@ -6497,6 +6503,7 @@ static int ib_metadata_catalog(ib_cursor *cursor, unsigned char *matched,
 		/* Catalog information is an enhancement; an unavailable catalog must not
 		 * turn an otherwise valid user query into a failure. */
 		free(catalog_error);
+		cursor->metadata_degraded = 1;
 		return 0;
 	}
 	free(catalog_error);
@@ -6568,10 +6575,14 @@ static int ib_cursor_describe_metadata(ib_cursor *cursor, ib_cancel_slot *cancel
 }
 
 /* ib_statement_cache_metadata runs the column-metadata enrichment of a
- * prepared statement once, in the statement's transaction, and keeps a copy
- * on the statement. The enrichment is optional: on failure nothing is cached
- * and each execution enriches its own cursor, as before. */
-static void ib_statement_cache_metadata(ib_statement *statement)
+ * prepared statement once, in the statement's transaction and under the
+ * prepare operation's cancellation slot, and keeps a copy on the statement.
+ * The enrichment is optional: when it is skipped or degraded nothing is
+ * cached and each execution enriches its own cursor, as before. A fatal
+ * failure (cancellation, cancellation-slot protocol, catalog cleanup or a
+ * broken connection) is returned so that Prepare fails. */
+static int ib_statement_cache_metadata(ib_statement *statement,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	ib_cursor descriptor;
 	char *catalog_error;
@@ -6580,22 +6591,38 @@ static void ib_statement_cache_metadata(ib_statement *statement)
 	if (statement == NULL || statement->output == NULL ||
 		statement->output->sqld < 0 || statement->connection == NULL ||
 		statement->connection->transaction == NULL) {
-		return;
+		return 0;
 	}
 	memset(&descriptor, 0, sizeof(descriptor));
 	descriptor.connection = statement->connection;
 	descriptor.prepared = statement;
 	descriptor.transaction = statement->connection->transaction;
+	descriptor.statement = statement->statement;
 	descriptor.statement_type = statement->statement_type;
 	catalog_error = NULL;
 	descriptor.output = ib_clone_sqlda(statement->output, &catalog_error);
 	if (descriptor.output == NULL ||
-		ib_cursor_describe_metadata(&descriptor, NULL, 0U, &catalog_error) != 0) {
-		free(catalog_error);
+		ib_cursor_describe_metadata(&descriptor, cancel, generation,
+			&catalog_error) != 0) {
 		ib_cursor_free_parts(&descriptor);
-		return;
+		/* Without a slot, optional catalog failures are reported rather than
+		 * skipped; only the fatal ones fail Prepare. */
+		if (cancel != NULL || statement->connection->broken ||
+			ib_catalog_error_requires_propagation(catalog_error)) {
+			if (catalog_error == NULL) {
+				(void) ib_fail(&catalog_error, "prepare-time catalog metadata failed");
+			}
+			ib_give_error(error, catalog_error);
+			return -1;
+		}
+		free(catalog_error);
+		return 0;
 	}
 	free(catalog_error);
+	if (descriptor.metadata_degraded) {
+		ib_cursor_free_parts(&descriptor);
+		return 0;
+	}
 	count = (size_t) descriptor.output->sqld;
 	if (count != 0U) {
 		statement->cached_metadata = descriptor.metadata;
@@ -6608,6 +6635,7 @@ static void ib_statement_cache_metadata(ib_statement *statement)
 	statement->metadata_count = count;
 	statement->metadata_cached = 1;
 	ib_cursor_free_parts(&descriptor);
+	return 0;
 }
 
 static void ib_statement_free_metadata_cache(ib_statement *statement)
@@ -8326,8 +8354,8 @@ int ib_connection_exec(ib_connection *connection, const char *query,
 
 static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 	const char *query,
-	size_t query_length, int allow_arrays, ib_cancel_slot *cancel,
-	uint64_t generation, char **error)
+	size_t query_length, int allow_arrays, int cache_metadata,
+	ib_cancel_slot *cancel, uint64_t generation, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
@@ -8423,7 +8451,10 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 		ib_cancel_slot_complete(cancel, generation);
 		goto fail;
 	}
-	ib_cancel_slot_complete(cancel, generation);
+	/* The prepare-time catalog enrichment below still runs under the slot. */
+	if (!cache_metadata) {
+		ib_cancel_slot_complete(cancel, generation);
+	}
 	descriptor.connection = connection;
 	descriptor.transaction = prepare_transaction;
 	descriptor.statement = statement->statement;
@@ -8447,6 +8478,11 @@ static ib_statement *ib_statement_prepare_mode(ib_connection *connection,
 		statement->output = descriptor.output;
 		descriptor.output = NULL;
 	}
+	if (cache_metadata && ib_statement_cache_metadata(statement, cancel,
+		generation, &failure_error) != 0) {
+		goto fail;
+	}
+	ib_cancel_slot_complete(cancel, generation);
 	if (owns_transaction) {
 		memset(status, 0, sizeof(status));
 		result = isc_commit_transaction(status, &prepare_transaction);
@@ -8490,7 +8526,7 @@ ib_statement *ib_statement_prepare(ib_connection *connection, const char *query,
 	size_t query_length, ib_cancel_slot *cancel, uint64_t generation,
 	char **error)
 {
-	return ib_statement_prepare_mode(connection, query, query_length, 0,
+	return ib_statement_prepare_mode(connection, query, query_length, 0, 0,
 		cancel, generation, error);
 }
 
@@ -10410,8 +10446,7 @@ ib_statement *ib_transaction_prepare(ib_transaction *transaction,
 		return NULL;
 	}
 	statement = ib_statement_prepare_mode(&transaction->view, query, query_length,
-		allow_arrays, cancel, generation, error);
-	ib_statement_cache_metadata(statement);
+		allow_arrays, 1, cancel, generation, error);
 	ib_transaction_sync(transaction);
 	return statement;
 }
