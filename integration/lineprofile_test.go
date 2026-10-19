@@ -1061,6 +1061,7 @@ func TestLineProfileDifferential(t *testing.T) {
 								t.Fatalf("rows before the error %#v, native %#v", gotRows, nativeRows)
 							}
 						}
+						lpCheckFirstHits(t, result)
 						t.Logf("native and emulated SQLCODE %d at line %d", lpSQLCode(nativeErr), result.FailedAt.Line)
 						return
 					}
@@ -1107,6 +1108,7 @@ func TestLineProfileDifferential(t *testing.T) {
 					if tt.check != nil {
 						tt.check(t, result)
 					}
+					lpCheckFirstHits(t, result)
 					t.Logf("rows %d, server calls %d, round trips %d, raw %v, prepare %v, snapshots %v, setup %v",
 						result.Rows, result.ServerCalls, result.RoundTrips, result.Raw, result.Prepare, result.Snapshots, result.Setup)
 				})
@@ -1140,22 +1142,24 @@ func lpCheckRowByRow(want bool) func(t *testing.T, result interbase.LineProfileR
 func lpCheckFirstHits(t *testing.T, result interbase.LineProfileResult) {
 	t.Helper()
 	for _, routine := range result.Routines {
-		lines := make(map[int]time.Duration)
+		lines := make(map[int][2]time.Duration)
 		for _, node := range routine.Nodes {
 			m := node.Metrics
-			if m.FirstRaw > m.Raw || m.FirstAdjusted > m.Adjusted || m.Hits == 1 && (m.FirstRaw != m.Raw || m.FirstAdjusted != m.Adjusted) {
+			if m.FirstRaw > m.Raw || m.FirstAdjusted > m.Adjusted || m.FirstAdjusted > m.FirstRaw ||
+				m.Hits == 1 && (m.FirstRaw != m.Raw || m.FirstAdjusted != m.Adjusted) ||
+				m.Hits == 0 && (m.FirstRaw != 0 || m.FirstAdjusted != 0) {
 				t.Fatalf("%s node at line %d: hits %d first %v/%v total %v/%v", node.Kind, node.Line, m.Hits, m.FirstRaw, m.FirstAdjusted, m.Raw, m.Adjusted)
 			}
-			if m.Hits > 0 {
-				lines[node.Line] += m.FirstRaw
-			}
+			first := lines[node.Line]
+			lines[node.Line] = [2]time.Duration{first[0] + m.FirstRaw, first[1] + m.FirstAdjusted}
 		}
 		for line, first := range lines {
-			if routine.Lines[line].FirstRaw != first {
-				t.Fatalf("line %d first raw %v, want %v", line, routine.Lines[line].FirstRaw, first)
+			if got := routine.Lines[line]; got.FirstRaw != first[0] || got.FirstAdjusted != first[1] {
+				t.Fatalf("line %d first %v/%v, want %v/%v", line, got.FirstRaw, got.FirstAdjusted, first[0], first[1])
 			}
 		}
-		if routine.Inclusive.FirstRaw != 0 || routine.Exclusive.FirstRaw != 0 {
+		if routine.Inclusive.FirstRaw != 0 || routine.Exclusive.FirstRaw != 0 ||
+			routine.Inclusive.FirstAdjusted != 0 || routine.Exclusive.FirstAdjusted != 0 {
 			t.Fatalf("routine %s totals have first-hit times", routine.Name)
 		}
 	}
