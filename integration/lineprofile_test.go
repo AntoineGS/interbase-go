@@ -29,9 +29,13 @@ func lpFixture(t *testing.T, dialect int) (*sql.Conn, context.Context) {
 
 	since := "CAST('NOW' AS DATE) - D"
 	quotedAlias := `"Q"`
+	// ibg-tvs: the widest exact scaled type holding one digit more than its
+	// precision (BIGINT storage in dialect 3, INTEGER in dialect 1).
+	wide, wideValue := "NUMERIC(18,2)", "92233720368547758.07"
 	if dialect == 1 {
 		since = "'NOW' - D"
 		quotedAlias = "AS Q"
+		wide, wideValue = "NUMERIC(9,2)", "21474836.47"
 	}
 	ddl := []string{
 		"CREATE TABLE LP_ITEMS (ID INTEGER, CODE CHAR(3) CHARACTER SET NONE, NAME VARCHAR(20) CHARACTER SET NONE, " +
@@ -459,6 +463,16 @@ END`,
 		`CREATE PROCEDURE LP_NARROW (ID INTEGER) RETURNS (N42 NUMERIC(4,2)) AS
 BEGIN
   SELECT N92 FROM LP_PRICES WHERE ID = :ID INTO :N42;
+  SUSPEND;
+END`,
+		"CREATE PROCEDURE LP_WIDE_OUT RETURNS (V " + wide + ") AS BEGIN V = " + wideValue + "; END",
+		`CREATE PROCEDURE LP_WIDE_IN (K INTEGER) RETURNS (D DOUBLE PRECISION, T VARCHAR(30), N NUMERIC(15,4)) AS
+BEGIN
+  EXECUTE PROCEDURE LP_WIDE_OUT RETURNING_VALUES :D;
+  EXECUTE PROCEDURE LP_WIDE_OUT RETURNING_VALUES :T;
+  SUSPEND;
+  IF (K = 1) THEN
+    EXECUTE PROCEDURE LP_WIDE_OUT RETURNING_VALUES :N;
   SUSPEND;
 END`,
 		`CREATE PROCEDURE LP_RET (X INTEGER) RETURNS (Y INTEGER, Z SMALLINT) AS
@@ -944,6 +958,10 @@ func TestLineProfileDifferential(t *testing.T) {
 				{name: "numeric conversions", sql: "select * from LP_NUMS"},
 				{name: "BLOB variable into another charset", sql: "select * from LP_BLOBCOPY(1)"},
 				{name: "BLOB variable as procedure input", sql: "select * from LP_BLOBCALL(1)"},
+				{name: "scaled value wider than its precision", sql: "select * from LP_WIDE_IN(0)", unexecuted: []string{"RETURNING_VALUES :N"}},
+				{name: "scaled value wider than its precision, stepped", sql: "select * from LP_WIDE_IN(0)", unexecuted: []string{"RETURNING_VALUES :N"},
+					stepInto: []string{"LP_WIDE_OUT"}},
+				{name: "scaled value wider than its precision, overflow", sql: "select * from LP_WIDE_IN(1)", failAt: "RETURNING_VALUES :N"},
 				{name: "narrowing numeric value", sql: "select * from LP_NARROW(1)"},
 				{name: "narrowing numeric overflow", sql: "select * from LP_NARROW(3)"},
 				{name: "returning values", sql: "select * from LP_CALLER",

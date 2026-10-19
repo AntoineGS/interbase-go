@@ -1363,3 +1363,23 @@ func TestLineProfileRelationIDsIncludeOverhead(t *testing.T) {
 		t.Fatalf("relationIDs() = %v, want [5 9]", got)
 	}
 }
+
+func TestLineProfileExceedsPrecision(t *testing.T) {
+	for _, tt := range []struct {
+		value, typeText string
+		want            bool
+	}{
+		{"92233720368547758.07", "NUMERIC(18,2)", true},
+		{"-92233720368547758.08", "NUMERIC(18, 2)", true},
+		{"9223372036854775.80", "NUMERIC(18,2)", false},
+		{"0.07", "NUMERIC(18,2)", false},
+		{"21474836.47", "DECIMAL(9,2)", true},
+		{"1234567.89", "NUMERIC(9,2)", false},
+		{"12345678901", "INTEGER", false},
+		{"abc", "VARCHAR(5)", false},
+	} {
+		if got := exceedsPrecision(tt.value, tt.typeText); got != tt.want {
+			t.Errorf("exceedsPrecision(%q, %q) = %v, want %v", tt.value, tt.typeText, got, tt.want)
+		}
+	}
+}

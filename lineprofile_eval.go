@@ -728,7 +728,14 @@ func (r *lpRun) store(node *LineProfileNode, target *lpVar, value any, sourceTyp
 	}
 	text := "SELECT CAST(? AS " + targetType + ") FROM RDB$DATABASE"
 	if sourceType != "" && !isBlobType(sourceType) {
-		text = "SELECT CAST(CAST(? AS " + sourceType + ") AS " + targetType + ") FROM RDB$DATABASE"
+		source := "CAST(? AS " + sourceType + ")"
+		if s, ok := value.(string); ok && r.plan.dialect == 3 && exceedsPrecision(s, sourceType) {
+			// The storage holds more digits than the declared precision,
+			// which the driver refuses for a NUMERIC parameter (ibg-tvs):
+			// the exact decimal text is converted on the server instead.
+			source = "CAST(CAST(? AS VARCHAR(24) CHARACTER SET NONE) AS " + sourceType + ")"
+		}
+		text = "SELECT CAST(" + source + " AS " + targetType + ") FROM RDB$DATABASE"
 	}
 	if err := checkBlobArgs([]any{value}); err != nil {
 		return err
@@ -746,6 +753,21 @@ func (r *lpRun) store(node *LineProfileNode, target *lpVar, value any, sourceTyp
 	}
 	target.value, err = r.holdValue(cellValue(rows[0][0]))
 	return err
+}
+
+// exceedsPrecision reports whether a decimal string, as a scaled integer
+// is held, has more significant digits than the precision of a NUMERIC or
+// DECIMAL type text: InterBase stores such a value (a NUMERIC(18,2) holds
+// 19 digits) but the driver refuses it for a parameter of that type.
+func exceedsPrecision(value, typeText string) bool {
+	normalized := normalizeType(typeText)
+	var precision int
+	if _, err := fmt.Sscanf(strings.TrimPrefix(strings.TrimPrefix(normalized, "NUMERIC"), "DECIMAL"), "(%d", &precision); err != nil ||
+		!strings.HasPrefix(normalized, "NUMERIC(") && !strings.HasPrefix(normalized, "DECIMAL(") {
+		return false
+	}
+	digits := strings.TrimLeft(strings.NewReplacer("-", "", "+", "", ".", "").Replace(value), "0")
+	return len(digits) > precision
 }
 
 // declaredType normalizes a declared type, adding the database default
