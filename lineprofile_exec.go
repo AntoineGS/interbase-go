@@ -531,18 +531,26 @@ func (r *lpRun) execSelectInto(f *lpFrame, n *psql.Node, node *LineProfileNode) 
 	if err != nil {
 		return err
 	}
-	rows, err := r.queryRows(node, b, 2)
+	// The CAST statement runs on a scratch node so that, when it is run
+	// again without the CAST, the node holds only the native-equivalent run.
+	attempt := &LineProfileNode{Metrics: LineMetrics{Hits: node.Metrics.Hits}}
+	rows, err := r.queryRows(attempt, b, 2)
+	node.SQL = attempt.SQL
 	if err != nil && cast != nil && r.catchable(err) {
 		// The failure may be a row's in-statement CAST (R18), where the
 		// server raises the singleton error before converting any row
 		// (ibg-pm8). bindSelect casts only statements that can run again,
-		// so the plain statement decides, as it would natively.
-		node.Metrics.Errors--
+		// so the plain statement decides, as it would natively; the
+		// attempt is Retries overhead.
+		r.discardAttempt(attempt.Metrics)
 		if b, err = r.bind(f, node, n.SQL.Text, n.SQL.Params); err != nil {
 			return err
 		}
 		cast = nil
 		rows, err = r.queryRows(node, b, 2)
+	} else {
+		attempt.Metrics.Hits = 0
+		addMetrics(&node.Metrics, attempt.Metrics)
 	}
 	if err != nil {
 		return err
@@ -557,6 +565,15 @@ func (r *lpRun) execSelectInto(f *lpFrame, n *psql.Node, node *LineProfileNode) 
 		node.Metrics.Errors++
 		return errSingleton()
 	}
+}
+
+// discardAttempt moves the server work of a statement run only to choose
+// how to run its node out of the run's measured calls into overhead.
+func (r *lpRun) discardAttempt(m LineMetrics) {
+	r.result.Retries += m.Raw
+	r.result.ServerCalls -= m.ServerCalls
+	r.result.RoundTrips -= m.RoundTrips
+	r.result.OverheadActivity = r.result.OverheadActivity.Add(ActivityDelta{Tables: m.Tables, Pages: m.Pages})
 }
 
 // assignRow assigns the columns of row to targets; exact[i] (when set)

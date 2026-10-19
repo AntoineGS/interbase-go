@@ -240,8 +240,11 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   (`Before`/`After` probes), so it approximates server time. Counters (server
   calls, round trips, rows, pages, per-table activity) are those of this
   attachment only. Work done by the profiler itself (prepares, savepoints,
-  snapshots, setup, BLOB reads) is reported in separate overhead buckets and
-  never counted in line metrics.
+  snapshots, setup, BLOB reads, retries) is reported in separate overhead
+  buckets and never counted in line metrics. `Retries` is the time of a
+  singleton `SELECT ... INTO` whose in-statement `CAST` failed and that ran
+  again without it, so the node counts only the run native PSQL would do;
+  the attempt's counters go to `OverheadActivity`.
 - Transaction envelope: read-committed, read-only unless the analysis says the
   routine may write, and always rolled back. Effects that are not
   transactional, such as generator increments, external tables, events and

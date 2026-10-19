@@ -146,6 +146,10 @@ type LineProfileResult struct {
 	// Blobs is the overhead of reading BLOB values fetched into variables
 	// (they are held as bytes, R22) and of reading kept BLOB outputs.
 	Blobs time.Duration
+	// Retries is the time of statements the emulator ran only to choose
+	// how to run a node: a singleton SELECT whose in-statement CAST failed
+	// and that ran again without it (the node counts the second run only).
+	Retries time.Duration
 	// OverheadActivity holds the attachment counters of overhead work —
 	// prepares (with their catalog reads), savepoint statements, entry
 	// arguments, BLOB reads and early cursor closes — which never count in

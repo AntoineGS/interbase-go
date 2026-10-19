@@ -1408,13 +1408,14 @@ func TestLineProfileBlobDateMessage(t *testing.T) {
 // never cast in the statement.
 func TestLineProfileSingletonCastRetry(t *testing.T) {
 	conn, ctx := lpFixture(t, 3)
+	texts := lpRelationID(t, ctx, conn, "LP_TEXTS")
 	for _, tt := range []struct {
 		query, marker string
 		wantSQL       string
-		calls         int64 // execute and fetches: the CAST statement's and the plain one's, or the plain one's only
+		retried       bool // the CAST statement ran first; its work is Retries overhead
 	}{
-		{"select * from LP_PM_FIRST", "SELECT W40", "SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID", 6},
-		{"select * from LP_PM_PROC", "SELECT T FROM", "SELECT T FROM LP_PM_SRC(900)", 3},
+		{"select * from LP_PM_FIRST", "SELECT W40", "SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID", true},
+		{"select * from LP_PM_PROC", "SELECT T FROM", "SELECT T FROM LP_PM_SRC(900)", false},
 	} {
 		result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: tt.query, Dialect: 3})
 		if err != nil || lpSQLCode(result.Err) != -811 {
@@ -1422,9 +1423,23 @@ func TestLineProfileSingletonCastRetry(t *testing.T) {
 		}
 		routine := result.Routines[0]
 		node := routine.Nodes[lpNodeAt(t, routine, tt.marker)]
-		if node.SQL != tt.wantSQL || node.Metrics.Errors != 1 || node.Metrics.Rows != 2 || node.Metrics.ServerCalls != tt.calls {
-			t.Fatalf("%s: node SQL %q errors %d rows %d calls %d; want the plain statement, one error, two rows, %d calls",
-				tt.query, node.SQL, node.Metrics.Errors, node.Metrics.Rows, node.Metrics.ServerCalls, tt.calls)
+		// Execute and two fetches of the plain statement only, as natively.
+		if node.SQL != tt.wantSQL || node.Metrics.Errors != 1 || node.Metrics.Rows != 2 || node.Metrics.ServerCalls != 3 {
+			t.Fatalf("%s: node SQL %q errors %d rows %d calls %d; want the plain statement, one error, two rows, 3 calls",
+				tt.query, node.SQL, node.Metrics.Errors, node.Metrics.Rows, node.Metrics.ServerCalls)
+		}
+		if (result.Retries > 0) != tt.retried {
+			t.Fatalf("%s: Retries %v, want retried %v", tt.query, result.Retries, tt.retried)
+		}
+		if tt.retried {
+			// LP_TEXTS has four rows: one scan in the node, the CAST
+			// attempt's scan in the overhead.
+			if got := node.Metrics.Tables[texts].SeqReads; got != 4 {
+				t.Fatalf("%s: node LP_TEXTS reads %d, want one scan (4)", tt.query, got)
+			}
+			if got := result.OverheadActivity.Tables[texts].SeqReads; got < 4 {
+				t.Fatalf("%s: overhead LP_TEXTS reads %d, want the CAST attempt's scan", tt.query, got)
+			}
 		}
 	}
 }
