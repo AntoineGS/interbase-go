@@ -245,7 +245,10 @@ func TestLineProfileExecuteStatementErrors(t *testing.T) {
 		{name: "EXECUTE PROCEDURE", text: "'EXECUTE PROCEDURE LP_P'", when: "WHEN SQLCODE -204", sqlCode: -204, gdsCode: 335544853},
 		{name: "COMMIT", text: "'COMMIT'", when: "WHEN GDSCODE exec_stmt_disallow", sqlCode: -204, gdsCode: 335544857},
 		{name: "ROLLBACK WORK", text: "'ROLLBACK WORK'", when: "WHEN GDSCODE exec_stmt_disallow", sqlCode: -204, gdsCode: 335544857},
+		{name: "SET TRANSACTION", text: "'SET TRANSACTION'", when: "WHEN SQLCODE -204", sqlCode: -204, gdsCode: 335544853},
 		{name: "unsupported statement", text: "'SET GENERATOR LP_G TO 1'", when: "WHEN ANY", fatal: true},
+		{name: "SAVEPOINT", text: "'SAVEPOINT LP_S'", when: "WHEN ANY", fatal: true},
+		{name: "RELEASE SAVEPOINT", text: "'RELEASE SAVEPOINT LP_S'", when: "WHEN ANY", fatal: true},
 		{name: "ROLLBACK TO SAVEPOINT", text: "'ROLLBACK TO SAVEPOINT LP_S'", when: "WHEN ANY", fatal: true},
 		{name: "ROLLBACK WORK TO SAVEPOINT", text: "'ROLLBACK WORK TO SAVEPOINT LP_S'", when: "WHEN ANY", fatal: true},
 		{name: "DDL", text: "'CREATE TABLE LP_X (ID INTEGER)'", when: "WHEN ANY", fatal: true},
@@ -300,6 +303,44 @@ func TestLineProfileExecuteStatementErrors(t *testing.T) {
 			}
 			if node := lineProfileNodeOn(t, run, 6, "executeStatement"); node.Metrics.Errors != 1 {
 				t.Fatalf("node errors %d, want 1", node.Metrics.Errors)
+			}
+		})
+	}
+}
+
+// TestLineProfileUnsupportedDynamicWords checks how the first words of a
+// text the driver does not prepare choose its outcome.
+func TestLineProfileUnsupportedDynamicWords(t *testing.T) {
+	for _, tt := range []struct {
+		text    string
+		gdsCode int64 // 0: refused, not run
+	}{
+		{"COMMIT RETAIN", gdsExecStmtDisallow},
+		{"commit work", gdsExecStmtDisallow},
+		{"ROLLBACK RETAIN", gdsExecStmtDisallow},
+		{"ROLLBACK WORK", gdsExecStmtDisallow},
+		{"/* undo */ ROLLBACK", gdsExecStmtDisallow},
+		{"-- undo\nrollback work", gdsExecStmtDisallow},
+		{"SET TRANSACTION READ ONLY", gdsExecStmtExecute},
+		{"/* t */ SET TRANSACTION", gdsExecStmtExecute},
+		{"ROLLBACK TO SAVEPOINT LP_S", 0},
+		{"ROLLBACK WORK TO LP_S", 0},
+		{"/* sp */ ROLLBACK TO LP_S", 0},
+		{"SET GENERATOR LP_G TO 1", 0},
+		{"SAVEPOINT LP_S", 0},
+		{"RELEASE SAVEPOINT LP_S", 0},
+	} {
+		t.Run(tt.text, func(t *testing.T) {
+			err := unsupportedDynamic(tt.text)
+			var nativeErr *Error
+			if tt.gdsCode == 0 {
+				if !errors.As(err, new(*lpFatalError)) || !strings.Contains(err.Error(), "does not run this kind of statement") {
+					t.Fatalf("unsupportedDynamic() = %v, want a refusal", err)
+				}
+				return
+			}
+			if !errors.As(err, &nativeErr) || errors.As(err, new(*lpFatalError)) || nativeErr.GDSCode() != tt.gdsCode || nativeErr.SQLCode != -204 {
+				t.Fatalf("unsupportedDynamic() = %#v, want catchable GDSCODE %d, SQLCODE -204", err, tt.gdsCode)
 			}
 		})
 	}
