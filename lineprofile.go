@@ -24,15 +24,15 @@ type LineProfileOptions struct {
 	// as failed at its line ("BLOB too large to emulate"); a variable is
 	// never truncated, and WHEN handlers cannot catch the failure.
 	MaxBlobBytes int64
-	// WarmUp executes the entry statement once natively before the measured
-	// run, on the same attachment, so first-use costs (such as the server
-	// compiling procedures on their first call in the attachment) are paid
-	// outside the measurement: a selectable entry as SELECT * FROM P(args)
-	// with every row fetched and discarded, an executable one as EXECUTE
-	// PROCEDURE P(args). It runs in its own read-committed transaction,
-	// read-only when ReadOnly, always rolled back, under the same ctx.
-	// Effects that are not transactional happen twice. See
-	// LineProfileResult.WarmUp and WarmUpErr.
+	// WarmUp runs one discarded profile pass before the measured run, on the
+	// same attachment, so first-use costs (such as the server compiling a
+	// procedure on its first call from the attachment) are paid outside the
+	// measurement. The pass emulates the entry exactly as the measured run
+	// does (same StepInto) in its own read-committed transaction, read-only
+	// when ReadOnly, always rolled back, under the same ctx; everything it
+	// measures is discarded and the measured run starts afresh. Effects that
+	// are not transactional happen twice. See LineProfileResult.WarmUp and
+	// WarmUpErr.
 	WarmUp bool
 }
 
@@ -160,11 +160,12 @@ type LineProfileResult struct {
 	// how to run a node: a singleton SELECT whose in-statement CAST failed
 	// and that ran again without it (the node counts the second run only).
 	Retries time.Duration
-	// WarmUp is the elapsed time of the warm-up execution
+	// WarmUp is the elapsed time of the warm-up pass
 	// (LineProfileOptions.WarmUp), its transaction included; it is in no
-	// other bucket and no line. WarmUpErr is its failure (a sanitized driver
-	// error), nil when there was no warm-up or it succeeded; a failed
-	// warm-up does not stop the measured run. A ctx cancel or deadline
+	// other bucket and no line. WarmUpErr is the error the pass ended with
+	// (a sanitized driver error, without its location), nil when there was
+	// no warm-up or it completed; a failed warm-up does not stop the
+	// measured run. A ctx cancel or deadline
 	// during the warm-up ends the call as canceled before the measured run;
 	// RolledBack then reports the warm-up's rollback. The round-trip
 	// baselines and activity snapshots start after the warm-up, so node
@@ -311,14 +312,14 @@ func LineProfile(ctx context.Context, pooled *sql.Conn, opts LineProfileOptions)
 	return result, resultErr
 }
 
-// profileOnConn runs the warm-up (opts.WarmUp), the baselines and the
+// profileOnConn runs the warm-up pass (opts.WarmUp), the baselines and the
 // measured run on the pinned connection c. The first error is the run
 // outcome; the second a baseline, close or rollback failure.
 func profileOnConn(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileOptions,
 	result *LineProfileResult, stepInto map[string]bool) (outcomeErr, err error) {
 	if opts.WarmUp {
 		start := time.Now()
-		warmErr, txErr := warmUp(ctx, c, plan, opts.ReadOnly, &result.RolledBack)
+		warmErr, txErr := warmUp(ctx, c, plan, opts, result.Columns, stepInto, &result.RolledBack)
 		result.WarmUp = time.Since(start)
 		switch {
 		case ctx.Err() != nil:
@@ -329,22 +330,15 @@ func profileOnConn(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileO
 		case txErr != nil:
 			return nil, fmt.Errorf("interbase: line profile warm-up: %w", txErr)
 		}
-		result.WarmUpErr = warmErr
+		_, result.WarmUpErr = unwrapRunError(warmErr)
 		result.RolledBack = false
 	}
 	if result.Before, err = measureBaseline(ctx, c); err != nil {
 		return nil, err
 	}
-	tx, err := (&Attachment{conn: c}).BeginTx(ctx, TransactionOptions{
-		ReadOnly:  opts.ReadOnly,
-		Isolation: sql.LevelReadCommitted,
-	})
+	run, err := beginRun(ctx, c, plan, opts, result, stepInto)
 	if err != nil {
 		return nil, err
-	}
-	run := &lpRun{
-		ctx: ctx, conn: c, tx: tx, plan: plan, opts: opts, result: result, dbNone: plan.dbNone,
-		statements: make(map[string]cachedStatement), stepInto: stepInto,
 	}
 	outcomeErr, txErr := run.runInTransaction()
 	after, afterErr := measureBaseline(context.WithoutCancel(ctx), c)
@@ -355,58 +349,40 @@ func profileOnConn(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileO
 	return outcomeErr, errors.Join(txErr, afterErr)
 }
 
-// warmUp executes the entry statement once natively on c in its own
-// read-committed transaction and always rolls it back, its statement and
-// cursor closed first. A selectable entry's rows are all fetched and
-// discarded. The first error is the execution's; the second a close or
-// rollback failure.
-func warmUp(ctx context.Context, c *conn, plan *lpPlan, readOnly bool, rolledBack *bool) (execErr, txErr error) {
+// beginRun starts a run's read-committed transaction (read-only when
+// opts.ReadOnly) on c; the run measures into result.
+func beginRun(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileOptions,
+	result *LineProfileResult, stepInto map[string]bool) (*lpRun, error) {
 	tx, err := (&Attachment{conn: c}).BeginTx(ctx, TransactionOptions{
-		ReadOnly:  readOnly,
+		ReadOnly:  opts.ReadOnly,
 		Isolation: sql.LevelReadCommitted,
 	})
 	if err != nil {
+		return nil, err
+	}
+	return &lpRun{
+		ctx: ctx, conn: c, tx: tx, plan: plan, opts: opts, result: result, dbNone: plan.dbNone,
+		statements: make(map[string]cachedStatement), stepInto: stepInto,
+	}, nil
+}
+
+// warmUp runs the emulation once as the measured run will (Ruling W1), in
+// its own transaction, always rolled back, and discards everything it
+// measured. The first error is the pass's outcome; the second a close or
+// rollback failure.
+func warmUp(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileOptions, columns []string,
+	stepInto map[string]bool, rolledBack *bool) (outcomeErr, txErr error) {
+	discarded := &LineProfileResult{
+		ReadOnly: opts.ReadOnly, Columns: columns,
+		Routines: []LineProfileRoutine{newRoutineProfile(plan.entry)},
+	}
+	run, err := beginRun(ctx, c, plan, opts, discarded, stepInto)
+	if err != nil {
 		return err, nil
 	}
-	entry := plan.analysis.Entry
-	text := procedureName(entry.Procedure, entry.Quoted)
-	if len(entry.Args) > 0 {
-		text += "(" + strings.Join(entry.Args, ", ") + ")"
-	}
-	if entry.Selectable {
-		text = "SELECT * FROM " + text
-	} else {
-		text = "EXECUTE PROCEDURE " + text
-	}
-	txErr = runProfileTransaction(tx.Rollback, func() (closeErr error) {
-		stmt, err := tx.Prepare(ctx, text)
-		if err != nil {
-			execErr = err
-			return nil
-		}
-		defer func() { closeErr = stmt.Close() }()
-		if len(stmt.Outputs()) == 0 {
-			_, execErr = stmt.Exec(ctx)
-			return nil
-		}
-		cursor, err := stmt.Query(ctx)
-		if err != nil {
-			execErr = err
-			return nil
-		}
-		for {
-			hasRow, err := cursor.Next(ctx)
-			if err != nil || !hasRow {
-				execErr = err
-				break
-			}
-		}
-		if err := cursor.Close(); execErr == nil {
-			execErr = err
-		}
-		return nil
-	}, rolledBack)
-	return execErr, txErr
+	outcomeErr, txErr = run.runInTransaction()
+	*rolledBack = discarded.RolledBack
+	return outcomeErr, txErr
 }
 
 func (p RoutineProblem) String() string {
@@ -452,15 +428,7 @@ func finishLineProfile(ctx context.Context, result *LineProfileResult, outcomeEr
 		result.Outcome = LineProfileCompleted
 		return
 	}
-	var located *lpNodeError
-	if errors.As(err, &located) {
-		result.FailedAt = &LineProfileLocation{Routine: located.routine, Line: located.line}
-		err = located.err
-	}
-	var fatalErr *lpFatalError
-	if errors.As(err, &fatalErr) {
-		err = fatalErr.err
-	}
+	result.FailedAt, err = unwrapRunError(err)
 	result.Err = err
 	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		result.Outcome = LineProfileCanceled
@@ -468,6 +436,22 @@ func finishLineProfile(ctx context.Context, result *LineProfileResult, outcomeEr
 		return
 	}
 	result.Outcome = LineProfileFailed
+}
+
+// unwrapRunError returns the driver error of a run outcome and the location
+// where it stopped (nil when it is not located).
+func unwrapRunError(err error) (*LineProfileLocation, error) {
+	var at *LineProfileLocation
+	var located *lpNodeError
+	if errors.As(err, &located) {
+		at = &LineProfileLocation{Routine: located.routine, Line: located.line}
+		err = located.err
+	}
+	var fatalErr *lpFatalError
+	if errors.As(err, &fatalErr) {
+		err = fatalErr.err
+	}
+	return at, err
 }
 
 // relationIDs lists the relations of the node and overhead counters, sorted.

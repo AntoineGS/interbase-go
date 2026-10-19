@@ -3,30 +3,29 @@ package interbase
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
-// lineProfileWarmUpFake is an attachment whose transactions are fake ones.
-// events logs, in order, each begin ("begin ro" or "begin rw"), each
-// rollback and the first info call (baseline probe or snapshot) after a
-// rollback.
+// lineProfileWarmUpFake is an attachment whose transactions are fake ones:
+// each cursor of a transaction returns rows rows. events logs, in order,
+// each begin ("begin ro" or "begin rw"), each rollback and the first info
+// call (baseline probe or snapshot) after another event.
 type lineProfileWarmUpFake struct {
 	conn   *conn
 	events []string
 	counts []*lineProfileFakeCounts
-	// warmUpRows is the number of rows the first transaction's cursors
-	// return; fetches counts its fetches.
-	warmUpRows, fetches int
-	// warmUpNext, when set, replaces the first transaction's fetch.
+	execs  [][]string // statements executed per transaction
+	rows   int
+	// warmUpNext, when set, replaces the first transaction's fetch;
+	// warmUpExec its exec.
 	warmUpNext func() (bool, error)
-	// warmUpCounts configures the first transaction's fake.
-	warmUpCounts func(*lineProfileFakeCounts)
+	warmUpExec func(query string) (int64, error)
 }
 
 func newLineProfileWarmUpFake() *lineProfileWarmUpFake {
-	f := &lineProfileWarmUpFake{warmUpRows: 3}
+	f := &lineProfileWarmUpFake{rows: 2}
 	native := &nativeConnection{
 		brokenOverride: func() bool { return false },
 		databaseInfoItemsOverride: func(codes []byte) ([]byte, error) {
@@ -42,24 +41,31 @@ func newLineProfileWarmUpFake() *lineProfileWarmUpFake {
 			mode = "begin ro"
 		}
 		f.events = append(f.events, mode)
+		index := len(f.counts)
 		counts := &lineProfileFakeCounts{}
-		first := len(f.counts) == 0
 		f.counts = append(f.counts, counts)
-		// The measured run's only SELECTs are entry arguments.
-		next := func() (bool, error) { return true, nil }
-		if first {
-			next = func() (bool, error) {
-				if f.warmUpNext != nil {
-					return f.warmUpNext()
-				}
-				f.fetches++
-				return f.fetches <= f.warmUpRows, nil
+		f.execs = append(f.execs, nil)
+		fetched := 0
+		next := func() (bool, error) {
+			fetched++
+			return fetched <= f.rows, nil
+		}
+		exec := func(query string) (int64, error) {
+			f.execs[index] = append(f.execs[index], query)
+			return 1, nil
+		}
+		if index == 0 {
+			if f.warmUpNext != nil {
+				next = f.warmUpNext
 			}
-			if f.warmUpCounts != nil {
-				f.warmUpCounts(counts)
+			if f.warmUpExec != nil {
+				exec = func(query string) (int64, error) {
+					f.execs[index] = append(f.execs[index], query)
+					return f.warmUpExec(query)
+				}
 			}
 		}
-		tx := newLineProfileFakeNative(counts, next, func(string) (int64, error) { return 1, nil })
+		tx := newLineProfileFakeNative(counts, next, exec)
 		rollback := tx.rollbackOverride
 		tx.rollbackOverride = func() error {
 			f.events = append(f.events, "rollback")
@@ -71,112 +77,111 @@ func newLineProfileWarmUpFake() *lineProfileWarmUpFake {
 	return f
 }
 
-func (f *lineProfileWarmUpFake) run(t *testing.T, ctx context.Context, plan *lpPlan, opts LineProfileOptions) (LineProfileResult, error, error) {
+func (f *lineProfileWarmUpFake) run(t *testing.T, ctx context.Context, opts LineProfileOptions) (LineProfileResult, error, error) {
 	t.Helper()
-	if opts.KeepRows == 0 {
-		opts.KeepRows = 10
-	}
+	opts.KeepRows = 10
+	plan := newLineProfileFakePlan(t, lineProfileWarmUpBody)
 	result := LineProfileResult{ReadOnly: opts.ReadOnly, Routines: []LineProfileRoutine{newRoutineProfile(plan.entry)}}
 	outcomeErr, err := profileOnConn(ctx, f.conn, plan, opts, &result, nil)
 	return result, outcomeErr, err
 }
 
-const lineProfileWarmUpBody = "BEGIN\n  SUSPEND;\nEND"
+const lineProfileWarmUpBody = "DECLARE VARIABLE X INTEGER;\nBEGIN\n" +
+	"  FOR SELECT ID FROM LP_T INTO :X DO\n" +
+	"  BEGIN\n" +
+	"    UPDATE LP_T SET A = :X;\n" +
+	"    SUSPEND;\n" +
+	"  END\n" +
+	"END"
+
+// lineProfileWarmUpShape is the timing-free part of a result.
+type lineProfileWarmUpShape struct {
+	Outcome     error
+	Rows        int64
+	ServerCalls int64
+	Nodes       []LineProfileNode
+	Overhead    ActivityDelta
+}
+
+func lineProfileShape(result LineProfileResult, outcomeErr error) lineProfileWarmUpShape {
+	shape := lineProfileWarmUpShape{Outcome: outcomeErr, Rows: result.Rows, ServerCalls: result.ServerCalls, Overhead: result.OverheadActivity}
+	for _, node := range result.Routines[0].Nodes {
+		m := node.Metrics
+		node.Metrics = LineMetrics{Hits: m.Hits, ServerCalls: m.ServerCalls, Rows: m.Rows, Errors: m.Errors, Pages: m.Pages, Tables: m.Tables}
+		shape.Nodes = append(shape.Nodes, node)
+	}
+	return shape
+}
 
 func TestLineProfileWarmUpOffRunsNoExtraTransaction(t *testing.T) {
 	f := newLineProfileWarmUpFake()
-	result, outcomeErr, err := f.run(t, context.Background(), newLineProfileFakePlan(t, lineProfileWarmUpBody), LineProfileOptions{ReadOnly: true})
+	result, outcomeErr, err := f.run(t, context.Background(), LineProfileOptions{ReadOnly: true})
 	if outcomeErr != nil || err != nil {
 		t.Fatalf("run = %v, %v", outcomeErr, err)
 	}
-	if len(f.counts) != 1 || f.fetches != 0 {
-		t.Fatalf("transactions %d, warm-up fetches %d; want the run's only (events %v)", len(f.counts), f.fetches, f.events)
+	if len(f.counts) != 1 {
+		t.Fatalf("transactions %d; want the run's only (events %v)", len(f.counts), f.events)
 	}
 	if result.WarmUp != 0 || result.WarmUpErr != nil {
 		t.Fatalf("WarmUp %v, WarmUpErr %v; want none", result.WarmUp, result.WarmUpErr)
 	}
 }
 
-func TestLineProfileWarmUpRunsTheEntryOnceBeforeTheRun(t *testing.T) {
-	for _, tt := range []struct {
-		name       string
-		selectable bool
-		args       []string
-		readOnly   bool
-		want       string
-		begin      string
-	}{
-		{"selectable read-only", true, nil, true, "SELECT * FROM LP_FAKE", "begin ro"},
-		{"selectable read-write", true, []string{"1", "'x'"}, false, "SELECT * FROM LP_FAKE(1, 'x')", "begin rw"},
-		{"executable", false, []string{"1"}, true, "EXECUTE PROCEDURE LP_FAKE(1)", "begin ro"},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			const pause = 30 * time.Millisecond
-			f := newLineProfileWarmUpFake()
-			f.warmUpCounts = func(c *lineProfileFakeCounts) { c.onPrepare = func() { time.Sleep(pause) } }
-			plan := newLineProfileFakePlan(t, lineProfileWarmUpBody)
-			plan.analysis.Entry.Selectable = tt.selectable
-			plan.analysis.Entry.Args = tt.args
-			for i := range tt.args {
-				plan.entry.inputs = append(plan.entry.inputs, lpParam{name: string(rune('A' + i)), typeText: "INTEGER"})
-			}
-			result, outcomeErr, err := f.run(t, context.Background(), plan, LineProfileOptions{ReadOnly: tt.readOnly, WarmUp: true})
-			if outcomeErr != nil || err != nil {
-				t.Fatalf("run = %v, %v", outcomeErr, err)
-			}
-			want := []string{tt.begin, "rollback", "info", tt.begin, "info", "rollback", "info"}
-			if strings.Join(f.events, ",") != strings.Join(want, ",") {
-				t.Fatalf("events %v, want %v", f.events, want)
-			}
-			warm := f.counts[0]
-			if warm.prepared != 1 || warm.prepares[tt.want] != 1 {
-				t.Fatalf("warm-up prepares %v, want one %q", warm.prepares, tt.want)
-			}
-			if warm.closedAtRollback != 1 || warm.cursorsClosedAtRollback != warm.queried {
-				t.Fatalf("warm-up statements closed before rollback %d, cursors %d/%d", warm.closedAtRollback, warm.cursorsClosedAtRollback, warm.queried)
-			}
-			if tt.selectable && (warm.queried != 1 || f.fetches != f.warmUpRows+1) {
-				t.Fatalf("warm-up queried %d, fetches %d; want every row fetched", warm.queried, f.fetches)
-			}
-			if !tt.selectable && warm.queried != 0 {
-				t.Fatalf("executable warm-up queried %d", warm.queried)
-			}
-			if result.WarmUp < pause || result.Setup >= pause || result.Prepare >= pause {
-				t.Fatalf("WarmUp %v, Setup %v, Prepare %v; want the warm-up in WarmUp only", result.WarmUp, result.Setup, result.Prepare)
-			}
-			if result.WarmUpErr != nil || !result.RolledBack {
-				t.Fatalf("WarmUpErr %v, RolledBack %v", result.WarmUpErr, result.RolledBack)
-			}
-		})
-	}
-}
-
-func TestLineProfileWarmUpQuotedEntryName(t *testing.T) {
-	f := newLineProfileWarmUpFake()
-	plan := newLineProfileFakePlan(t, lineProfileWarmUpBody)
-	plan.analysis.Entry.Procedure, plan.analysis.Entry.Quoted = `lp "q"`, true
-	if _, outcomeErr, err := f.run(t, context.Background(), plan, LineProfileOptions{WarmUp: true}); outcomeErr != nil || err != nil {
-		t.Fatalf("run = %v, %v", outcomeErr, err)
-	}
-	if want := `SELECT * FROM "lp ""q"""`; f.counts[0].prepares[want] != 1 {
-		t.Fatalf("warm-up prepares %v, want %q", f.counts[0].prepares, want)
+// TestLineProfileWarmUpIsADiscardedPass checks Ruling W1: the warm-up runs
+// the same emulation once in its own rolled-back transaction before the
+// run's baselines, and the measured run starts fresh with nothing of it.
+func TestLineProfileWarmUpIsADiscardedPass(t *testing.T) {
+	for _, readOnly := range []bool{true, false} {
+		cold := newLineProfileWarmUpFake()
+		coldResult, coldOutcome, coldErr := cold.run(t, context.Background(), LineProfileOptions{ReadOnly: readOnly})
+		f := newLineProfileWarmUpFake()
+		result, outcomeErr, err := f.run(t, context.Background(), LineProfileOptions{ReadOnly: readOnly, WarmUp: true})
+		if outcomeErr != nil || err != nil || coldOutcome != nil || coldErr != nil {
+			t.Fatalf("read-only %v: run = %v, %v; cold %v, %v", readOnly, outcomeErr, err, coldOutcome, coldErr)
+		}
+		begin := "begin rw"
+		if readOnly {
+			begin = "begin ro"
+		}
+		want := []string{begin, "info", "rollback", "info", begin, "info", "rollback", "info"}
+		if strings.Join(f.events, ",") != strings.Join(want, ",") {
+			t.Fatalf("read-only %v: events %v, want %v", readOnly, f.events, want)
+		}
+		warm, measured := f.counts[0], f.counts[1]
+		if !reflect.DeepEqual(warm.prepares, measured.prepares) || !reflect.DeepEqual(f.execs[0], f.execs[1]) ||
+			warm.queried != measured.queried || len(f.execs[1]) != cold.rows {
+			t.Fatalf("warm-up prepares %v execs %v, run prepares %v execs %v; want the same node sequence",
+				warm.prepares, f.execs[0], measured.prepares, f.execs[1])
+		}
+		if !warm.rolledBack || warm.closedAtRollback != warm.prepared || warm.cursorsClosedAtRollback != warm.queried {
+			t.Fatalf("warm-up rolled back %v, statements closed before %d/%d, cursors %d/%d",
+				warm.rolledBack, warm.closedAtRollback, warm.prepared, warm.cursorsClosedAtRollback, warm.queried)
+		}
+		if got, want := lineProfileShape(result, outcomeErr), lineProfileShape(coldResult, coldOutcome); !reflect.DeepEqual(got, want) {
+			t.Fatalf("measured run %+v, want as without warm-up %+v", got, want)
+		}
+		if len(result.KeptRows) != len(coldResult.KeptRows) || result.WarmUp <= 0 || result.WarmUpErr != nil || !result.RolledBack {
+			t.Fatalf("kept %d/%d, WarmUp %v, WarmUpErr %v, RolledBack %v",
+				len(result.KeptRows), len(coldResult.KeptRows), result.WarmUp, result.WarmUpErr, result.RolledBack)
+		}
 	}
 }
 
 func TestLineProfileWarmUpFailureContinuesTheRun(t *testing.T) {
 	f := newLineProfileWarmUpFake()
-	f.warmUpNext = func() (bool, error) {
-		return false, &Error{Operation: "fetch", SQLCode: -803, Message: "LP warm-up failure"}
+	f.warmUpExec = func(string) (int64, error) {
+		return 0, &Error{Operation: "exec", SQLCode: -803, Message: "LP warm-up failure"}
 	}
-	result, outcomeErr, err := f.run(t, context.Background(), newLineProfileFakePlan(t, lineProfileWarmUpBody), LineProfileOptions{WarmUp: true})
+	result, outcomeErr, err := f.run(t, context.Background(), LineProfileOptions{WarmUp: true})
 	if outcomeErr != nil || err != nil {
 		t.Fatalf("run = %v, %v; want the measured run to go on", outcomeErr, err)
 	}
 	var nativeErr *Error
-	if !errors.As(result.WarmUpErr, &nativeErr) || nativeErr.SQLCode != -803 {
-		t.Fatalf("WarmUpErr = %v", result.WarmUpErr)
+	var located *lpNodeError
+	if !errors.As(result.WarmUpErr, &nativeErr) || nativeErr.SQLCode != -803 || errors.As(result.WarmUpErr, &located) {
+		t.Fatalf("WarmUpErr = %#v; want the driver error", result.WarmUpErr)
 	}
-	if len(f.counts) != 2 || !f.counts[0].rolledBack || !f.counts[1].rolledBack || result.Rows != 1 {
+	if len(f.counts) != 2 || !f.counts[0].rolledBack || !f.counts[1].rolledBack || result.Rows != 2 {
 		t.Fatalf("transactions %d, rows %d, events %v", len(f.counts), result.Rows, f.events)
 	}
 }
@@ -189,18 +194,25 @@ func TestLineProfileWarmUpCancelEndsTheCall(t *testing.T) {
 		cancel()
 		return true, nil
 	}
-	result, outcomeErr, err := f.run(t, ctx, newLineProfileFakePlan(t, lineProfileWarmUpBody), LineProfileOptions{WarmUp: true})
+	result, outcomeErr, err := f.run(t, ctx, LineProfileOptions{WarmUp: true})
 	if err != nil || !errors.Is(outcomeErr, context.Canceled) {
 		t.Fatalf("run = %v, %v; want canceled", outcomeErr, err)
 	}
-	if len(f.counts) != 1 || !f.counts[0].rolledBack || f.counts[0].closedAtRollback != 1 {
-		t.Fatalf("transactions %d, events %v; want the warm-up only, rolled back after its statement closed", len(f.counts), f.events)
+	warm := f.counts[0]
+	if len(f.counts) != 1 || !warm.rolledBack || warm.closedAtRollback != warm.prepared {
+		t.Fatalf("transactions %d, events %v; want the warm-up only, rolled back after its statements closed", len(f.counts), f.events)
 	}
-	if result.WarmUp <= 0 || result.WarmUpErr != nil || !result.RolledBack {
-		t.Fatalf("WarmUp %v, WarmUpErr %v, RolledBack %v", result.WarmUp, result.WarmUpErr, result.RolledBack)
+	if result.WarmUp <= 0 || result.WarmUpErr != nil || !result.RolledBack || result.ServerCalls != 0 || result.Before.Samples != 0 {
+		t.Fatalf("WarmUp %v, WarmUpErr %v, RolledBack %v, calls %d, baseline %+v",
+			result.WarmUp, result.WarmUpErr, result.RolledBack, result.ServerCalls, result.Before)
 	}
 	finishLineProfile(ctx, &result, outcomeErr, err)
 	if result.Outcome != LineProfileCanceled {
 		t.Fatalf("outcome %s, want canceled", result.Outcome)
+	}
+	for _, node := range result.Routines[0].Nodes {
+		if node.Metrics.Hits != 0 {
+			t.Fatalf("node %d keeps warm-up hits %d", node.ID, node.Metrics.Hits)
+		}
 	}
 }

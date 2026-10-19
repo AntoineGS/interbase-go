@@ -121,9 +121,9 @@ func lpSameLineCounts(t *testing.T, cold, warm interbase.LineProfileResult) {
 	}
 }
 
-// TestLineProfileWarmUp checks ibg-3os: the warm-up executes the entry once
-// natively in a rolled-back transaction before the measured run, which it
-// leaves unchanged.
+// TestLineProfileWarmUp checks ibg-3os (Ruling W1): the warm-up is one
+// discarded profile pass in a rolled-back transaction before the measured
+// run, which it leaves unchanged.
 func TestLineProfileWarmUp(t *testing.T) {
 	for _, dialect := range []int{3, 1} {
 		t.Run(fmt.Sprintf("dialect %d", dialect), func(t *testing.T) {
@@ -136,7 +136,10 @@ func TestLineProfileWarmUp(t *testing.T) {
 				opts.WarmUp = true
 				warm, warmBumps := lpRunCounted(t, ctx, conn, "LP_WU_GEN", opts)
 				if coldBumps != 1 || warmBumps != coldBumps+1 {
-					t.Fatalf("generator +%d without warm-up, +%d with; want one more native execution", coldBumps, warmBumps)
+					t.Fatalf("generator +%d without warm-up, +%d with; want one more emulated execution", coldBumps, warmBumps)
+				}
+				if warm.ServerCalls != cold.ServerCalls || warm.Rows != cold.Rows {
+					t.Fatalf("server calls %d/%d, rows %d/%d; want the warm-up discarded", cold.ServerCalls, warm.ServerCalls, cold.Rows, warm.Rows)
 				}
 				if cold.Outcome != interbase.LineProfileCompleted || warm.WarmUp <= 0 || warm.WarmUpErr != nil || cold.WarmUp != 0 {
 					t.Fatalf("cold %s/%v, warm-up %v / %v", cold.Outcome, cold.Err, warm.WarmUp, warm.WarmUpErr)
