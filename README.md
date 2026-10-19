@@ -272,10 +272,10 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   the call beforehand does not move it (measured), so the profiler does not
   try to warm callees up.
 - BLOB values fetched into variables are held in client memory up to
-  `MaxBlobBytes` (default 16 MiB, also used for 0 or a negative value). A larger BLOB ends the run as `failed` at
-  its line with "BLOB too large to emulate"; the value is never truncated and
-  `WHEN` handlers cannot catch this. Kept output rows show at most 64 KiB of a
-  BLOB.
+  `MaxBlobBytes` (default 16 MiB, also used for 0 or a negative value). A
+  larger BLOB ends the run as `failed` at its line with "BLOB too large to
+  emulate"; the value is never truncated and `WHEN` handlers cannot catch
+  this. Kept output rows show at most 64 KiB of a BLOB.
 - `EXECUTE STATEMENT <text> [INTO <targets>]` and `FOR EXECUTE STATEMENT
   <text> INTO <targets> DO <statement>` run as InterBase runs them (verified
   natively, dialects 1 and 3). The text is evaluated like any value and
@@ -291,15 +291,15 @@ result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{
   an error is reported as `isc_exec_stmt2_execute`, with the statement's
   own SQLCODE for a prepare error and SQLCODE -204 for an execution error,
   except `COMMIT` and `ROLLBACK`, reported as `isc_exec_stmt_disallow`
-  (SQLCODE -204); `WHEN` handlers catch them. InterBase copies `INTO` columns without
-  conversion, so a column of another type yields garbage there; the profiler
-  assigns NULLs and exact copies only (same storage, a `VARCHAR` value that
-  fits, a wider integer value that fits) and otherwise fails the run, as it
-  does for a column count other than the targets', `INTO` on a statement
-  without rows, and statements it does not run: DDL (Ruling R26), `SET
-  GENERATOR` (not transactional) and `SAVEPOINT`, `RELEASE SAVEPOINT`,
-  `ROLLBACK [WORK] TO SAVEPOINT` (they would interfere with the profiler's
-  own savepoints).
+  (SQLCODE -204); `WHEN` handlers catch them. InterBase copies `INTO`
+  columns without conversion, so a column of another type yields garbage
+  there; the profiler assigns NULLs and exact copies only (same storage, a
+  `VARCHAR` value that fits, a wider integer value that fits) and otherwise
+  fails the run, as it does for a column count other than the targets',
+  `INTO` on a statement without rows, and statements it does not run: DDL
+  (Ruling R26), `SET GENERATOR` (not transactional) and `SAVEPOINT`,
+  `RELEASE SAVEPOINT`, `ROLLBACK [WORK] TO SAVEPOINT` (they would interfere
+  with the profiler's own savepoints).
 - BLOB variables follow InterBase (verified natively, dialects 1 and 3): a
   BLOB variable or BLOB output parameter assigned to a text variable fails
   with SQLCODE -902, while a BLOB column selected into one is cut to the

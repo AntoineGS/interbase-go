@@ -9,9 +9,9 @@ var gdsCodesByName = map[string]int64{
 	"bad_db_handle":                    335544324,
 	"convert_error":                    335544334,
 	"deadlock":                         335544336,
-	"lock_conflict":                    335544345,
 	"integ_fail":                       335544342,
 	"invalid_blr":                      335544343,
+	"lock_conflict":                    335544345,
 	"not_valid":                        335544347,
 	"no_cur_rec":                       335544348,
 	"no_dup":                           335544349,
@@ -31,10 +31,6 @@ var gdsCodesByName = map[string]int64{
 	"primary_key_exists":               335544548,
 	"check_constraint":                 335544558,
 	"dsql_error":                       335544569,
-	"exec_stmt2_execute":               335544853,
-	"exec_stmt2_fetch_err":             335544854,
-	"exec_stmt2_single_multi":          335544855,
-	"exec_stmt_disallow":               335544857,
 	"dsql_cursor_err":                  335544572,
 	"sing_select_err":                  335544652,
 	"unique_key_violation":             335544665,
@@ -46,6 +42,10 @@ var gdsCodesByName = map[string]int64{
 	"exception_integer_divide_by_zero": 335544778,
 	"exception_integer_overflow":       335544779,
 	"cancelled":                        335544794,
+	"exec_stmt2_execute":               335544853,
+	"exec_stmt2_fetch_err":             335544854,
+	"exec_stmt2_single_multi":          335544855,
+	"exec_stmt_disallow":               335544857,
 }
 
 // GDSCodeByName returns the status code for a name as written in
