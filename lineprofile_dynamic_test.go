@@ -207,6 +207,38 @@ func TestLineProfileExecuteStatementInto(t *testing.T) {
 	}
 }
 
+// TestLineProfileExecuteStatementIntoDescribesDeclaredType checks that the
+// target of an INTO copy is described with its declared type, the database
+// default character set added to a text type declared without one.
+func TestLineProfileExecuteStatementIntoDescribesDeclaredType(t *testing.T) {
+	body := "DECLARE VARIABLE X VARCHAR(10);\nBEGIN\n" +
+		"  EXECUTE STATEMENT 'SELECT V FROM LP_T' INTO :X;\n" +
+		"  SUSPEND;\n" +
+		"END"
+	const describe = "SELECT CAST(NULL AS VARCHAR(10) CHARACTER SET WIN1252) FROM RDB$DATABASE"
+	run, counts, _ := newLineProfileDynamicRun(t, body, []string{"X"}, func() (bool, error) { return true, nil }, nil)
+	run.plan.dbCharset = "win1252"
+	varchar := []OutputDescriptor{{Name: "V", Kind: "VARCHAR", SubType: 53, Length: 10, Nullable: true}}
+	counts.outputsFor = func(query string) []OutputDescriptor {
+		if query == "SELECT V FROM LP_T" || query == describe {
+			return varchar
+		}
+		return nil
+	}
+	counts.valueFor = func(query string) driver.Value {
+		if query == "SELECT V FROM LP_T" {
+			return "abc"
+		}
+		return nil
+	}
+	if outcome, txErr := run.runInTransaction(); outcome != nil || txErr != nil {
+		t.Fatalf("runInTransaction() = %v, %v", outcome, txErr)
+	}
+	if counts.prepares[describe] != 1 {
+		t.Fatalf("prepares %v; want the target described as %q", counts.prepares, describe)
+	}
+}
+
 // lineProfileFakeEOF marks the end of rows in a fake result.
 var lineProfileFakeEOF = errors.New("fake end of rows")
 

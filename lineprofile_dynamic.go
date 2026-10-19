@@ -576,12 +576,13 @@ func (r *lpRun) assignDynamic(f *lpFrame, targets []string, row []Cell, outputs 
 // the same subtype), is a VARCHAR of the target's character set whose value
 // fits the target's length, or is an unscaled integer of a wider kind whose
 // value fits the target (the copy keeps the low bytes, verified natively).
-// The target's storage is described by the server once per type.
+// The target's storage is described by the server once per type, with the
+// database default character set for a text type declared without one.
 func (r *lpRun) copiesExactly(source OutputDescriptor, value any, target *lpVar) (bool, error) {
 	if isBlobType(target.typ.Text) {
 		return source.Kind == "BLOB" && source.SubType == blobSubtype(target.typ.Text), nil
 	}
-	text := "SELECT CAST(NULL AS " + castType(target.typ.Text) + ") FROM RDB$DATABASE"
+	text := "SELECT CAST(NULL AS " + r.declaredType(target.typ.Text) + ") FROM RDB$DATABASE"
 	stmt, err := r.fixedStatement(nil, text)
 	if err != nil {
 		return false, err
@@ -596,7 +597,9 @@ func (r *lpRun) copiesExactly(source OutputDescriptor, value any, target *lpVar)
 	}
 	if source.Kind != want.Kind {
 		// A wider integer column keeps its low bytes: exact when the value
-		// fits the target.
+		// fits the target. The low bytes come first only on a little-endian
+		// server (verified natively on x86, which every supported InterBase
+		// platform is).
 		limit, narrower := lpIntegerLimits[want.Kind]
 		i, isInt := value.(int64)
 		return narrower && isInt && source.Scale == 0 && lpIntegerLimits[source.Kind] > limit && i >= -limit-1 && i <= limit, nil
