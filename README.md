@@ -196,6 +196,16 @@ a caller that simply returns the error already lets the pool discard it. The
 `Introspector` value handed to a `Raw` callback must not be retained beyond
 that callback.
 
+`DescribeStatement(ctx, pooled, query)` prepares a statement to classify it and
+then drops it. To describe and then run the same statement without a second
+native prepare, use `PrepareNext(ctx, pooled, query)`: it returns the same
+description, and the connection's next argument-free `QueryContext` or
+`ExecContext` with the identical text, including one made through a
+transaction begun in between, runs the kept statement. Any other text,
+arguments, prepare or description on that connection discards it. Close the
+returned `PendingStatement` on every path that does not run it, because a
+prepared statement keeps the objects it references in use for DDL.
+
 ### SQL and profiling helpers
 
 The profiling helpers reuse a borrowed `*sql.Conn`; they do not open a second

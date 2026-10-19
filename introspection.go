@@ -389,9 +389,21 @@ func (c *conn) DescribeStatement(ctx context.Context, query string) (StatementDe
 // The caller holds c.mu for the duration of this helper.
 func (c *conn) inspectPreparedStatementLocked(ctx context.Context, query, operation string,
 	inspect func(*nativeStatement) error) error {
+	_, err := c.prepareInspectedLocked(ctx, query, operation, inspect, false)
+	return err
+}
+
+// prepareInspectedLocked prepares and inspects query, discarding any pending
+// statement first. With keep it returns the inspected statement open;
+// otherwise it closes it and returns nil.
+func (c *conn) prepareInspectedLocked(ctx context.Context, query, operation string,
+	inspect func(*nativeStatement) error, keep bool) (*nativeStatement, error) {
+	if err := c.discardPendingLocked(); err != nil {
+		return nil, err
+	}
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer releaseNative()
 	statement, err := c.native.prepare(ctx, query)
@@ -409,23 +421,32 @@ func (c *conn) inspectPreparedStatementLocked(ctx context.Context, query, operat
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
-		return operationErr
+		return nil, operationErr
 	}
 	if err := contextError(ctx); err != nil {
-		return errors.Join(err, statement.close())
+		return nil, errors.Join(err, statement.close())
 	}
 	inspectErr := inspect(statement)
-	closeErr := statement.close()
+	var closeErr error
+	if inspectErr != nil || !keep {
+		closeErr = statement.close()
+	}
 	releaseNative()
 	if inspectErr != nil || closeErr != nil {
 		operationErr := c.sanitizeError(operation, errors.Join(inspectErr, closeErr))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
-		return operationErr
+		return nil, operationErr
 	}
 	if err := contextError(ctx); err != nil {
-		return err
+		if keep {
+			err = errors.Join(err, c.sanitizeError("close statement", statement.close()))
+		}
+		return nil, err
 	}
-	return nil
+	if !keep {
+		return nil, nil
+	}
+	return statement, nil
 }

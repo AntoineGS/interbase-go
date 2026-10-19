@@ -739,7 +739,11 @@ type conn struct {
 	closed             bool
 	statements         map[*stmt]struct{}
 	rows               map[*rows]struct{}
-	distributed        *DistributedTransaction
+	// pending is the statement PrepareNext kept for the next execution of
+	// pendingQuery; it is also registered in statements.
+	pending      *stmt
+	pendingQuery string
+	distributed  *DistributedTransaction
 	// activityPerItem is set once the combined activity response exceeded the
 	// native limit; guarded by mu.
 	activityPerItem bool
@@ -1101,6 +1105,9 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
+	if err := c.discardPendingLocked(); err != nil {
+		return nil, err
+	}
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
 		return nil, err
@@ -1154,6 +1161,7 @@ func (c *conn) closeLocked() error {
 	if c.closed {
 		return firstErr
 	}
+	c.pending, c.pendingQuery = nil, ""
 	if err := c.closeStatementsLocked(); err != nil {
 		firstErr = errors.Join(firstErr, c.sanitizeError("close statement", err))
 	}
@@ -1234,12 +1242,21 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	releaseNative, err := enterNativeContext(ctx)
+	pending, err := c.takePendingLocked(query, args)
 	if err != nil {
 		return nil, err
 	}
+	releaseNative, err := enterNativeContext(ctx)
+	if err != nil {
+		return nil, errors.Join(err, c.releaseStatementLocked(pending))
+	}
 	defer releaseNative()
-	affected, err := c.native.exec(ctx, query, args, false)
+	var affected int64
+	if pending != nil {
+		affected, err = pending.native.exec(ctx, args)
+	} else {
+		affected, err = c.native.exec(ctx, query, args, false)
+	}
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
@@ -1250,10 +1267,14 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 			contextCancellation(ctx), operationErr, cleanupErr, c.native.writeOutcomeState(), evidence)
 		operationErr = joinNativeRequestDiagnostic(operationErr,
 			c.sanitizeError("", parts.request))
+		operationErr = errors.Join(operationErr, c.releaseStatementLocked(pending))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
 		return nil, operationErr
+	}
+	if err := c.releaseStatementLocked(pending); err != nil {
+		return nil, err
 	}
 	if err := contextError(ctx); err != nil {
 		if c.native.broken() {
@@ -1290,13 +1311,23 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-
-	releaseNative, err := enterNativeContext(ctx)
+	pending, err := c.takePendingLocked(query, args)
 	if err != nil {
 		return nil, err
 	}
+
+	releaseNative, err := enterNativeContext(ctx)
+	if err != nil {
+		return nil, errors.Join(err, c.releaseStatementLocked(pending))
+	}
 	defer releaseNative()
-	nativeRows, columns, err := c.native.query(ctx, query, args, false)
+	var nativeRows *nativeCursor
+	var columns []string
+	if pending != nil {
+		nativeRows, columns, err = pending.native.query(ctx, args)
+	} else {
+		nativeRows, columns, err = c.native.query(ctx, query, args, false)
+	}
 	releaseNative()
 	if err != nil {
 		evidence := nativeCancellationEvidenceOf(err)
@@ -1308,6 +1339,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 			c.native.writeOutcomeState(), evidence)
 		operationErr = joinNativeRequestDiagnostic(operationErr,
 			c.sanitizeError("", parts.request))
+		operationErr = errors.Join(operationErr, c.releaseStatementLocked(pending))
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
@@ -1316,6 +1348,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	result := &rows{
 		conn:                c,
 		native:              nativeRows,
+		statement:           pending,
 		explicitTransaction: nativeRows.explicitTransaction,
 		ctx:                 ctx,
 		columns:             columns,
@@ -1390,6 +1423,7 @@ func (c *conn) invalidateLocked(cause error) {
 		statement.mu.Unlock()
 	}
 	c.statements = nil
+	c.pending, c.pendingQuery = nil, ""
 	c.closed = true
 	native := c.native
 	c.native = nil
@@ -1399,8 +1433,10 @@ func (c *conn) invalidateLocked(cause error) {
 }
 
 type rows struct {
-	conn                *conn
-	native              *nativeCursor
+	conn   *conn
+	native *nativeCursor
+	// statement is the pending statement these rows ran, closed with them.
+	statement           *stmt
 	explicitTransaction bool
 	ctx                 context.Context
 	columns             []string
@@ -1547,27 +1583,35 @@ func (r *rows) finishLocked(abort bool, cause error) error {
 	}
 	r.closed = true
 	r.conn.unregisterRowsLocked(r)
+	statement := r.statement
+	r.statement = nil
 	if r.conn.closed {
 		r.native = nil
 		return nil
 	}
 	native := r.native
 	r.native = nil
-	if native == nil {
-		return nil
-	}
-	close := native.close
-	if abort {
-		close = native.abort
-	}
-	if err := close(); err != nil {
-		cleanupErr := r.conn.sanitizeError("close cursor", err)
-		if cause != nil {
-			cleanupErr = errors.Join(cause, cleanupErr)
+	if native != nil {
+		close := native.close
+		if abort {
+			close = native.abort
 		}
-		r.terminalErr = cleanupErr
-		r.conn.invalidateLocked(cleanupErr)
-		return cleanupErr
+		if err := close(); err != nil {
+			cleanupErr := r.conn.sanitizeError("close cursor", err)
+			if cause != nil {
+				cleanupErr = errors.Join(cause, cleanupErr)
+			}
+			r.terminalErr = cleanupErr
+			r.conn.invalidateLocked(cleanupErr)
+			return cleanupErr
+		}
+	}
+	if err := r.conn.releaseStatementLocked(statement); err != nil {
+		if cause != nil {
+			err = errors.Join(cause, err)
+		}
+		r.terminalErr = err
+		return err
 	}
 	return nil
 }
