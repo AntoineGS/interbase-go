@@ -317,6 +317,29 @@ END`,
 BEGIN
   FOR SELECT C3, U3, P4 FROM LP_PADS WHERE ID < 3 ORDER BY ID INTO :V2, :U2, :W DO SUSPEND;
 END`,
+		`CREATE PROCEDURE LP_PM_FIRST RETURNS (W VARCHAR(8) CHARACTER SET WIN1252) AS
+BEGIN
+  SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID INTO :W;
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_PM_SECOND RETURNS (W VARCHAR(8) CHARACTER SET WIN1252) AS
+BEGIN
+  SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID DESC INTO :W;
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_PM_SRC (K INTEGER) RETURNS (T VARCHAR(40) CHARACTER SET WIN1252) AS
+BEGIN
+  INSERT INTO LP_LOG (ID, MSG) VALUES (:K, 'pm');
+  T = 'short';
+  SUSPEND;
+  T = 'far too long here';
+  SUSPEND;
+END`,
+		`CREATE PROCEDURE LP_PM_PROC RETURNS (W VARCHAR(8) CHARACTER SET WIN1252) AS
+BEGIN
+  SELECT T FROM LP_PM_SRC(900) INTO :W;
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE LP_R18U (MAXID INTEGER) RETURNS (U VARCHAR(8)) AS
 BEGIN
   FOR SELECT U40 FROM LP_TEXTS WHERE ID <= :MAXID ORDER BY ID INTO :U DO SUSPEND;
@@ -909,6 +932,11 @@ func TestLineProfileDifferential(t *testing.T) {
 				},
 				{name: "execute writes", sql: "execute procedure LP_WRITES 6", skipHits: true},
 				{name: "singleton", sql: "execute procedure LP_SINGLETON"},
+				// ibg-pm8: a second row is a singleton error even when a
+				// row fails the conversion to its target.
+				{name: "singleton, second row fails the conversion", sql: "select * from LP_PM_FIRST", failAt: "SELECT W40"},
+				{name: "singleton, first row fails the conversion", sql: "select * from LP_PM_SECOND", failAt: "SELECT W40"},
+				{name: "singleton from a writing procedure, a row fails the conversion", sql: "select * from LP_PM_PROC", failAt: "SELECT T FROM"},
 				{name: "truncation", sql: "execute procedure LP_TRUNC"},
 				{name: "UTF8 length in bytes", sql: "execute procedure LP_TRUNC8"},
 				{name: "bare procedure in FROM", sql: "select * from LP_BARE_USER"},
@@ -1207,6 +1235,33 @@ func TestLineProfileAnalysis(t *testing.T) {
 				t.Fatalf("callees = %+v, want %s", analysis.Callees, tt.callee)
 			}
 		})
+	}
+}
+
+// TestLineProfileSingletonCastRetry checks ibg-pm8 beyond the SQLCODE (see
+// the differential cases): a failing in-statement CAST is retried without
+// it and counts one error, and a singleton SELECT that cannot run twice is
+// never cast in the statement.
+func TestLineProfileSingletonCastRetry(t *testing.T) {
+	conn, ctx := lpFixture(t, 3)
+	for _, tt := range []struct {
+		query, marker string
+		wantSQL       string
+		calls         int64 // execute and fetches: the CAST statement's and the plain one's, or the plain one's only
+	}{
+		{"select * from LP_PM_FIRST", "SELECT W40", "SELECT W40 FROM LP_TEXTS WHERE ID IN (1, 3) ORDER BY ID", 6},
+		{"select * from LP_PM_PROC", "SELECT T FROM", "SELECT T FROM LP_PM_SRC(900)", 3},
+	} {
+		result, err := interbase.LineProfile(ctx, conn, interbase.LineProfileOptions{SQL: tt.query, Dialect: 3})
+		if err != nil || lpSQLCode(result.Err) != -811 {
+			t.Fatalf("%s: %v / %v", tt.query, result.Err, err)
+		}
+		routine := result.Routines[0]
+		node := routine.Nodes[lpNodeAt(t, routine, tt.marker)]
+		if node.SQL != tt.wantSQL || node.Metrics.Errors != 1 || node.Metrics.Rows != 2 || node.Metrics.ServerCalls != tt.calls {
+			t.Fatalf("%s: node SQL %q errors %d rows %d calls %d; want the plain statement, one error, two rows, %d calls",
+				tt.query, node.SQL, node.Metrics.Errors, node.Metrics.Rows, node.Metrics.ServerCalls, tt.calls)
+		}
 	}
 }
 

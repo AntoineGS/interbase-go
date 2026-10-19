@@ -529,6 +529,18 @@ func (r *lpRun) execSelectInto(f *lpFrame, n *psql.Node, node *LineProfileNode) 
 		return err
 	}
 	rows, err := r.queryRows(node, b, 2)
+	if err != nil && cast != nil && r.catchable(err) {
+		// The failure may be a row's in-statement CAST (R18), where the
+		// server raises the singleton error before converting any row
+		// (ibg-pm8). bindSelect casts only statements that can run again,
+		// so the plain statement decides, as it would natively.
+		node.Metrics.Errors--
+		if b, err = r.bind(f, node, n.SQL.Text, n.SQL.Params); err != nil {
+			return err
+		}
+		cast = nil
+		rows, err = r.queryRows(node, b, 2)
+	}
 	if err != nil {
 		return err
 	}

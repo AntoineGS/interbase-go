@@ -373,7 +373,7 @@ func (r *lpRun) bindSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (bou
 			types[i], needed = castType(target.typ.Text), true
 		}
 	}
-	if !needed {
+	if !needed || n.Kind == psql.NodeSelectInto && !r.rerunnable(f.meta, n) {
 		return b, nil, nil
 	}
 	text, cast := castSelectItems(base, types)
@@ -386,6 +386,26 @@ func (r *lpRun) bindSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (bou
 	}
 	r.selects[key] = lpSelectText{text: text, cast: cast}
 	return castBound, cast, nil
+}
+
+// rerunnable reports whether statement node n of meta can run a second time
+// with no effect beyond the first run's: no GEN_ID and no procedure that
+// the analysis did not prove read-only. A singleton SELECT whose in-statement
+// CAST fails runs again without it (execSelectInto); one that cannot is
+// never cast in the statement.
+func (r *lpRun) rerunnable(meta *lpRoutineMeta, n *psql.Node) bool {
+	for _, site := range r.procedureSites(meta) {
+		if site.line >= n.Line && site.line <= n.EndLine {
+			if callee := r.plan.procs[site.name]; callee == nil || !callee.readsOnly {
+				return false
+			}
+		}
+	}
+	genID := false
+	wordsIn(n.SQL.Text, func(start, end int, _, _ bool) {
+		genID = genID || strings.EqualFold(n.SQL.Text[start:end], "GEN_ID")
+	})
+	return !genID
 }
 
 // convertsWithoutServer reports whether assigning a value of the source
