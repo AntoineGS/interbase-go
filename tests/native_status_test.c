@@ -356,24 +356,49 @@ static void test_status_codes_report_gds_and_exception_number(void)
 static void test_status_codes_render_a_full_vector(void)
 {
 	char codes[IB_STATUS_CODES_LENGTH];
-	char want[IB_STATUS_CODES_LENGTH];
+	char want[IB_STATUS_CODES_LENGTH * 2U];
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	size_t index;
 	size_t used;
 
-	/* The most codes a terminated vector holds, each at its widest. */
-	memset(status, 0, sizeof(status));
+	/* The most codes the loop reads: an unterminated vector of pairs, every
+	 * code at its widest. */
 	used = (size_t) snprintf(want, sizeof(want), ", gds");
-	for (index = 0U; index + 2U < IB_STATUS_VECTOR_LENGTH; index += 2U) {
+	for (index = 0U; index + 1U < IB_STATUS_VECTOR_LENGTH; index += 2U) {
 		status[index] = isc_arg_gds;
 		status[index + 1U] = (ISC_STATUS) INTPTR_MIN;
 		used += (size_t) snprintf(want + used, sizeof(want) - used, " %" PRIdPTR,
 			(intptr_t) INTPTR_MIN);
 	}
-	status[index] = isc_arg_end;
+	require_condition(index / 2U == IB_STATUS_VECTOR_LENGTH / 2U,
+		"the full vector does not hold the maximum code count");
+	require_condition(used < sizeof(codes),
+		"the widest code rendering does not fit IB_STATUS_CODES_LENGTH");
 	ib_status_codes(status, codes, sizeof(codes));
 	require_condition(strcmp(codes, want) == 0,
 		"a full status vector did not render every GDS code");
+
+	/* The widest form with an exception: isc_except and its number take the
+	 * first four slots, then every remaining pair is a widest code, and the
+	 * exception number is widest too. */
+	status[0] = isc_arg_gds;
+	status[1] = (ISC_STATUS) isc_except;
+	status[2] = isc_arg_number;
+	status[3] = (ISC_STATUS) INTPTR_MIN;
+	used = (size_t) snprintf(want, sizeof(want), ", gds %" PRIdPTR, (intptr_t) isc_except);
+	for (index = 4U; index + 1U < IB_STATUS_VECTOR_LENGTH; index += 2U) {
+		status[index] = isc_arg_gds;
+		status[index + 1U] = (ISC_STATUS) INTPTR_MIN;
+		used += (size_t) snprintf(want + used, sizeof(want) - used, " %" PRIdPTR,
+			(intptr_t) INTPTR_MIN);
+	}
+	used += (size_t) snprintf(want + used, sizeof(want) - used, ", exception %" PRIdPTR,
+		(intptr_t) INTPTR_MIN);
+	require_condition(used < sizeof(codes),
+		"the widest exception rendering does not fit IB_STATUS_CODES_LENGTH");
+	ib_status_codes(status, codes, sizeof(codes));
+	require_condition(strcmp(codes, want) == 0,
+		"a full status vector lost its codes or exception number");
 }
 
 static void test_dialect_is_encoded_in_dpb(void)
