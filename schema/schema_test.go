@@ -278,8 +278,8 @@ func TestProceduresSeparateOrderedInputAndOutputParameters(t *testing.T) {
 	if input.Domain == nil || input.Domain.Name != "IN_NAME" || input.Domain.FieldType.Int64 != 37 {
 		t.Fatalf("input parameter domain = %#v, want VARCHAR domain metadata", input.Domain)
 	}
-	if input.Nullable.Valid {
-		t.Fatalf("nullable input parameter = %#v, want unknown declaration nullability", input.Nullable)
+	if !input.Nullable.Valid || !input.Nullable.Bool {
+		t.Fatalf("input parameter nullable = %#v, want nullable through its domain", input.Nullable)
 	}
 	output := procedure.OutputParameters[0]
 	if output.Direction != ParameterOutput || output.Name != "OUT_TOTAL" || output.Domain == nil ||
@@ -288,6 +288,26 @@ func TestProceduresSeparateOrderedInputAndOutputParameters(t *testing.T) {
 	}
 	if output.Domain.Nullable.Valid && output.Domain.Nullable.Bool {
 		t.Fatalf("output parameter domain nullable = %#v, want non-null domain", output.Domain.Nullable)
+	}
+}
+
+func TestCatalogProcedureWithNullableParametersGeneratesDDL(t *testing.T) {
+	db, _ := openFixtureDBWithOptions(t, fixtureOptions{})
+	defer db.Close()
+
+	procedure, err := New(db).Procedure(context.Background(), "PROC_TWO")
+	if err != nil {
+		t.Fatalf("Procedure returned error: %v", err)
+	}
+	got, err := procedure.GenerateDDL()
+	if err != nil {
+		t.Fatalf("procedure GenerateDDL returned error: %v", err)
+	}
+	want := `CREATE PROCEDURE "PROC_TWO" ("IN_NAME" "IN_NAME", "IN_COUNT" "IN_COUNT") RETURNS ("OUT_TOTAL" "OUT_TOTAL" NOT NULL) AS BEGIN
+  X =  1;
+END`
+	if got != want {
+		t.Fatalf("procedure DDL = %q, want %q", got, want)
 	}
 }
 
@@ -500,7 +520,9 @@ func TestDomainEnumerationUsesExplicitImplicitNameFilter(t *testing.T) {
 	}
 }
 
-func TestProcedureParameterNullabilityIsConservative(t *testing.T) {
+// RDB$PROCEDURE_PARAMETERS has no null flag: a parameter's nullability is
+// that of its domain, implicit for an inline type.
+func TestProcedureParameterNullabilityFollowsDomain(t *testing.T) {
 	tests := []struct {
 		name          string
 		mode          string
@@ -508,8 +530,9 @@ func TestProcedureParameterNullabilityIsConservative(t *testing.T) {
 		wantNullable  bool
 		wantDomainNil bool
 	}{
-		{name: "non-null domain guarantees non-null parameter", mode: "not_null", wantValid: true, wantNullable: false},
-		{name: "nullable domain does not prove declaration", mode: "nullable", wantValid: false},
+		{name: "non-null domain", mode: "not_null", wantValid: true, wantNullable: false},
+		{name: "nullable domain", mode: "nullable", wantValid: true, wantNullable: true},
+		{name: "domain without null flag", mode: "null_flag_null", wantValid: true, wantNullable: true},
 		{name: "NULL field source", mode: "null_field_source", wantValid: false, wantDomainNil: true},
 	}
 	for _, test := range tests {
@@ -1227,6 +1250,8 @@ func applyFixtureOptions(kind string, values [][]driver.Value, options fixtureOp
 			values[0][15] = int64(1)
 		case "nullable":
 			values[0][15] = int64(0)
+		case "null_flag_null":
+			values[0][15] = nil
 		}
 	}
 	if options.parameterNullabilityMode == "null_field_source" && kind == "parameters" {

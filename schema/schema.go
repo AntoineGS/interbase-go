@@ -167,10 +167,10 @@ type ProcedureParameter struct {
 	Description   sql.NullString
 	SystemFlag    sql.NullInt64
 	Domain        *Domain
-	// Nullable is valid only when the applicable domain's NOT NULL flag
-	// proves the parameter is non-null. The reference-compatible parameter
-	// projection does not expose a declaration nullability flag, so a nullable
-	// domain cannot prove that the parameter itself is nullable.
+	// Nullable is that of Domain, and invalid when no domain was resolved.
+	// RDB$PROCEDURE_PARAMETERS has no null flag: an inline parameter type
+	// gets an implicit domain, so the domain's NULL_FLAG is the parameter's;
+	// a NULL flag, like 0, means nullable.
 	Nullable sql.NullBool
 }
 
@@ -848,10 +848,10 @@ func scanDomain(rows *sql.Rows) (*Domain, error) {
 }
 
 func parameterNullable(domain *Domain) sql.NullBool {
-	if domain == nil || !domain.Nullable.Valid || domain.Nullable.Bool {
+	if domain == nil {
 		return sql.NullBool{}
 	}
-	return sql.NullBool{Bool: false, Valid: true}
+	return sql.NullBool{Bool: !domain.Nullable.Valid || domain.Nullable.Bool, Valid: true}
 }
 
 func columnNullable(flag sql.NullInt64, domain *Domain) sql.NullBool {

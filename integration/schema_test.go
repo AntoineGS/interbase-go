@@ -197,15 +197,17 @@ END`,
 	if !optional.FieldSource.Valid || optional.Domain == nil {
 		t.Fatalf("optional parameter domain metadata = %#v, want resolved domain", optional)
 	}
-	if optional.Nullable.Valid {
-		t.Fatalf("optional parameter nullable = %#v, want unknown declaration nullability", optional.Nullable)
+	if !optional.Nullable.Valid || !optional.Nullable.Bool {
+		t.Fatalf("optional parameter nullable = %#v, want nullable through its implicit domain", optional.Nullable)
 	}
 	required := procedure.InputParameters[1]
 	if !required.FieldSource.Valid || required.Domain == nil {
 		t.Fatalf("required parameter domain metadata = %#v, want resolved domain", required)
 	}
-	if _, err := procedure.GenerateDDL(); !errors.Is(err, catalogschema.ErrUnsupportedDDL) || !strings.Contains(err.Error(), "nullability") {
-		t.Fatalf("procedure with unknown parameter nullability error = %v, want deliberate ErrUnsupportedDDL", err)
+	ddl, err := procedure.GenerateDDL()
+	header := `CREATE PROCEDURE "GO_SCHEMA_PROC" ("OPTIONAL_INPUT" INTEGER, "REQUIRED_INPUT" INTEGER) RETURNS ("OUTPUT_VALUE" INTEGER) AS`
+	if err != nil || !strings.HasPrefix(ddl, header) || !strings.HasSuffix(ddl, procedure.Source.String) {
+		t.Fatalf("procedure DDL = (%q, %v), want header %q followed by the stored source", ddl, err, header)
 	}
 
 	if procedures, err := catalog.Procedures(ctx, "GO_SCHEMA"); err != nil {
@@ -385,8 +387,9 @@ ENTRY_POINT 'go_schema_ext_cstring' MODULE_NAME 'go_schema_ext_library'`,
 	if procedure == nil || len(procedure.InputParameters) != 1 || len(procedure.OutputParameters) != 1 {
 		t.Fatalf("procedure = %#v, want one input and one output", procedure)
 	}
-	if _, err := procedure.GenerateDDL(); !errors.Is(err, catalogschema.ErrUnsupportedDDL) || !strings.Contains(err.Error(), "nullability") {
-		t.Fatalf("procedure DDL error = %v, want deliberate ErrUnsupportedDDL for unknown nullability", err)
+	procedureDDL, err := procedure.GenerateDDL()
+	if err != nil || !strings.HasPrefix(procedureDDL, `CREATE PROCEDURE "GO_SCHEMA_EXT_PROC" ("INPUT_VALUE" INTEGER) RETURNS ("OUTPUT_VALUE" INTEGER) AS`) {
+		t.Fatalf("procedure DDL = (%q, %v), want the nullable INPUT_VALUE parameter", procedureDDL, err)
 	}
 
 	role, err := catalog.Role(ctx, "GO_SCHEMA_EXT_ROLE")
@@ -561,7 +564,7 @@ GRANT SELECT ON GO_REPLAY_CHILD TO GO_REPLAY_ROLE;
 
 	sourceCatalog := catalogschema.New(sourceDB)
 	var statements []string
-	unsupported := make([]string, 0, 2)
+	unsupported := make([]string, 0, 1)
 	appendDDL := func(label string, object catalogschema.DDLer) {
 		t.Helper()
 		statement, err := object.GenerateDDL()
@@ -632,13 +635,7 @@ GRANT SELECT ON GO_REPLAY_CHILD TO GO_REPLAY_ROLE;
 	if err != nil || procedure == nil {
 		t.Fatalf("source procedure: %v", err)
 	}
-	procedureDDL, procedureErr := procedure.GenerateDDL()
-	if procedureErr == nil {
-		statements = append(statements, procedureDDL)
-	} else {
-		recordUnsupported("procedure", procedureErr, "nullability")
-		statements = append(statements, `CREATE PROCEDURE "GO_REPLAY_PROC" ("INPUT_VALUE" INTEGER) RETURNS ("OUTPUT_VALUE" INTEGER) AS `+procedure.Source.String)
-	}
+	appendDDL("procedure", procedure)
 	trigger, err := sourceCatalog.Trigger(ctx, "GO_REPLAY_INSERT")
 	if err != nil || trigger == nil {
 		t.Fatalf("source trigger: %v", err)
@@ -677,8 +674,8 @@ GRANT SELECT ON GO_REPLAY_CHILD TO GO_REPLAY_ROLE;
 	for _, privilege := range privileges {
 		appendDDL("role privilege", privilege)
 	}
-	if len(unsupported) != 2 {
-		t.Fatalf("explicit unsupported metadata = %#v, want computed table and unknown-nullability procedure", unsupported)
+	if len(unsupported) != 1 {
+		t.Fatalf("explicit unsupported metadata = %#v, want the computed table only", unsupported)
 	}
 
 	for index, statement := range statements {
