@@ -21,6 +21,7 @@ type pendingFake struct {
 	execErr        error
 	describeErr    error
 	closeErr       error
+	descriptor     StatementDescriptor
 }
 
 func (f *pendingFake) connection() *conn {
@@ -34,6 +35,9 @@ func (f *pendingFake) connection() *conn {
 			descriptionOverride: func() (StatementDescriptor, error) {
 				if f.describeErr != nil {
 					return StatementDescriptor{}, f.describeErr
+				}
+				if f.descriptor.Kind != "" {
+					return f.descriptor, nil
 				}
 				return StatementDescriptor{Kind: "select", ReturnsRows: true}, nil
 			},
@@ -112,6 +116,28 @@ func TestPrepareNextReusesStatementForIdenticalQuery(t *testing.T) {
 	}
 	if len(f.events) != 2 {
 		t.Fatalf("Close after consumption closed again: %v", f.events)
+	}
+}
+
+func TestPrepareNextPreservesStatementKinds(t *testing.T) {
+	for _, kind := range []string{
+		"start-transaction", "commit", "rollback", "set-generator", "savepoint",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			f := &pendingFake{descriptor: StatementDescriptor{
+				Kind: kind, Mutating: kind == "set-generator",
+			}}
+			pending, err := PrepareNext(context.Background(), pendingTestConn(t, f), pendingSQL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := pending.Descriptor(); got.Kind != kind || got.Mutating != (kind == "set-generator") {
+				t.Fatalf("descriptor = %+v, want kind %q and expected mutability", got, kind)
+			}
+			if err := pending.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

@@ -39,10 +39,17 @@ type ColumnOrigin struct {
 // StatementDescriptor classifies a prepared statement without running it.
 // The application must reject Kind "unsupported" before attempting execution.
 type StatementDescriptor struct {
+	// Kind is one of "select", "select-for-update", "insert", "update",
+	// "delete", "ddl", "procedure", "start-transaction", "commit",
+	// "rollback", "set-generator", "savepoint", or "unsupported" when the
+	// driver does not classify the statement type.
 	Kind        string
 	ReturnsRows bool
-	Mutating    bool
-	InputCount  int
+	// Mutating is false for select, unsupported, transaction-control, and
+	// savepoint kinds; it is true for every other recognized kind, including
+	// set-generator.
+	Mutating   bool
+	InputCount int
 	// Columns has one entry per output column, in output order.
 	Columns []ColumnOrigin
 }

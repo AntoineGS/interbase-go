@@ -31,6 +31,38 @@ func TestDescribeStatementDoesNotExecute(t *testing.T) {
 	}
 }
 
+func TestStatementKindDescriptionMapping(t *testing.T) {
+	cases := []struct {
+		nativeKind int
+		kind       string
+		mutating   bool
+	}{
+		{0, "unsupported", false},
+		{1, "select", false},
+		{2, "select-for-update", true},
+		{3, "insert", true},
+		{4, "update", true},
+		{5, "delete", true},
+		{6, "ddl", true},
+		{7, "procedure", true},
+		{8, "start-transaction", false},
+		{9, "commit", false},
+		{10, "rollback", false},
+		{11, "set-generator", true},
+		{12, "savepoint", false},
+		{255, "unsupported", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.kind, func(t *testing.T) {
+			kind, mutating := statementKindDescription(tc.nativeKind)
+			if kind != tc.kind || mutating != tc.mutating {
+				t.Fatalf("statementKindDescription(%d) = %q, %v; want %q, %v",
+					tc.nativeKind, kind, mutating, tc.kind, tc.mutating)
+			}
+		})
+	}
+}
+
 func TestDescribeStatementJoinsInspectionAndCloseFailures(t *testing.T) {
 	inspectErr := errors.New("inspect failed")
 	closeErr := errors.New("close failed")

@@ -78,6 +78,11 @@ static void overlap_publication_wait_hook(struct ib_cancel_slot *slot);
 #define IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK(slot) overlap_completion_wait_hook(slot)
 #define IB_CANCEL_SLOT_TEST_PUBLICATION_WAIT_HOOK(slot) overlap_publication_wait_hook(slot)
 #include "../native.c"
+_Static_assert(IB_STATEMENT_START_TRANSACTION == 8, "statement enum values must be appended");
+_Static_assert(IB_STATEMENT_COMMIT == 9, "statement enum values must be appended");
+_Static_assert(IB_STATEMENT_ROLLBACK == 10, "statement enum values must be appended");
+_Static_assert(IB_STATEMENT_SET_GENERATOR == 11, "statement enum values must be appended");
+_Static_assert(IB_STATEMENT_SAVEPOINT == 12, "statement enum values must be appended");
 #undef IB_CANCEL_SLOT_TEST_COMPLETION_WAIT_HOOK
 #undef IB_CANCEL_SLOT_TEST_PUBLICATION_WAIT_HOOK
 #undef isc_start_transaction
@@ -1911,7 +1916,11 @@ static void test_prepared_statement_summary(void)
 		{isc_info_sql_stmt_delete, IB_STATEMENT_DELETE, 0},
 		{isc_info_sql_stmt_ddl, IB_STATEMENT_DDL, 0},
 		{isc_info_sql_stmt_exec_procedure, IB_STATEMENT_PROCEDURE, 1},
-		{isc_info_sql_stmt_commit, IB_STATEMENT_UNSUPPORTED, 0}
+		{isc_info_sql_stmt_start_trans, IB_STATEMENT_START_TRANSACTION, 0},
+		{isc_info_sql_stmt_commit, IB_STATEMENT_COMMIT, 0},
+		{isc_info_sql_stmt_rollback, IB_STATEMENT_ROLLBACK, 0},
+		{isc_info_sql_stmt_set_generator, IB_STATEMENT_SET_GENERATOR, 0},
+		{255, IB_STATEMENT_UNSUPPORTED, 0}
 	};
 	size_t index;
 	int kind = -1;
@@ -1966,6 +1975,49 @@ static void test_prepared_statement_summary(void)
 		error = NULL;
 		(void) ib_statement_close(statement, &error);
 		ib_error_free(error);
+		free(connection);
+	}
+}
+
+static void test_prepared_savepoint_summary(void)
+{
+	static const struct {
+		const char *query;
+		int sdk_type;
+	} cases[] = {
+		{"SAVEPOINT GO_STATEMENT_KIND", isc_info_sql_stmt_ddl},
+		{"RELEASE SAVEPOINT GO_STATEMENT_KIND", isc_info_sql_stmt_ddl},
+		{"ROLLBACK WORK TO SAVEPOINT GO_STATEMENT_KIND", isc_info_sql_stmt_rollback}
+	};
+	size_t index;
+
+	for (index = 0U; index < sizeof(cases) / sizeof(cases[0]); index++) {
+		ib_connection *connection;
+		ib_statement *statement;
+		int kind = -1;
+		int returns_rows = -1;
+		int input_count = -1;
+		char *error = NULL;
+
+		reset_mocks();
+		statement_type = cases[index].sdk_type;
+		connection = new_connection();
+		statement = ib_statement_prepare(connection, cases[index].query,
+			strlen(cases[index].query), &error);
+		check(statement != NULL && error == NULL,
+			"savepoint statement preparation failed");
+		ib_error_free(error);
+		if (statement != NULL) {
+			error = NULL;
+			check(ib_statement_summary(statement, &kind, &returns_rows,
+				&input_count, &error) == 0 && error == NULL &&
+				kind == IB_STATEMENT_SAVEPOINT && returns_rows == 0,
+				"savepoint statement summary did not report savepoint");
+			ib_error_free(error);
+			error = NULL;
+			(void) ib_statement_close(statement, &error);
+			ib_error_free(error);
+		}
 		free(connection);
 	}
 }
@@ -4258,6 +4310,7 @@ int main(void)
 	test_prepare_once_execute_repeated();
 	test_prepared_input_metadata_accessor();
 	test_prepared_statement_summary();
+	test_prepared_savepoint_summary();
 	test_failed_implicit_execution_keeps_handle();
 	test_prepare_failure_releases_handle_and_transaction();
 	test_failed_prepare_rollback_marks_connection_broken();

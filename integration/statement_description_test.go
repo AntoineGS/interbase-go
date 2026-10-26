@@ -18,6 +18,19 @@ func TestStatementDescriptionClassifiesWithoutExecuting(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pooled.Close()
+	if _, err := pooled.ExecContext(ctx, "CREATE GENERATOR GO_STATEMENT_KIND_GEN"); err != nil {
+		t.Fatalf("create generator fixture: %v", err)
+	}
+	defer func() {
+		if _, err := pooled.ExecContext(ctx, "DROP GENERATOR GO_STATEMENT_KIND_GEN"); err != nil {
+			t.Errorf("drop generator fixture: %v", err)
+		}
+	}()
+	var generatorValue int64
+	if err := pooled.QueryRowContext(ctx,
+		"SELECT GEN_ID(GO_STATEMENT_KIND_GEN, 0) FROM RDB$DATABASE").Scan(&generatorValue); err != nil {
+		t.Fatalf("read generator fixture: %v", err)
+	}
 
 	cases := []struct {
 		query, kind    string
@@ -31,6 +44,14 @@ func TestStatementDescriptionClassifiesWithoutExecuting(t *testing.T) {
 		{"CREATE TABLE GO_DESCRIPTION_ONLY (ID INTEGER)", "ddl", false, true, 0},
 		{"EXECUTE PROCEDURE GO_WRITE_RETURN(9199, 42)", "procedure", true, true, 0},
 		{"EXECUTE PROCEDURE GO_WRITE_PROC(9199, 42)", "procedure", false, true, 0},
+		{"COMMIT", "commit", false, false, 0},
+		{"COMMIT WORK", "commit", false, false, 0},
+		{"ROLLBACK", "rollback", false, false, 0},
+		{"SET TRANSACTION READ WRITE", "start-transaction", false, false, 0},
+		{"SAVEPOINT GO_STATEMENT_KIND", "savepoint", false, false, 0},
+		{"RELEASE SAVEPOINT GO_STATEMENT_KIND", "savepoint", false, false, 0},
+		{"ROLLBACK WORK TO SAVEPOINT GO_STATEMENT_KIND", "savepoint", false, false, 0},
+		{"SET GENERATOR GO_STATEMENT_KIND_GEN TO 1", "set-generator", false, true, 0},
 	}
 	for _, tc := range cases {
 		got, err := interbase.DescribeStatement(ctx, pooled, tc.query)
@@ -41,6 +62,14 @@ func TestStatementDescriptionClassifiesWithoutExecuting(t *testing.T) {
 			t.Fatalf("DescribeStatement(%q) = %+v, want %s rows=%v mutating=%v inputs=%d",
 				tc.query, got, tc.kind, tc.rows, tc.mutating, tc.inputs)
 		}
+	}
+	var describedGeneratorValue int64
+	if err := pooled.QueryRowContext(ctx,
+		"SELECT GEN_ID(GO_STATEMENT_KIND_GEN, 0) FROM RDB$DATABASE").Scan(&describedGeneratorValue); err != nil {
+		t.Fatalf("read described generator fixture: %v", err)
+	}
+	if describedGeneratorValue != generatorValue {
+		t.Fatalf("description changed generator from %d to %d", generatorValue, describedGeneratorValue)
 	}
 	// This SELECT is optional server grammar, not a classification fallback.
 	cte, err := interbase.DescribeStatement(ctx, pooled,

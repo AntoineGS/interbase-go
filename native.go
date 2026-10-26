@@ -1642,6 +1642,46 @@ func (s *nativeStatement) plan() (string, error) {
 	return string(C.GoBytes(unsafe.Pointer(planPointer), C.int(planLength))), nil
 }
 
+func statementKindDescription(kind int) (string, bool) {
+	var name string
+	switch kind {
+	case int(C.IB_STATEMENT_SELECT):
+		name = "select"
+	case int(C.IB_STATEMENT_SELECT_FOR_UPDATE):
+		name = "select-for-update"
+	case int(C.IB_STATEMENT_INSERT):
+		name = "insert"
+	case int(C.IB_STATEMENT_UPDATE):
+		name = "update"
+	case int(C.IB_STATEMENT_DELETE):
+		name = "delete"
+	case int(C.IB_STATEMENT_DDL):
+		name = "ddl"
+	case int(C.IB_STATEMENT_PROCEDURE):
+		name = "procedure"
+	case int(C.IB_STATEMENT_START_TRANSACTION):
+		name = "start-transaction"
+	case int(C.IB_STATEMENT_COMMIT):
+		name = "commit"
+	case int(C.IB_STATEMENT_ROLLBACK):
+		name = "rollback"
+	case int(C.IB_STATEMENT_SET_GENERATOR):
+		name = "set-generator"
+	case int(C.IB_STATEMENT_SAVEPOINT):
+		name = "savepoint"
+	default:
+		return "unsupported", false
+	}
+	switch kind {
+	case int(C.IB_STATEMENT_SELECT), int(C.IB_STATEMENT_START_TRANSACTION),
+		int(C.IB_STATEMENT_COMMIT), int(C.IB_STATEMENT_ROLLBACK),
+		int(C.IB_STATEMENT_SAVEPOINT):
+		return name, false
+	default:
+		return name, true
+	}
+}
+
 func (s *nativeStatement) description() (StatementDescriptor, error) {
 	release := nativegate.Global.Enter()
 	defer release()
@@ -1656,28 +1696,10 @@ func (s *nativeStatement) description() (StatementDescriptor, error) {
 	if C.ib_statement_summary(s.ptr, &kind, &returnsRows, &inputCount, &errorPointer) != 0 {
 		return StatementDescriptor{}, takeNativeError(errorPointer)
 	}
-	var name string
-	switch kind {
-	case C.IB_STATEMENT_SELECT:
-		name = "select"
-	case C.IB_STATEMENT_SELECT_FOR_UPDATE:
-		name = "select-for-update"
-	case C.IB_STATEMENT_INSERT:
-		name = "insert"
-	case C.IB_STATEMENT_UPDATE:
-		name = "update"
-	case C.IB_STATEMENT_DELETE:
-		name = "delete"
-	case C.IB_STATEMENT_DDL:
-		name = "ddl"
-	case C.IB_STATEMENT_PROCEDURE:
-		name = "procedure"
-	default:
-		name = "unsupported"
-	}
+	name, mutating := statementKindDescription(int(kind))
 	descriptor := StatementDescriptor{
 		Kind: name, ReturnsRows: returnsRows != 0,
-		Mutating:   name != "select" && name != "unsupported",
+		Mutating:   mutating,
 		InputCount: int(inputCount),
 	}
 	count := int(C.ib_statement_num_output(s.ptr))

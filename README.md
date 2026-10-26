@@ -206,6 +206,18 @@ arguments, prepare or description on that connection discards it. Close the
 returned `PendingStatement` on every path that does not run it, because a
 prepared statement keeps the objects it references in use for DDL.
 
+`StatementDescriptor.Kind` is one of `select`, `select-for-update`, `insert`,
+`update`, `delete`, `ddl`, `procedure`, `start-transaction`, `commit`,
+`rollback`, `set-generator`, `savepoint`, or `unsupported` when the driver does
+not classify the statement type. The InterBase SDK has no distinct
+`isc_info_sql_stmt_*` value for SQL savepoints, so `SAVEPOINT`,
+`RELEASE SAVEPOINT`, and
+`ROLLBACK [WORK] TO [SAVEPOINT]` are recognized from their leading SQL tokens
+and reported as `savepoint`. `Mutating` is false for `select`, `unsupported`,
+transaction-control kinds, and `savepoint`; it is true for every other
+recognized kind, including `set-generator`. Describing a statement does not
+execute it, and transaction-control SQL remains refused by `database/sql`.
+
 ### SQL and profiling helpers
 
 The profiling helpers reuse a borrowed `*sql.Conn`; they do not open a second

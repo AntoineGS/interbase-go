@@ -495,14 +495,24 @@ func newLineProfileFakeNative(counts *lineProfileFakeCounts, next func() (bool, 
 						kind = "procedure"
 					} else if strings.HasPrefix(strings.ToUpper(query), "CREATE ") {
 						kind = "ddl"
-					} else if upper := strings.ToUpper(query); strings.HasPrefix(upper, "COMMIT") ||
-						strings.HasPrefix(upper, "ROLLBACK") || strings.HasPrefix(upper, "SET ") ||
-						strings.HasPrefix(upper, "SAVEPOINT") || strings.HasPrefix(upper, "RELEASE") {
-						// As ib_statement_summary: every kind it does not
-						// list, savepoint statements included.
-						kind = "unsupported"
+					} else if upper := strings.ToUpper(query); strings.HasPrefix(upper, "COMMIT") {
+						kind = "commit"
+					} else if strings.HasPrefix(upper, "ROLLBACK TO") ||
+						strings.HasPrefix(upper, "ROLLBACK WORK TO") ||
+						strings.HasPrefix(upper, "SAVEPOINT") || strings.HasPrefix(upper, "RELEASE SAVEPOINT") {
+						kind = "savepoint"
+					} else if strings.HasPrefix(upper, "ROLLBACK") {
+						kind = "rollback"
+					} else if strings.HasPrefix(upper, "SET TRANSACTION") {
+						kind = "start-transaction"
+					} else if strings.HasPrefix(upper, "SET GENERATOR") {
+						kind = "set-generator"
 					}
-					return StatementDescriptor{Kind: kind, ReturnsRows: isSelect, InputCount: inputs}, nil
+					mutating := kind != "select" && kind != "unsupported" &&
+						kind != "start-transaction" && kind != "commit" &&
+						kind != "rollback" && kind != "savepoint"
+					return StatementDescriptor{Kind: kind, ReturnsRows: isSelect,
+						Mutating: mutating, InputCount: inputs}, nil
 				},
 				numInputOverride:      func() int { return inputs },
 				inputMetadataOverride: func(int) (nativeInputMetadata, error) { return nativeInputMetadata{}, nil },

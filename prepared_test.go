@@ -8,9 +8,13 @@ import (
 
 type preparedTestCounts struct{ statementClose, cursorClose, free int }
 
-func newPreparedTestTransaction(t *testing.T, returnsRows bool) (*Transaction, *preparedTestCounts) {
+func newPreparedTestTransaction(t *testing.T, returnsRows bool, descriptions ...StatementDescriptor) (*Transaction, *preparedTestCounts) {
 	t.Helper()
 	counts := &preparedTestCounts{}
+	description := StatementDescriptor{Kind: "select", ReturnsRows: returnsRows, InputCount: 1}
+	if len(descriptions) > 0 {
+		description = descriptions[0]
+	}
 	native := &nativeTransaction{
 		cancelSlotOverride:  &fakeCancelSlot{},
 		commitOverride:      func() error { return nil },
@@ -20,7 +24,7 @@ func newPreparedTestTransaction(t *testing.T, returnsRows bool) (*Transaction, *
 		prepareContextOverride: func(string, bool, *nativeCancelOperation) (*nativeStatement, error) {
 			return &nativeStatement{
 				descriptionOverride: func() (StatementDescriptor, error) {
-					return StatementDescriptor{Kind: "select", ReturnsRows: returnsRows, InputCount: 1}, nil
+					return description, nil
 				},
 				numInputOverride:      func() int { return 1 },
 				inputMetadataOverride: func(int) (nativeInputMetadata, error) { return nativeInputMetadata{}, nil },
@@ -46,6 +50,27 @@ func newPreparedTestTransaction(t *testing.T, returnsRows bool) (*Transaction, *
 	}
 	attachment.directTx = tx
 	return tx, counts
+}
+
+func TestDirectPreparedStatementAcceptsRecognizedKinds(t *testing.T) {
+	for _, kind := range []string{
+		"start-transaction", "commit", "rollback", "set-generator", "savepoint",
+	} {
+		t.Run(kind, func(t *testing.T) {
+			tx, _ := newPreparedTestTransaction(t, false,
+				StatementDescriptor{Kind: kind, Mutating: kind == "set-generator", InputCount: 1})
+			statement, err := tx.Prepare(context.Background(), "SET GENERATOR GO_STATEMENT_KIND TO 1")
+			if err != nil {
+				t.Fatalf("Prepare recognized kind %q: %v", kind, err)
+			}
+			if err := statement.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 func TestDirectPreparedStatementDescribesAndCloseIsIdempotent(t *testing.T) {

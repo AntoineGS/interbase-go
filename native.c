@@ -8552,6 +8552,98 @@ int ib_statement_num_input(const ib_statement *statement)
 	return (int) statement->input->sqld;
 }
 
+static size_t ib_statement_skip_space_and_comments(const char *query,
+	size_t query_length, size_t offset)
+{
+	for (;;) {
+		while (offset < query_length && isspace((unsigned char) query[offset])) {
+			offset++;
+		}
+		if (offset + 1U < query_length && query[offset] == '-' &&
+			query[offset + 1U] == '-') {
+			offset += 2U;
+			while (offset < query_length && query[offset] != '\n' &&
+				query[offset] != '\r') {
+				offset++;
+			}
+			continue;
+		}
+		if (offset + 1U < query_length && query[offset] == '/' &&
+			query[offset + 1U] == '*') {
+			offset += 2U;
+			while (offset + 1U < query_length &&
+				!(query[offset] == '*' && query[offset + 1U] == '/')) {
+				offset++;
+			}
+			if (offset + 1U >= query_length) {
+				return query_length;
+			}
+			offset += 2U;
+			continue;
+		}
+		return offset;
+	}
+}
+
+static int ib_statement_sql_keyword(const char *query, size_t query_length,
+	size_t *offset, const char *keyword)
+{
+	size_t index = *offset;
+	size_t keyword_length = strlen(keyword);
+	size_t keyword_index;
+
+	if (index > query_length || keyword_length > query_length - index) {
+		return 0;
+	}
+	for (keyword_index = 0U; keyword_index < keyword_length; keyword_index++) {
+		if (tolower((unsigned char) query[index + keyword_index]) !=
+			tolower((unsigned char) keyword[keyword_index])) {
+			return 0;
+		}
+	}
+	index += keyword_length;
+	if (index < query_length &&
+		(isalnum((unsigned char) query[index]) || query[index] == '_' ||
+			query[index] == '$')) {
+		return 0;
+	}
+	*offset = index;
+	return 1;
+}
+
+/* The SDK has no statement-type value for savepoints, so recognize their SQL
+ * forms before mapping the server's DDL or rollback type. */
+static int ib_statement_is_savepoint_query(const char *query,
+	size_t query_length)
+{
+	size_t offset;
+
+	if (query == NULL) {
+		return 0;
+	}
+	offset = ib_statement_skip_space_and_comments(query, query_length, 0U);
+	if (ib_statement_sql_keyword(query, query_length, &offset, "SAVEPOINT")) {
+		return 1;
+	}
+	if (ib_statement_sql_keyword(query, query_length, &offset, "RELEASE")) {
+		offset = ib_statement_skip_space_and_comments(query, query_length, offset);
+		return ib_statement_sql_keyword(query, query_length, &offset, "SAVEPOINT");
+	}
+	if (!ib_statement_sql_keyword(query, query_length, &offset, "ROLLBACK")) {
+		return 0;
+	}
+	offset = ib_statement_skip_space_and_comments(query, query_length, offset);
+	if (ib_statement_sql_keyword(query, query_length, &offset, "WORK")) {
+		offset = ib_statement_skip_space_and_comments(query, query_length, offset);
+	}
+	if (!ib_statement_sql_keyword(query, query_length, &offset, "TO")) {
+		return 0;
+	}
+	offset = ib_statement_skip_space_and_comments(query, query_length, offset);
+	(void) ib_statement_sql_keyword(query, query_length, &offset, "SAVEPOINT");
+	return offset < query_length;
+}
+
 int ib_statement_summary(const ib_statement *statement, int *kind,
 	int *returns_rows, int *input_count, char **error)
 {
@@ -8564,33 +8656,50 @@ int ib_statement_summary(const ib_statement *statement, int *kind,
 		kind == NULL || returns_rows == NULL || input_count == NULL) {
 		return ib_fail(error, "invalid prepared statement summary");
 	}
-	switch (statement->statement_type) {
-	case isc_info_sql_stmt_select:
-		prepared_kind = IB_STATEMENT_SELECT;
-		has_rows = 1;
-		break;
-	case isc_info_sql_stmt_select_for_upd:
-		prepared_kind = IB_STATEMENT_SELECT_FOR_UPDATE;
-		has_rows = 1;
-		break;
-	case isc_info_sql_stmt_insert:
-		prepared_kind = IB_STATEMENT_INSERT;
-		break;
-	case isc_info_sql_stmt_update:
-		prepared_kind = IB_STATEMENT_UPDATE;
-		break;
-	case isc_info_sql_stmt_delete:
-		prepared_kind = IB_STATEMENT_DELETE;
-		break;
-	case isc_info_sql_stmt_ddl:
-		prepared_kind = IB_STATEMENT_DDL;
-		break;
-	case isc_info_sql_stmt_exec_procedure:
-		prepared_kind = IB_STATEMENT_PROCEDURE;
-		has_rows = statement->output != NULL && statement->output->sqld > 0;
-		break;
-	default:
-		break;
+	if (ib_statement_is_savepoint_query(statement->query,
+		statement->query_length)) {
+		prepared_kind = IB_STATEMENT_SAVEPOINT;
+	} else {
+		switch (statement->statement_type) {
+		case isc_info_sql_stmt_select:
+			prepared_kind = IB_STATEMENT_SELECT;
+			has_rows = 1;
+			break;
+		case isc_info_sql_stmt_select_for_upd:
+			prepared_kind = IB_STATEMENT_SELECT_FOR_UPDATE;
+			has_rows = 1;
+			break;
+		case isc_info_sql_stmt_insert:
+			prepared_kind = IB_STATEMENT_INSERT;
+			break;
+		case isc_info_sql_stmt_update:
+			prepared_kind = IB_STATEMENT_UPDATE;
+			break;
+		case isc_info_sql_stmt_delete:
+			prepared_kind = IB_STATEMENT_DELETE;
+			break;
+		case isc_info_sql_stmt_ddl:
+			prepared_kind = IB_STATEMENT_DDL;
+			break;
+		case isc_info_sql_stmt_exec_procedure:
+			prepared_kind = IB_STATEMENT_PROCEDURE;
+			has_rows = statement->output != NULL && statement->output->sqld > 0;
+			break;
+		case isc_info_sql_stmt_start_trans:
+			prepared_kind = IB_STATEMENT_START_TRANSACTION;
+			break;
+		case isc_info_sql_stmt_commit:
+			prepared_kind = IB_STATEMENT_COMMIT;
+			break;
+		case isc_info_sql_stmt_rollback:
+			prepared_kind = IB_STATEMENT_ROLLBACK;
+			break;
+		case isc_info_sql_stmt_set_generator:
+			prepared_kind = IB_STATEMENT_SET_GENERATOR;
+			break;
+		default:
+			break;
+		}
 	}
 	*kind = prepared_kind;
 	*returns_rows = has_rows;

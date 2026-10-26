@@ -241,6 +241,18 @@ func (r *lpRun) prepareDynamic(text string) (*PreparedStatement, error) {
 	}
 	switch {
 	case err == nil:
+		switch stmt.kind {
+		case "start-transaction", "commit", "rollback":
+			if closeErr := r.closeDynamic(stmt); closeErr != nil {
+				return nil, fatal(closeErr)
+			}
+			return nil, unsupportedDynamic(text)
+		case "set-generator", "savepoint":
+			if closeErr := r.closeDynamic(stmt); closeErr != nil {
+				return nil, fatal(closeErr)
+			}
+			return nil, errNotRun(text)
+		}
 		return stmt, nil
 	case errors.Is(err, errPreparedStatementUnsupported):
 		return nil, unsupportedDynamic(text)
