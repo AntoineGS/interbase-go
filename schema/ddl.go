@@ -23,14 +23,16 @@ const (
 	Dialect1 DDLDialect = 1
 )
 
-// DDLOptions selects the SQL dialect for one rendering operation. A zero
-// Dialect preserves the historical Dialect 3 default. SQL source catalog
-// fields are preserved verbatim rather than translated; when rendering such
-// source, callers must select the dialect compatible with the source database.
+// DDLOptions selects the SQL dialect and engine profile for one rendering
+// operation. A zero Dialect preserves the historical Dialect 3 default. SQL
+// source catalog fields are preserved verbatim rather than translated; when
+// rendering such source, callers must select the dialect compatible with the
+// source database.
 type DDLOptions struct {
 	Dialect DDLDialect
-	// Firebird renders Firebird DDL where it differs from InterBase:
-	// multi-event DML triggers are valid.
+	// Firebird renders Firebird catalog types and declarations where they
+	// differ from InterBase, including numeric relation types, TYPE OF
+	// parameters, and multi-event DML triggers.
 	Firebird bool
 }
 
@@ -831,6 +833,22 @@ func (r Relation) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 
 	prefix := "CREATE TABLE "
 	relationType := strings.TrimSpace(r.RelationType.String)
+	if options.Firebird {
+		switch relationType {
+		case "0":
+			relationType = "PERSISTENT"
+		case "1":
+			relationType = "VIEW"
+		case "2":
+			relationType = "EXTERNAL"
+		case "3":
+			relationType = "VIRTUAL"
+		case "4":
+			relationType = "GLOBAL_TEMPORARY_PRESERVE_ROWS"
+		case "5":
+			relationType = "GLOBAL_TEMPORARY_DELETE_ROWS"
+		}
+	}
 	switch relationType {
 	case "", "PERSISTENT", "EXTERNAL":
 	case "GLOBAL_TEMPORARY_DELETE_ROWS", "GLOBAL_TEMPORARY_PRESERVE_ROWS":
@@ -920,6 +938,8 @@ func (r Relation) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 	builder.WriteString("\n)")
 	if relationType == "GLOBAL_TEMPORARY_PRESERVE_ROWS" {
 		appendDDLClause(&builder, "ON COMMIT PRESERVE ROWS")
+	} else if options.Firebird && relationType == "GLOBAL_TEMPORARY_DELETE_ROWS" {
+		appendDDLClause(&builder, "ON COMMIT DELETE ROWS")
 	}
 	return builder.String(), nil
 }
@@ -928,7 +948,7 @@ func quoteStringLiteral(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
-func parameterDefinition(parameter ProcedureParameter, renderer ddlRenderer) (string, error) {
+func parameterDefinition(parameter ProcedureParameter, renderer ddlRenderer, firebird bool) (string, error) {
 	name, err := renderer.identifier(parameter.Name, "parameter name")
 	if err != nil {
 		return "", err
@@ -949,7 +969,33 @@ func parameterDefinition(parameter ProcedureParameter, renderer ddlRenderer) (st
 		return "", unsupportedDDL("procedure", parameter.ProcedureName, fmt.Sprintf("parameter %q uses a computed domain", parameter.Name))
 	}
 	var typeName string
-	if userDomainReference(parameter.Domain) && parameter.FieldSource.Valid && strings.TrimRight(parameter.FieldSource.String, " ") != "" {
+	fieldName := strings.TrimRight(parameter.FirebirdTypeOfFieldName.String, " ")
+	relationName := strings.TrimRight(parameter.FirebirdTypeOfRelationName.String, " ")
+	hasFieldReference := parameter.FirebirdTypeOfFieldName.Valid && fieldName != ""
+	hasRelationReference := parameter.FirebirdTypeOfRelationName.Valid && relationName != ""
+	if firebird && (hasFieldReference || hasRelationReference) {
+		if !hasFieldReference || !hasRelationReference || !parameter.FirebirdParameterMechanism.Valid || parameter.FirebirdParameterMechanism.Int64 != 1 {
+			return "", unsupportedDDL("procedure", parameter.ProcedureName, fmt.Sprintf("parameter %q has incomplete TYPE OF COLUMN metadata", parameter.Name))
+		}
+		relation, err := renderer.identifier(relationName, "parameter column relation")
+		if err != nil {
+			return "", err
+		}
+		field, err := renderer.identifier(fieldName, "parameter column name")
+		if err != nil {
+			return "", err
+		}
+		typeName = "TYPE OF COLUMN " + relation + "." + field
+	} else if firebird && parameter.FirebirdParameterMechanism.Valid && parameter.FirebirdParameterMechanism.Int64 == 1 {
+		if !userDomainReference(parameter.Domain) {
+			return "", unsupportedDDL("procedure", parameter.ProcedureName, fmt.Sprintf("parameter %q has no user domain for its TYPE OF declaration", parameter.Name))
+		}
+		domainName, err := renderer.identifier(strings.TrimRight(parameter.Domain.Name, " "), "parameter domain")
+		if err != nil {
+			return "", err
+		}
+		typeName = "TYPE OF " + domainName
+	} else if userDomainReference(parameter.Domain) && parameter.FieldSource.Valid && strings.TrimRight(parameter.FieldSource.String, " ") != "" {
 		typeName, err = renderer.identifier(parameter.Domain.Name, "parameter domain")
 	} else {
 		parts, partsErr := parameter.Domain.sqlTypePartsWithRenderer(renderer)
@@ -1023,7 +1069,7 @@ func (p Procedure) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 	if len(p.InputParameters) != 0 {
 		parameters := make([]string, 0, len(p.InputParameters))
 		for _, parameter := range p.InputParameters {
-			definition, err := parameterDefinition(parameter, renderer)
+			definition, err := parameterDefinition(parameter, renderer, options.Firebird)
 			if err != nil {
 				return "", err
 			}
@@ -1036,7 +1082,7 @@ func (p Procedure) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 	if len(p.OutputParameters) != 0 {
 		parameters := make([]string, 0, len(p.OutputParameters))
 		for _, parameter := range p.OutputParameters {
-			definition, err := parameterDefinition(parameter, renderer)
+			definition, err := parameterDefinition(parameter, renderer, options.Firebird)
 			if err != nil {
 				return "", err
 			}

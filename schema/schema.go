@@ -167,6 +167,12 @@ type ProcedureParameter struct {
 	Description   sql.NullString
 	SystemFlag    sql.NullInt64
 	Domain        *Domain
+	// These fields are populated only by Firebird-aware metadata readers.
+	// InterBase leaves them empty because its catalog does not expose the
+	// corresponding TYPE OF declaration references.
+	FirebirdParameterMechanism sql.NullInt64
+	FirebirdTypeOfFieldName    sql.NullString
+	FirebirdTypeOfRelationName sql.NullString
 	// Nullable is that of Domain, and invalid when no domain was resolved.
 	// RDB$PROCEDURE_PARAMETERS has no null flag: an inline parameter type
 	// gets an implicit domain, so the domain's NULL_FLAG is the parameter's;
