@@ -29,6 +29,9 @@ const (
 // source, callers must select the dialect compatible with the source database.
 type DDLOptions struct {
 	Dialect DDLDialect
+	// Firebird renders Firebird DDL where it differs from InterBase:
+	// multi-event DML triggers are valid.
+	Firebird bool
 }
 
 type ddlRenderer struct{ dialect DDLDialect }
@@ -1139,7 +1142,7 @@ func (t Trigger) GenerateDDLWithOptions(options DDLOptions) (string, error) {
 	if err != nil {
 		return "", unsupportedDDL("trigger", t.Name, err.Error())
 	}
-	if strings.Contains(event, " OR ") {
+	if strings.Contains(event, " OR ") && !options.Firebird {
 		return "", unsupportedDDL("trigger", t.Name, "multiple DML events are not valid in InterBase trigger DDL")
 	}
 	if !t.Source.Valid || strings.TrimSpace(t.Source.String) == "" {
