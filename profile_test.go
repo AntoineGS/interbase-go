@@ -114,15 +114,8 @@ func testProfilePanicReleasesNativeGateInChild(t *testing.T) {
 		}
 		return nil, errors.New("unexpected database information code")
 	})
-	native.beginTransactionOverride = func([]byte) (*nativeTransaction, error) {
-		return &nativeTransaction{
-			prepareContextOverride: func(string, bool, *nativeCancelOperation) (*nativeStatement, error) {
-				panic("injected prepare panic")
-			},
-			rollbackOverride:    func() error { return nil },
-			handleStateOverride: func() nativeHandleState { return nativeHandleConsumed },
-			freeOverride:        func() {},
-		}, nil
+	native.prepareContextOverride = func(string, *nativeCancelOperation) (*nativeStatement, error) {
+		panic("injected prepare panic")
 	}
 	db := openDatabaseSQLTestDB(t, &conn{native: native})
 	pooled, err := db.Conn(context.Background())

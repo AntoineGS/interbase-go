@@ -114,81 +114,15 @@ func Profile(ctx context.Context, pooled *sql.Conn, query string, options Profil
 	if err != nil {
 		return result, err
 	}
-	if err := contextError(ctx); err != nil {
-		return result, err
-	}
-	if err := validateDatabaseSQLQuery(query); err != nil {
-		return result, err
-	}
-
-	var routinesBefore RoutineActivity
-	var routinesBeforeErr error
-	if options.RoutineActivity {
-		routinesBefore, routinesBeforeErr = ReadRoutineActivity(ctx, pooled)
-		if routinesBeforeErr != nil {
-			result.RoutinesUnavailable = routinesBeforeErr
-		}
-	}
-
-	before, err := ReadActivity(ctx, pooled)
+	prepared, err := PrepareProfile(ctx, pooled, query, ProfilePreparationOptions{
+		RoutineActivity: options.RoutineActivity,
+	})
 	if err != nil {
 		return result, err
 	}
-
-	transactionOptions := TransactionOptions{
-		ReadOnly:  options.ReadOnly,
-		Isolation: sql.LevelReadCommitted,
-	}
-	profileErr := pooled.Raw(func(driverConn any) error {
-		c, ok := driverConn.(*conn)
-		if !ok {
-			return ErrNotInterBaseConn
-		}
-		attachment := &Attachment{conn: c}
-		tx, err := attachment.BeginTx(ctx, transactionOptions)
-		if err != nil {
-			return err
-		}
-
-		return runProfileTransaction(tx.Rollback, func() error {
-			result.RawPlan, result.Prepare, result.Execute, result.Fetch,
-				result.ReturnsRows, result.Rows, result.Complete, err =
-				tx.profileStatement(ctx, query, options.MaxRows, options.FetchAll)
-			return err
-		}, &result.RolledBack)
-	})
-	resultErr = errors.Join(resultErr, profileErr)
-
-	cleanupContext := context.WithoutCancel(ctx)
-	after, afterErr := ReadActivity(cleanupContext, pooled)
-	if afterErr != nil {
-		resultErr = errors.Join(resultErr, fmt.Errorf("interbase: read profile activity after execution: %w", afterErr))
-	} else {
-		result, err = finishProfile(result, before, after)
-		if err != nil {
-			resultErr = errors.Join(resultErr, err)
-		} else if len(result.Activity.Tables) != 0 {
-			ids := make([]int, 0, len(result.Activity.Tables))
-			for id := range result.Activity.Tables {
-				ids = append(ids, id)
-			}
-			names, namesErr := RelationNames(cleanupContext, pooled, ids)
-			if namesErr != nil {
-				resultErr = errors.Join(resultErr, fmt.Errorf("interbase: resolve profile relation names: %w", namesErr))
-			} else {
-				result.RelationNames = names
-			}
-		}
-	}
-
-	if options.RoutineActivity {
-		routinesAfter, routinesAfterErr := ReadRoutineActivity(cleanupContext, pooled)
-		if routinesAfterErr != nil {
-			result.RoutinesUnavailable = errors.Join(result.RoutinesUnavailable, routinesAfterErr)
-			result.Routines = nil
-		} else if routinesBeforeErr == nil {
-			result.Routines = routinesAfter.Delta(routinesBefore)
-		}
+	result, resultErr = prepared.Profile(ctx, options)
+	if closeErr := prepared.Close(); closeErr != nil {
+		resultErr = errors.Join(resultErr, closeErr)
 	}
 	return result, resultErr
 }

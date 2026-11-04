@@ -185,6 +185,9 @@ type nativeConnection struct {
 	dialect                   int
 	brokenOverride            func() bool
 	closeOverride             func() error
+	beginOverride             func([]byte) error
+	commitOverride            func() error
+	rollbackOverride          func() error
 	beginTransactionOverride  func([]byte) (*nativeTransaction, error)
 	beginDistributedOverride  func([]*nativeConnection, [][]byte) (*nativeDistributedTransaction, error)
 	dropOverride              func() error
@@ -1869,6 +1872,9 @@ func (c *nativeConnection) exec(ctx context.Context, query string, args []argume
 func (c *nativeConnection) begin(tpb []byte) error {
 	release := nativegate.Global.Enter()
 	defer release()
+	if c != nil && c.beginOverride != nil {
+		return c.beginOverride(append([]byte(nil), tpb...))
+	}
 	if c == nil || c.ptr == nil {
 		return errors.New("native connection is unavailable")
 	}
@@ -1886,6 +1892,9 @@ func (c *nativeConnection) begin(tpb []byte) error {
 func (c *nativeConnection) commit() error {
 	release := nativegate.Global.Enter()
 	defer release()
+	if c != nil && c.commitOverride != nil {
+		return c.commitOverride()
+	}
 	if c == nil || c.ptr == nil {
 		return errors.New("native connection is unavailable")
 	}
@@ -1899,6 +1908,9 @@ func (c *nativeConnection) commit() error {
 func (c *nativeConnection) rollback() error {
 	release := nativegate.Global.Enter()
 	defer release()
+	if c != nil && c.rollbackOverride != nil {
+		return c.rollbackOverride()
+	}
 	if c == nil || c.ptr == nil {
 		return errors.New("native connection is unavailable")
 	}

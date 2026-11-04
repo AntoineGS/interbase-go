@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // Introspector is implemented by the driver connection passed to
@@ -405,15 +406,23 @@ func (c *conn) inspectPreparedStatementLocked(ctx context.Context, query, operat
 // otherwise it closes it and returns nil.
 func (c *conn) prepareInspectedLocked(ctx context.Context, query, operation string,
 	inspect func(*nativeStatement) error, keep bool) (*nativeStatement, error) {
+	statement, _, err := c.prepareInspectedTimedLocked(ctx, query, operation, inspect, keep)
+	return statement, err
+}
+
+func (c *conn) prepareInspectedTimedLocked(ctx context.Context, query, operation string,
+	inspect func(*nativeStatement) error, keep bool) (*nativeStatement, time.Duration, error) {
 	releaseNative, err := enterNativeContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer releaseNative()
 	if err := c.discardPendingLocked(); err != nil {
-		return nil, c.failAdmittedLocked(releaseNative, err)
+		return nil, 0, c.failAdmittedLocked(releaseNative, err)
 	}
+	started := time.Now()
 	statement, err := c.native.prepare(ctx, query)
+	prepare := time.Since(started)
 	if err != nil {
 		releaseNative()
 		prepareOperation := "prepare " + operation
@@ -428,10 +437,10 @@ func (c *conn) prepareInspectedLocked(ctx context.Context, query, operation stri
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
-		return nil, operationErr
+		return nil, prepare, operationErr
 	}
 	if err := contextError(ctx); err != nil {
-		return nil, errors.Join(err, statement.close())
+		return nil, prepare, errors.Join(err, statement.close())
 	}
 	inspectErr := inspect(statement)
 	var closeErr error
@@ -444,16 +453,16 @@ func (c *conn) prepareInspectedLocked(ctx context.Context, query, operation stri
 		if c.native.broken() {
 			c.invalidateLocked(operationErr)
 		}
-		return nil, operationErr
+		return nil, prepare, operationErr
 	}
 	if err := contextError(ctx); err != nil {
 		if keep {
 			err = errors.Join(err, c.sanitizeError("close statement", statement.close()))
 		}
-		return nil, err
+		return nil, prepare, err
 	}
 	if !keep {
-		return nil, nil
+		return nil, prepare, nil
 	}
-	return statement, nil
+	return statement, prepare, nil
 }

@@ -27,6 +27,9 @@ type pendingFake struct {
 func (f *pendingFake) connection() *conn {
 	native := introspectionTestNative(3)
 	native.cancelSlotOverride = &fakeCancelSlot{}
+	native.beginOverride = func([]byte) error { return nil }
+	native.rollbackOverride = func() error { return nil }
+	native.commitOverride = func() error { return nil }
 	native.prepareOverride = func(query string) (*nativeStatement, error) {
 		f.prepares = append(f.prepares, query)
 		id := len(f.prepares)
@@ -116,6 +119,38 @@ func TestPrepareNextReusesStatementForIdenticalQuery(t *testing.T) {
 	}
 	if len(f.events) != 2 {
 		t.Fatalf("Close after consumption closed again: %v", f.events)
+	}
+}
+
+func TestPrepareNextReusesStatementInsideTransaction(t *testing.T) {
+	f := &pendingFake{}
+	connection := pendingTestConn(t, f)
+	pending, err := PrepareNext(context.Background(), connection, pendingSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := connection.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelReadCommitted, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := tx.QueryContext(context.Background(), pendingSQL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rows.Next() {
+		t.Fatal("unexpected row")
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.prepares) != 1 || len(f.oneShotQueries) != 0 || f.statementRuns != 1 {
+		t.Fatalf("prepares=%v oneShot=%v statementRuns=%d", f.prepares, f.oneShotQueries, f.statementRuns)
+	}
+	if err := pending.Close(); err != nil {
+		t.Fatalf("Close after transaction execution: %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"time"
 )
 
 // PendingStatement is a statement PrepareNext prepared and left on its
@@ -27,22 +28,28 @@ type PendingStatement struct {
 // prepared statement keeps the objects it references in use, which blocks
 // their DDL by other attachments.
 func PrepareNext(ctx context.Context, pooled *sql.Conn, query string) (*PendingStatement, error) {
+	pending, _, err := prepareNext(ctx, pooled, query)
+	return pending, err
+}
+
+func prepareNext(ctx context.Context, pooled *sql.Conn, query string) (*PendingStatement, time.Duration, error) {
 	if pooled == nil {
-		return nil, ErrNotInterBaseConn
+		return nil, 0, ErrNotInterBaseConn
 	}
 	pending := &PendingStatement{conn: pooled}
+	var prepare time.Duration
 	if err := pooled.Raw(func(driverConn any) error {
 		c, ok := driverConn.(*conn)
 		if !ok {
 			return ErrNotInterBaseConn
 		}
 		var err error
-		pending.statement, pending.descriptor, err = c.prepareNext(ctx, query)
+		pending.statement, pending.descriptor, prepare, err = c.prepareNextMeasured(ctx, query)
 		return err
 	}); err != nil {
-		return nil, err
+		return nil, prepare, err
 	}
-	return pending, nil
+	return pending, prepare, nil
 }
 
 // Descriptor returns the prepared statement's description.
@@ -82,31 +89,36 @@ func (p *PendingStatement) Close() error {
 }
 
 func (c *conn) prepareNext(ctx context.Context, query string) (*stmt, StatementDescriptor, error) {
+	statement, descriptor, _, err := c.prepareNextMeasured(ctx, query)
+	return statement, descriptor, err
+}
+
+func (c *conn) prepareNextMeasured(ctx context.Context, query string) (*stmt, StatementDescriptor, time.Duration, error) {
 	if err := contextError(ctx); err != nil {
-		return nil, StatementDescriptor{}, err
+		return nil, StatementDescriptor{}, 0, err
 	}
 	if err := validateDatabaseSQLQuery(query); err != nil {
-		return nil, StatementDescriptor{}, err
+		return nil, StatementDescriptor{}, 0, err
 	}
 	c.lockDirect()
 	defer c.mu.Unlock()
 	if c.distributed != nil {
-		return nil, StatementDescriptor{}, ErrDistributedParticipantManaged
+		return nil, StatementDescriptor{}, 0, ErrDistributedParticipantManaged
 	}
 	if c.closed || c.native == nil || c.native.broken() {
-		return nil, StatementDescriptor{}, driver.ErrBadConn
+		return nil, StatementDescriptor{}, 0, driver.ErrBadConn
 	}
 	if err := contextError(ctx); err != nil {
-		return nil, StatementDescriptor{}, err
+		return nil, StatementDescriptor{}, 0, err
 	}
 	var description StatementDescriptor
-	native, err := c.prepareInspectedLocked(ctx, query, "describe statement", func(statement *nativeStatement) error {
+	native, prepare, err := c.prepareInspectedTimedLocked(ctx, query, "describe statement", func(statement *nativeStatement) error {
 		var inspectErr error
 		description, inspectErr = statement.description()
 		return inspectErr
 	}, true)
 	if err != nil {
-		return nil, StatementDescriptor{}, err
+		return nil, StatementDescriptor{}, prepare, err
 	}
 	prepared := &stmt{conn: c, native: native, numInput: native.numInput()}
 	if c.statements == nil {
@@ -114,7 +126,7 @@ func (c *conn) prepareNext(ctx context.Context, query string) (*stmt, StatementD
 	}
 	c.statements[prepared] = struct{}{}
 	c.pending, c.pendingQuery = prepared, query
-	return prepared, description, nil
+	return prepared, description, prepare, nil
 }
 
 // takePendingLocked returns the pending statement when query and args select
