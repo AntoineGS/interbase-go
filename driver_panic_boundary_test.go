@@ -1,13 +1,40 @@
 package interbase
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"log"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
+
+type synchronizedBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+	changed chan struct{}
+}
+
+func (b *synchronizedBuffer) Write(value []byte) (int, error) {
+	b.mu.Lock()
+	n, err := b.Buffer.Write(value)
+	b.mu.Unlock()
+	select {
+	case b.changed <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
 
 type panicBoundaryConnector struct {
 	mu      sync.Mutex
@@ -86,17 +113,11 @@ func TestDatabaseSQLDriverPanicFailsWithoutRetryAndReconnectsNextCall(t *testing
 	}
 }
 
-func TestDatabaseSQLPreparePanicMayRetryOnFreshConnection(t *testing.T) {
-	connector := &panicBoundaryConnector{connect: func(opened int) *conn {
+func TestDatabaseSQLPreparePanicIsNonRetryable(t *testing.T) {
+	connector := &panicBoundaryConnector{connect: func(int) *conn {
 		native := &nativeConnection{}
-		if opened == 1 {
-			native.prepareOverride = func(string) (*nativeStatement, error) {
-				panic("injected prepare panic")
-			}
-		} else {
-			native.prepareOverride = func(string) (*nativeStatement, error) {
-				return &nativeStatement{numInputOverride: func() int { return 0 }}, nil
-			}
+		native.prepareOverride = func(string) (*nativeStatement, error) {
+			panic("injected prepare panic")
 		}
 		return panicBoundaryConn(native)
 	}}
@@ -106,12 +127,73 @@ func TestDatabaseSQLPreparePanicMayRetryOnFreshConnection(t *testing.T) {
 	db.SetMaxIdleConns(1)
 
 	statement, err := db.PrepareContext(context.Background(), "UPDATE T SET V = 1")
-	if err != nil {
-		t.Fatalf("safe prepare retry failed: %v", err)
+	if statement != nil {
+		_ = statement.Close()
 	}
-	defer statement.Close()
-	if opened := connector.Opened(); opened != 2 {
-		t.Fatalf("connections opened=%d, want retry on a fresh connection", opened)
+	if !errors.Is(err, ErrDriverPanic) || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("prepare panic error=%v; want non-retryable ErrDriverPanic", err)
+	}
+	if opened := connector.Opened(); opened != 1 {
+		t.Fatalf("prepare panic opened %d connections; want no retry", opened)
+	}
+}
+
+func TestPinnedDatabaseSQLConnReportsDriverPanicAndLogsCleanupPanic(t *testing.T) {
+	diagnostics := synchronizedBuffer{changed: make(chan struct{}, 1)}
+	previousOutput, previousFlags := log.Writer(), log.Flags()
+	log.SetOutput(&diagnostics)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(previousOutput)
+		log.SetFlags(previousFlags)
+	}()
+
+	connector := &panicBoundaryConnector{connect: func(int) *conn {
+		native := &nativeConnection{
+			execOverride: func(string, []argument, bool) (int64, error) {
+				panic("sensitive native panic detail")
+			},
+			closeOverride: func() error { panic("injected native cleanup panic") },
+		}
+		return panicBoundaryConn(native)
+	}}
+	db := sql.OpenDB(connector)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	pinned, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = pinned.ExecContext(context.Background(), "UPDATE T SET V = 1")
+	if !errors.Is(err, ErrDriverPanic) || errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("pinned execution error=%v; want non-retryable ErrDriverPanic", err)
+	}
+	if strings.Contains(err.Error(), "sensitive native panic detail") {
+		t.Fatalf("returned driver error exposed panic detail: %v", err)
+	}
+	if opened := connector.Opened(); opened != 1 {
+		t.Fatalf("pinned execution opened %d connections; want exactly one", opened)
+	}
+	if err := pinned.Close(); err != nil {
+		t.Fatalf("close pinned connection: %v", err)
+	}
+
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		logs := diagnostics.String()
+		if strings.Contains(logs, "sensitive native panic detail") &&
+			strings.Contains(logs, "injected native cleanup panic") &&
+			strings.Contains(logs, "goroutine") {
+			return
+		}
+		select {
+		case <-diagnostics.changed:
+		case <-deadline.C:
+			t.Fatalf("driver panic and cleanup diagnostics were not both logged:\n%s", diagnostics.String())
+		}
 	}
 }
 
