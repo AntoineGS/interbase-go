@@ -9921,6 +9921,9 @@ static int ib_blob_total_length(isc_blob_handle *blob, int64_t *length,
 	}
 	item_length = response_length;
 	total_length = (uint32_t) isc_vax_integer(response + 3, (short) item_length);
+	if ((unsigned char) response[3 + item_length] != isc_info_end) {
+		return ib_fail(error, "InterBase returned an unterminated output BLOB length response");
+	}
 	*length = (int64_t) total_length;
 	return 0;
 }

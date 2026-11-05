@@ -25,6 +25,9 @@ static short blob_gen_target_subtype;
 static short blob_gen_target_charset;
 static short blob_gen_source_subtype;
 static short blob_gen_source_charset;
+static int blob_info_calls;
+static int blob_info_mode;
+static uint32_t blob_info_total_length;
 
 static void *test_malloc(size_t size)
 {
@@ -34,6 +37,7 @@ static void *test_malloc(size_t size)
 #define malloc test_malloc
 #define isc_open_blob test_open_blob
 #define isc_open_blob2 test_open_blob2
+#define isc_blob_info test_blob_info
 #define isc_get_segment test_get_segment
 #define isc_close_blob test_close_blob
 #define isc_cancel_blob test_cancel_blob
@@ -66,6 +70,40 @@ static ISC_STATUS status_result(ISC_STATUS *status, ISC_STATUS code)
 	status[1] = code;
 	status[2] = isc_arg_end;
 	return code;
+}
+
+ISC_STATUS ISC_EXPORT test_blob_info(ISC_STATUS *status, isc_blob_handle *blob,
+	short item_length, char *items, short buffer_length, char *buffer)
+{
+	(void) blob;
+	(void) item_length;
+	(void) items;
+	blob_info_calls++;
+	if (buffer_length <= 0) {
+		return status_result(status, isc_network_error);
+	}
+	memset(buffer, 0, (size_t) buffer_length);
+	if (blob_info_mode == 1) {
+		buffer[0] = (char) isc_info_end;
+		return status_result(status, 0);
+	}
+	buffer[0] = (char) isc_info_blob_total_length;
+	if (blob_info_mode == 2) {
+		/* Simulate a response truncated immediately after its item tag. */
+		return status_result(status, 0);
+	}
+	buffer[1] = 4;
+	buffer[2] = 0;
+	if (blob_info_mode == 3) {
+		buffer[1] = 5;
+	}
+	for (size_t index = 0U; index < 4U && index + 3U < (size_t) buffer_length; index++) {
+		buffer[index + 3U] = (char) (blob_info_total_length >> (index * 8U));
+	}
+	if (blob_info_mode != 4 && 7 < buffer_length) {
+		buffer[7] = (char) isc_info_end;
+	}
+	return status_result(status, 0);
 }
 
 ISC_STATUS ISC_EXPORT test_open_blob(ISC_STATUS *status, isc_db_handle *database,
@@ -239,6 +277,8 @@ static void test_large_segment_materialization(void)
 	char *error = NULL;
 	size_t length = 0U;
 	int is_utf8 = 0;
+	int64_t total_length = -1;
+	int truncated = 0;
 
 	memset(&connection, 0, sizeof(connection));
 	connection.database = &handle_token;
@@ -253,10 +293,13 @@ static void test_large_segment_materialization(void)
 	blob_offset = 0U;
 	open_calls = 0;
 	close_calls = 0;
-	data = ib_read_blob(&cursor, &variable, &length, &is_utf8, &error);
+	data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
+		&total_length, &truncated, &error);
 	check(data != NULL && error == NULL, "large segmented BLOB read failed");
 	check(open_calls == 1 && close_calls == 1, "large segmented BLOB handle lifecycle is wrong");
 	check(length == 90000U, "large segmented BLOB length changed");
+	check(total_length == -1 && truncated == 0,
+		"unbounded BLOB read unexpectedly requested preview metadata");
 	int64_t opens, bytes;
 	ib_cursor_blob_read_stats(&cursor, &opens, &bytes);
 	check(opens == 1 && bytes == 90000, "materialization counters changed");
@@ -281,6 +324,160 @@ static void reset_controlled_blob(const unsigned char *payload, size_t length)
 	blob_gen_bpb2_calls = 0;
 	get_segment_calls = 0;
 	cancel_calls = 0;
+}
+
+static void check_bounded_blob_read(const char *name, const unsigned char *payload,
+	size_t payload_length, size_t limit, uint32_t reported_length,
+	size_t expected_read, size_t expected_segment_calls, int expected_truncated)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLVAR variable;
+	ISC_QUAD blob_id = {0};
+	char *data;
+	char *error = NULL;
+	size_t length = 0U;
+	int is_utf8 = 0;
+	int64_t total_length = -1;
+	int truncated = 0;
+	int64_t opens;
+	int64_t source_bytes;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &handle_token;
+	connection.dialect = SQL_DIALECT_V5;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = &handle_token;
+	memset(&variable, 0, sizeof(variable));
+	variable.sqltype = SQL_BLOB | 1;
+	variable.sqlsubtype = 0;
+	variable.sqldata = (char *) &blob_id;
+	reset_controlled_blob(payload, payload_length);
+	blob_info_total_length = reported_length;
+	blob_info_mode = 0;
+	blob_info_calls = 0;
+	ib_cursor_set_blob_read_limit(&cursor, limit);
+	data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
+		&total_length, &truncated, &error);
+	check_case(data != NULL && error == NULL, name, "bounded BLOB read failed");
+	check_case(length == expected_read, name, "retained read length changed");
+	check_case(length <= limit + 1U, name, "read exceeded prefix plus one-byte detection limit");
+	check_case(total_length == (int64_t) reported_length, name, "reported full BLOB length changed");
+	check_case(truncated == expected_truncated, name, "truncation flag changed");
+	check_case(blob_info_calls == 1, name, "bounded read did not request BLOB total length exactly once");
+	check_case(get_segment_calls == (int) expected_segment_calls, name, "segment read count changed");
+	ib_cursor_blob_read_stats(&cursor, &opens, &source_bytes);
+	check_case(opens == 1 && source_bytes == (int64_t) expected_read, name,
+		"native source-byte counter did not match bytes actually read");
+	for (size_t index = 0U; index < length; index++) {
+		unsigned char expected = payload == NULL ? (unsigned char) (index & 0xffU) : payload[index];
+		check_case((unsigned char) data[index] == expected, name, "bounded prefix bytes changed");
+	}
+	free(data);
+	controlled_payload = NULL;
+}
+
+static void test_bounded_blob_read_limits(void)
+{
+	static const unsigned char empty_blob[] = {0};
+	static const unsigned char at_limit[] = {'a', 'b', 'c', 'd'};
+	static const unsigned char over_limit[] = {'a', 'b', 'c', 'd', 'e'};
+	check_bounded_blob_read("empty BLOB", empty_blob, 0U, 4U, 0U, 0U, 1U, 0);
+	check_bounded_blob_read("exactly-at-limit BLOB", at_limit, sizeof(at_limit), 4U,
+		(uint32_t) sizeof(at_limit), sizeof(at_limit), 2U, 0);
+	check_bounded_blob_read("limit-plus-one BLOB", over_limit, sizeof(over_limit), 4U,
+		(uint32_t) sizeof(over_limit), sizeof(over_limit), 1U, 1);
+	check_bounded_blob_read("multi-segment boundary BLOB", NULL, 0U,
+		(size_t) IB_BLOB_SEGMENT_LENGTH, 90000U,
+		(size_t) IB_BLOB_SEGMENT_LENGTH + 1U, 2U, 1);
+	check_bounded_blob_read("synthetic BLOB larger than 2 GiB", NULL, 0U, 4U,
+		UINT32_C(0x80000001), 5U, 1U, 1);
+}
+
+static void test_bounded_null_blob_skips_native_read(void)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	ISC_QUAD blob_id = {0};
+	short indicator = -1;
+	XSQLDA *output;
+	ib_value_view view;
+	char *error = NULL;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &handle_token;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = &handle_token;
+	cursor.fetched = 1;
+	output = (XSQLDA *) calloc(1U, XSQLDA_LENGTH(1));
+	check(output != NULL, "NULL BLOB SQLDA allocation failed");
+	output->sqln = 1;
+	output->sqld = 1;
+	output->sqlvar[0].sqltype = SQL_BLOB | 1;
+	output->sqlvar[0].sqldata = (char *) &blob_id;
+	output->sqlvar[0].sqlind = &indicator;
+	cursor.output = output;
+	ib_cursor_set_blob_read_limit(&cursor, 4U);
+	reset_controlled_blob(NULL, 0U);
+	blob_info_calls = 0;
+	check(ib_cursor_column(&cursor, 0U, &view, &error) == 0 && error == NULL,
+		"bounded NULL BLOB conversion failed");
+	check(view.kind == IB_VALUE_NULL, "bounded NULL BLOB did not remain NULL");
+	check(open_calls == 0 && blob_info_calls == 0 && get_segment_calls == 0,
+		"bounded NULL BLOB unexpectedly opened or read a native BLOB");
+	free(output);
+	ib_error_free(error);
+}
+
+static void test_bounded_blob_info_rejects_malformed_responses(void)
+{
+	static const unsigned char payload[] = {'x'};
+	static const struct {
+		const char *name;
+		int mode;
+	} cases[] = {
+		{"wrong info item", 1},
+		{"truncated info response", 2},
+		{"invalid info length", 3},
+		{"missing info terminator", 4},
+	};
+	for (size_t index = 0U; index < sizeof(cases) / sizeof(cases[0]); index++) {
+		ib_connection connection;
+		ib_cursor cursor;
+		XSQLVAR variable;
+		ISC_QUAD blob_id = {0};
+		char *data;
+		char *error = NULL;
+		size_t length = 0U;
+		int is_utf8 = 0;
+		int64_t total_length = -1;
+		int truncated = 0;
+		memset(&connection, 0, sizeof(connection));
+		connection.database = &handle_token;
+		memset(&cursor, 0, sizeof(cursor));
+		cursor.connection = &connection;
+		cursor.transaction = &handle_token;
+		memset(&variable, 0, sizeof(variable));
+		variable.sqltype = SQL_BLOB | 1;
+		variable.sqldata = (char *) &blob_id;
+		reset_controlled_blob(payload, sizeof(payload));
+		blob_info_total_length = 1U;
+		blob_info_mode = cases[index].mode;
+		blob_info_calls = 0;
+		ib_cursor_set_blob_read_limit(&cursor, 1U);
+		data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
+			&total_length, &truncated, &error);
+		check_case(data == NULL && error != NULL, cases[index].name,
+			"malformed BLOB-info response was accepted");
+		check_case(blob_info_calls == 1 && get_segment_calls == 0,
+			cases[index].name, "malformed BLOB-info response read segment bytes");
+		check_case(close_calls == 1, cases[index].name,
+			"malformed BLOB-info response did not close its BLOB handle");
+		free(data);
+		ib_error_free(error);
+	}
 }
 
 static XSQLDA *make_catalog_output(ISC_QUAD *blob_id, short *indicator,
@@ -1320,6 +1517,9 @@ int main(void)
 {
 	test_cleanup_failure_without_message();
 	test_large_segment_materialization();
+	test_bounded_blob_read_limits();
+	test_bounded_null_blob_skips_native_read();
+	test_bounded_blob_info_rejects_malformed_responses();
 	test_catalog_text_uses_configured_source_not_attachment();
 	test_catalog_segmented_high_bytes_expand_exactly();
 	test_catalog_conversion_expansion_is_bounded();
