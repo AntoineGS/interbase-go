@@ -889,6 +889,10 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
+	blobReadLimit, boundedBlobs, err := blobReadLimitFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	args, err := convertNamedValues(values)
 	if err != nil {
 		return nil, err
@@ -933,6 +937,9 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 			conn.invalidateLocked(operationErr)
 		}
 		return nil, operationErr
+	}
+	if boundedBlobs {
+		nativeRows.setBlobReadLimit(blobReadLimit)
 	}
 	result := &rows{
 		conn:                conn,
@@ -1303,6 +1310,10 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
+	blobReadLimit, boundedBlobs, err := blobReadLimitFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
 	args, err := convertQuery(query, values)
 	if err != nil {
 		return nil, err
@@ -1350,6 +1361,9 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 			c.invalidateLocked(operationErr)
 		}
 		return nil, operationErr
+	}
+	if boundedBlobs {
+		nativeRows.setBlobReadLimit(blobReadLimit)
 	}
 	releaseNative()
 	result := &rows{

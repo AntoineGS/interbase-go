@@ -24,7 +24,8 @@ enum ib_value_kind {
 	IB_VALUE_SCALED_INT = 6,
 	IB_VALUE_BYTES = 7,
 	IB_VALUE_ARRAY = 8,
-	IB_VALUE_BLOB_REF = 9
+	IB_VALUE_BLOB_REF = 9,
+	IB_VALUE_BLOB_PREVIEW = 10
 };
 
 ib_cancel_slot *ib_cancel_slot_new(char **error);
@@ -142,6 +143,10 @@ typedef struct ib_value_view {
 	uint32_t blob_low;
 	int blob_subtype;
 	int blob_charset;
+	int64_t blob_total_length;
+	int blob_truncated;
+	int blob_text;
+	int blob_utf8;
 } ib_value_view;
 
 struct ib_array_view {
@@ -348,6 +353,7 @@ int ib_cursor_column_metadata(const ib_cursor *cursor, size_t index,
 	ib_column_metadata *metadata, char **error);
 int ib_cursor_column_indicator(const ib_cursor *cursor, size_t index,
 	uint16_t *indicator, char **error);
+void ib_cursor_set_blob_read_limit(ib_cursor *cursor, size_t max_prefix_bytes);
 int ib_cursor_column(const ib_cursor *cursor, size_t index,
 	ib_value_view *view, char **error);
 int ib_cursor_fingerprint_column(const ib_cursor *cursor, size_t index,

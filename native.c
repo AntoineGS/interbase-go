@@ -223,6 +223,8 @@ struct ib_cursor {
 	int output_pending;
 	int fetched;
 	int allow_arrays;
+	int blob_read_limit_enabled;
+	size_t blob_read_limit;
 	char *query;
 	size_t query_length;
 	char *array_data;
@@ -9887,6 +9889,42 @@ static int ib_append_blob_data(char **data, size_t *length, size_t *capacity,
 	return 0;
 }
 
+static int ib_blob_total_length(isc_blob_handle *blob, int64_t *length,
+	char **error)
+{
+	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
+	ISC_STATUS result;
+	char request[1];
+	char response[16];
+	ISC_LONG response_length;
+	ISC_LONG item_length;
+	uint32_t total_length;
+
+	if (blob == NULL || *blob == NULL || length == NULL) {
+		return ib_fail(error, "BLOB length result storage is unavailable");
+	}
+	request[0] = (char) isc_info_blob_total_length;
+	memset(response, 0, sizeof(response));
+	memset(status, 0, sizeof(status));
+	result = isc_blob_info(status, blob, (short) sizeof(request), request,
+		(short) sizeof(response), response);
+	if (result != 0) {
+		return ib_fail_status(error, "read output BLOB length", status);
+	}
+	if ((unsigned char) response[0] != isc_info_blob_total_length) {
+		return ib_fail(error, "InterBase returned invalid output BLOB length info");
+	}
+	response_length = isc_vax_integer(response + 1, 2);
+	if (response_length < 1 || response_length > 4 ||
+		(size_t) response_length > sizeof(response) - 3U) {
+		return ib_fail(error, "InterBase returned an invalid output BLOB length size");
+	}
+	item_length = response_length;
+	total_length = (uint32_t) isc_vax_integer(response + 3, (short) item_length);
+	*length = (int64_t) total_length;
+	return 0;
+}
+
 static int ib_catalog_name_is(const char *name, short length,
 	const char *expected)
 {
@@ -9946,7 +9984,8 @@ static short ib_catalog_text_override(const ib_cursor *cursor,
 }
 
 static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
-	size_t *length, int *is_utf8, char **error)
+	size_t *length, int *is_utf8, int64_t *total_length, int *truncated,
+	char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
@@ -9965,13 +10004,20 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	int cleanup_failed;
 	int use_bpb;
 	short override_charset;
+	int bounded;
+	size_t max_read_length;
 
 	if (length == NULL || cursor == NULL || cursor->connection == NULL ||
 		cursor->connection->database == NULL || cursor->transaction == NULL ||
-		variable == NULL || variable->sqldata == NULL || is_utf8 == NULL) {
+		variable == NULL || variable->sqldata == NULL || is_utf8 == NULL ||
+		total_length == NULL || truncated == NULL) {
 		(void) ib_fail(error, "BLOB result storage is unavailable");
 		return NULL;
 	}
+	bounded = cursor->blob_read_limit_enabled;
+	max_read_length = bounded ? cursor->blob_read_limit + 1U : SIZE_MAX;
+	*total_length = -1;
+	*truncated = 0;
 	memcpy(&blob_id, variable->sqldata, sizeof(blob_id));
 	*is_utf8 = 0;
 	override_charset = ib_catalog_text_override(cursor, variable);
@@ -10019,17 +10065,37 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 		(void) ib_fail_status(error, "open output BLOB", status);
 		return NULL;
 	}
+	if (bounded && ib_blob_total_length(&blob, total_length, error) != 0) {
+		cleanup_error = NULL;
+		cleanup_failed = ib_blob_cleanup(&blob, 1, &cleanup_error);
+		if (cleanup_failed != 0) {
+			ib_mark_broken(cursor->connection);
+		}
+		ib_append_error(error, cleanup_error);
+		return NULL;
+	}
 	data = NULL;
 	data_length = 0U;
 	capacity = 0U;
 	cursor->blob_opens++;
 	for (;;) {
 		unsigned short segment_length;
+		size_t segment_capacity;
+
+		segment_capacity = sizeof(segment);
+		if (bounded) {
+			if (data_length >= max_read_length) {
+				break;
+			}
+			if (max_read_length - data_length < segment_capacity) {
+				segment_capacity = max_read_length - data_length;
+			}
+		}
 
 		segment_length = 0U;
 		memset(status, 0, sizeof(status));
 		result = isc_get_segment(status, &blob, &segment_length,
-			(unsigned short) sizeof(segment), segment);
+			(unsigned short) segment_capacity, segment);
 		if (result == isc_segstr_eof) {
 			break;
 		}
@@ -10060,6 +10126,12 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 			ib_give_error(error, first_error);
 			return NULL;
 		}
+		if (bounded && data_length >= max_read_length) {
+			break;
+		}
+	}
+	if (bounded) {
+		*truncated = data_length > cursor->blob_read_limit;
 	}
 	cleanup_error = NULL;
 	cleanup_failed = ib_blob_cleanup(&blob, 0, &cleanup_error);
@@ -10110,6 +10182,15 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	}
 	*length = data_length;
 	return data;
+}
+
+void ib_cursor_set_blob_read_limit(ib_cursor *cursor, size_t max_prefix_bytes)
+{
+	if (cursor == NULL || max_prefix_bytes >= (size_t) IB_MAX_BLOB_BUFFER) {
+		return;
+	}
+	cursor->blob_read_limit = max_prefix_bytes;
+	cursor->blob_read_limit_enabled = 1;
 }
 
 void ib_cursor_blob_read_stats(const ib_cursor *cursor, int64_t *opens,
@@ -10265,13 +10346,15 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 		char *blob_data;
 		size_t blob_length;
 		int blob_is_utf8;
+		int64_t blob_total_length;
+		int blob_truncated;
 
 		if (cursor->allow_arrays) {
 			return ib_cursor_blob_ref((ib_cursor *) cursor, variable, view, error);
 		}
 
 		blob_data = ib_read_blob((ib_cursor *) cursor, variable, &blob_length,
-			&blob_is_utf8, error);
+			&blob_is_utf8, &blob_total_length, &blob_truncated, error);
 		if (blob_data == NULL) {
 			return -1;
 		}
@@ -10288,9 +10371,21 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 			((ib_cursor *) cursor)->converted_value = converted;
 			view->bytes = converted;
 			view->length = converted_length;
+			blob_is_utf8 = 1;
 		} else {
 			view->bytes = ((ib_cursor *) cursor)->materialized_value;
 			view->length = blob_length;
+		}
+		if (cursor->blob_read_limit_enabled) {
+			view->kind = IB_VALUE_BLOB_PREVIEW;
+			view->blob_total_length = blob_total_length;
+			view->blob_truncated = blob_truncated;
+			view->blob_text = variable->sqlsubtype == 1;
+			view->blob_utf8 = blob_is_utf8 ||
+				(cursor->connection != NULL &&
+					cursor->connection->charset == IB_CHARSET_UTF8 &&
+					variable->sqlsubtype == 1);
+			return 0;
 		}
 		view->kind = variable->sqlsubtype == 1 ? IB_VALUE_STRING : IB_VALUE_BYTES;
 		return 0;
