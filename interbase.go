@@ -25,6 +25,12 @@ import (
 // unknown, so database/sql must not retry the operation.
 var ErrDriverPanic = errors.New("interbase: driver operation panicked")
 
+// DriverPanicObserver receives the safe ErrDriverPanic diagnostic when
+// ResetSession recovers a panic and database/sql discards the connection.
+type DriverPanicObserver struct {
+	Notify func(error)
+}
+
 // TLSConfig contains the InterBase native client TLS attachment options.
 //
 // The native client expects these values in the attachment string. Enabled
@@ -111,9 +117,10 @@ type Config struct {
 	// ConnectTimeout bounds the native attachment handshake. Zero leaves the
 	// InterBase client default unchanged; positive values are rounded up to
 	// whole seconds because the native DPB stores an unsigned 32-bit count.
-	ConnectTimeout     time.Duration
-	TLS                TLSConfig
-	TransactionOptions TransactionOptions
+	ConnectTimeout      time.Duration
+	TLS                 TLSConfig
+	TransactionOptions  TransactionOptions
+	DriverPanicObserver *DriverPanicObserver
 }
 
 var (
@@ -154,6 +161,10 @@ func NewConnector(cfg Config) (driver.Connector, error) {
 	cfg.CatalogTextCharset = catalogTextCharset
 	cfg.ConnectTimeout = connectTimeout
 	cfg.TransactionOptions = transactionOptions
+	if cfg.DriverPanicObserver != nil {
+		observer := *cfg.DriverPanicObserver
+		cfg.DriverPanicObserver = &observer
+	}
 	return &connector{cfg: cfg}, nil
 }
 
@@ -454,10 +465,15 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		return nil, err
 	}
 
+	var resetPanicObserver func(error)
+	if c.cfg.DriverPanicObserver != nil {
+		resetPanicObserver = c.cfg.DriverPanicObserver.Notify
+	}
 	return &conn{
 		native:             native,
 		transactionOptions: c.cfg.TransactionOptions,
 		redactionSecrets:   configSecrets(c.cfg),
+		resetPanicObserver: resetPanicObserver,
 	}, nil
 }
 
@@ -753,7 +769,9 @@ type conn struct {
 	distributed  *DistributedTransaction
 	// activityPerItem is set once the combined activity response exceeded the
 	// native limit; guarded by mu.
-	activityPerItem bool
+	activityPerItem    bool
+	panicErr           error
+	resetPanicObserver func(error)
 	// directBeforeLock is a package-test seam for deterministic cancellation
 	// tests while a direct operation waits for the connection mutex.
 	directBeforeLock func()
@@ -798,6 +816,9 @@ func (c *conn) poisonLocked(cause error) *nativeConnection {
 	if cause == nil {
 		cause = errConnectionInvalidated
 	}
+	if errors.Is(cause, ErrDriverPanic) {
+		c.panicErr = cause
+	}
 	for result := range c.rows {
 		result.terminalErr = cause
 		result.closed = true
@@ -816,6 +837,28 @@ func (c *conn) poisonLocked(cause error) *nativeConnection {
 	native := c.native
 	c.native = nil
 	return native
+}
+
+func (c *conn) invalidConnectionErrorLocked() error {
+	if c.panicErr != nil {
+		return c.panicErr
+	}
+	return driver.ErrBadConn
+}
+
+func (c *conn) notifyResetSessionPanic(err error) {
+	c.mu.Lock()
+	observer := c.resetPanicObserver
+	c.mu.Unlock()
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			driverPanicError("reset session panic observer", recovered)
+		}
+	}()
+	observer(err)
 }
 
 func closeNativeAfterPanic(native *nativeConnection) {
@@ -1211,7 +1254,7 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driverStmt dri
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.native == nil || c.native.broken() {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -1313,7 +1356,7 @@ func (c *conn) BeginTx(ctx context.Context, options driver.TxOptions) (transacti
 		return nil, ErrDistributedParticipantManaged
 	}
 	if c.closed || c.native == nil || c.native.broken() {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(admission); err != nil {
 		return nil, err
@@ -1351,7 +1394,7 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.native == nil {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -1428,7 +1471,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	defer c.mu.Unlock()
 
 	if c.closed || c.native == nil {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -1531,7 +1574,14 @@ func (c *conn) IsValid() (valid bool) {
 // ResetSession rejects an invalid attachment so database/sql discards it
 // before another operation can reuse it from the pool.
 func (c *conn) ResetSession(ctx context.Context) (err error) {
-	defer c.recoverDriverPanic("reset session", &err)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := driverPanicError("reset session", recovered)
+			c.invalidateAfterPanic(panicErr)
+			err = driver.ErrBadConn
+			c.notifyResetSessionPanic(panicErr)
+		}
+	}()
 	if err := contextError(ctx); err != nil {
 		return err
 	}

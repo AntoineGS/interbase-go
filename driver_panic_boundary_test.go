@@ -9,6 +9,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -113,6 +114,76 @@ func TestDatabaseSQLDriverPanicFailsWithoutRetryAndReconnectsNextCall(t *testing
 	}
 }
 
+func TestResetSessionPanicReturnsBadConn(t *testing.T) {
+	native := &nativeConnection{brokenOverride: func() bool { panic("injected reset validation panic") }}
+	connection := panicBoundaryConn(native)
+	err := connection.ResetSession(context.Background())
+	if !errors.Is(err, driver.ErrBadConn) || errors.Is(err, ErrDriverPanic) {
+		t.Fatalf("ResetSession panic error=%v; want driver.ErrBadConn only", err)
+	}
+	if connection.IsValid() {
+		t.Fatal("ResetSession panic left the connection valid")
+	}
+}
+
+func TestNewConnectorCopiesDriverPanicObserver(t *testing.T) {
+	var originalCalls, replacementCalls atomic.Int32
+	observer := &DriverPanicObserver{Notify: func(error) { originalCalls.Add(1) }}
+	configured, err := NewConnector(Config{Database: "test.fdb", User: "SYSDBA", DriverPanicObserver: observer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer.Notify = func(error) { replacementCalls.Add(1) }
+	stored := configured.(*connector).cfg.DriverPanicObserver
+	if stored == observer {
+		t.Fatal("connector retained the caller-owned panic observer wrapper")
+	}
+	stored.Notify(ErrDriverPanic)
+	if originalCalls.Load() != 1 || replacementCalls.Load() != 0 {
+		t.Fatalf("observer calls original=%d replacement=%d; want 1 and 0", originalCalls.Load(), replacementCalls.Load())
+	}
+}
+
+func TestDatabaseSQLResetSessionPanicNotifiesAndRetriesOnFreshConnection(t *testing.T) {
+	observed := make(chan error, 1)
+	var resetValidationCalls atomic.Int32
+	connector := &panicBoundaryConnector{connect: func(opened int) *conn {
+		native := &nativeConnection{execOverride: func(string, []argument, bool) (int64, error) { return 1, nil }}
+		if opened == 1 {
+			native.brokenOverride = func() bool {
+				if resetValidationCalls.Add(1) == 2 {
+					panic("injected reset validation panic")
+				}
+				return false
+			}
+		}
+		connection := panicBoundaryConn(native)
+		connection.resetPanicObserver = func(err error) { observed <- err }
+		return connection
+	}}
+	db := sql.OpenDB(connector)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, err := db.ExecContext(context.Background(), "UPDATE T SET V = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(context.Background(), "UPDATE T SET V = 2"); err != nil {
+		t.Fatalf("database/sql did not safely retry on a fresh connection: %v", err)
+	}
+	if opened := connector.Opened(); opened != 2 {
+		t.Fatalf("connections opened=%d, want one fresh connection after reset panic", opened)
+	}
+	select {
+	case err := <-observed:
+		if !errors.Is(err, ErrDriverPanic) {
+			t.Fatalf("reset panic diagnostic=%v; want ErrDriverPanic", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ResetSession panic was not reported to the owning application session")
+	}
+}
+
 func TestDatabaseSQLPreparePanicIsNonRetryable(t *testing.T) {
 	connector := &panicBoundaryConnector{connect: func(int) *conn {
 		native := &nativeConnection{}
@@ -175,6 +246,9 @@ func TestPinnedDatabaseSQLConnReportsDriverPanicAndLogsCleanupPanic(t *testing.T
 	}
 	if opened := connector.Opened(); opened != 1 {
 		t.Fatalf("pinned execution opened %d connections; want exactly one", opened)
+	}
+	if _, nextErr := pinned.ExecContext(context.Background(), "UPDATE T SET V = 2"); !errors.Is(nextErr, ErrDriverPanic) || errors.Is(nextErr, driver.ErrBadConn) {
+		t.Fatalf("next pinned operation error=%v; want the recorded ErrDriverPanic", nextErr)
 	}
 	if err := pinned.Close(); err != nil {
 		t.Fatalf("close pinned connection: %v", err)
