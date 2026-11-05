@@ -638,6 +638,15 @@ static char *ib_convert_charset(const char *value, size_t length,
 			return NULL;
 		}
 	}
+	if (target_charset == IB_CHARSET_WIN1252) {
+		for (index = 0U; index < output_length; index++) {
+			if (ib_cp1252_byte_is_undefined((unsigned char) converted[index])) {
+				free(converted);
+				(void) ib_fail(error, "character data could not be converted");
+				return NULL;
+			}
+		}
+	}
 	*converted_length = output_length;
 	return converted;
 }
