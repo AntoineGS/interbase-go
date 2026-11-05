@@ -889,7 +889,7 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	blobReadLimit, boundedBlobs, err := blobReadLimitFromContext(ctx)
+	blobReadLimit, validateBlobUTF8, boundedBlobs, err := blobReadLimitFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -939,7 +939,7 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 		return nil, operationErr
 	}
 	if boundedBlobs {
-		nativeRows.setBlobReadLimit(blobReadLimit)
+		nativeRows.setBlobReadLimit(blobReadLimit, validateBlobUTF8)
 	}
 	result := &rows{
 		conn:                conn,
@@ -1310,7 +1310,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	blobReadLimit, boundedBlobs, err := blobReadLimitFromContext(ctx)
+	blobReadLimit, validateBlobUTF8, boundedBlobs, err := blobReadLimitFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1363,7 +1363,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 		return nil, operationErr
 	}
 	if boundedBlobs {
-		nativeRows.setBlobReadLimit(blobReadLimit)
+		nativeRows.setBlobReadLimit(blobReadLimit, validateBlobUTF8)
 	}
 	releaseNative()
 	result := &rows{

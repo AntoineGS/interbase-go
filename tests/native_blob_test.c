@@ -13,6 +13,7 @@ static int get_segment_calls;
 static int cancel_calls;
 static const unsigned char *controlled_payload;
 static size_t controlled_payload_length;
+static size_t controlled_segment_length;
 static int fail_segment;
 static int fail_open;
 static size_t blob_offset;
@@ -28,6 +29,7 @@ static short blob_gen_source_charset;
 static int blob_info_calls;
 static int blob_info_mode;
 static uint32_t blob_info_total_length;
+static short blob_lookup_charset = 3;
 
 static void *test_malloc(size_t size)
 {
@@ -157,6 +159,9 @@ ISC_STATUS ISC_EXPORT test_get_segment(ISC_STATUS *status, isc_blob_handle *blob
 	}
 	remaining = source_length - blob_offset;
 	chunk = remaining > (size_t) buffer_length ? (size_t) buffer_length : remaining;
+	if (controlled_segment_length > 0U && chunk > controlled_segment_length) {
+		chunk = controlled_segment_length;
+	}
 	if (controlled_payload != NULL) {
 		memcpy(buffer, controlled_payload + blob_offset, chunk);
 	} else {
@@ -201,7 +206,7 @@ ISC_STATUS ISC_EXPORT test_blob_lookup_desc2(ISC_STATUS *status,
 	lookup_desc_calls++;
 	memset(descriptor, 0, sizeof(*descriptor));
 	descriptor->blob_desc_subtype = 1;
-	descriptor->blob_desc_charset = 3;
+	descriptor->blob_desc_charset = blob_lookup_charset;
 	return status_result(status, 0);
 }
 
@@ -279,6 +284,8 @@ static void test_large_segment_materialization(void)
 	int is_utf8 = 0;
 	int64_t total_length = -1;
 	int truncated = 0;
+	int utf8_validated = 0;
+	int utf8_valid = 0;
 
 	memset(&connection, 0, sizeof(connection));
 	connection.database = &handle_token;
@@ -294,12 +301,14 @@ static void test_large_segment_materialization(void)
 	open_calls = 0;
 	close_calls = 0;
 	data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
-		&total_length, &truncated, &error);
+		&total_length, &truncated, &utf8_validated, &utf8_valid, &error);
 	check(data != NULL && error == NULL, "large segmented BLOB read failed");
 	check(open_calls == 1 && close_calls == 1, "large segmented BLOB handle lifecycle is wrong");
 	check(length == 90000U, "large segmented BLOB length changed");
 	check(total_length == -1 && truncated == 0,
 		"unbounded BLOB read unexpectedly requested preview metadata");
+	check(!utf8_validated && !utf8_valid,
+		"unbounded BLOB read unexpectedly validated preview UTF8");
 	int64_t opens, bytes;
 	ib_cursor_blob_read_stats(&cursor, &opens, &bytes);
 	check(opens == 1 && bytes == 90000, "materialization counters changed");
@@ -324,6 +333,8 @@ static void reset_controlled_blob(const unsigned char *payload, size_t length)
 	blob_gen_bpb2_calls = 0;
 	get_segment_calls = 0;
 	cancel_calls = 0;
+	controlled_segment_length = 0U;
+	blob_lookup_charset = 3;
 }
 
 static void check_bounded_blob_read(const char *name, const unsigned char *payload,
@@ -340,6 +351,8 @@ static void check_bounded_blob_read(const char *name, const unsigned char *paylo
 	int is_utf8 = 0;
 	int64_t total_length = -1;
 	int truncated = 0;
+	int utf8_validated = 0;
+	int utf8_valid = 0;
 	int64_t opens;
 	int64_t source_bytes;
 
@@ -357,14 +370,16 @@ static void check_bounded_blob_read(const char *name, const unsigned char *paylo
 	blob_info_total_length = reported_length;
 	blob_info_mode = 0;
 	blob_info_calls = 0;
-	ib_cursor_set_blob_read_limit(&cursor, limit);
+	ib_cursor_set_blob_read_limit(&cursor, limit, 0);
 	data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
-		&total_length, &truncated, &error);
+		&total_length, &truncated, &utf8_validated, &utf8_valid, &error);
 	check_case(data != NULL && error == NULL, name, "bounded BLOB read failed");
 	check_case(length == expected_read, name, "retained read length changed");
 	check_case(length <= limit + 1U, name, "read exceeded prefix plus one-byte detection limit");
 	check_case(total_length == (int64_t) reported_length, name, "reported full BLOB length changed");
 	check_case(truncated == expected_truncated, name, "truncation flag changed");
+	check_case(!utf8_validated && !utf8_valid, name,
+		"disabled UTF8 validation returned a result");
 	check_case(blob_info_calls == 1, name, "bounded read did not request BLOB total length exactly once");
 	check_case(get_segment_calls == (int) expected_segment_calls, name, "segment read count changed");
 	ib_cursor_blob_read_stats(&cursor, &opens, &source_bytes);
@@ -395,6 +410,143 @@ static void test_bounded_blob_read_limits(void)
 		UINT32_C(0x80000001), 5U, 1U, 1);
 }
 
+static void check_inferred_text_utf8_validation(const char *name,
+	const unsigned char *payload, size_t payload_length, size_t limit,
+	size_t segment_limit, int expected_valid)
+{
+	ib_connection connection;
+	ib_cursor cursor;
+	XSQLVAR variable;
+	ISC_QUAD blob_id = {0};
+	char *data;
+	char *error = NULL;
+	size_t length = 0U;
+	int is_utf8 = 0;
+	int64_t total_length = -1;
+	int truncated = 0;
+	int utf8_validated = 0;
+	int utf8_valid = 0;
+	int64_t opens;
+	int64_t source_bytes;
+	size_t retained = payload_length < limit + 1U ? payload_length : limit + 1U;
+
+	memset(&connection, 0, sizeof(connection));
+	connection.database = &handle_token;
+	connection.dialect = SQL_DIALECT_V5;
+	memset(&cursor, 0, sizeof(cursor));
+	cursor.connection = &connection;
+	cursor.transaction = &handle_token;
+	memset(&variable, 0, sizeof(variable));
+	variable.sqltype = SQL_BLOB | 1;
+	variable.sqlsubtype = 1;
+	variable.sqldata = (char *) &blob_id;
+	memcpy(variable.relname, "T", 1U);
+	variable.relname_length = 1;
+	memcpy(variable.sqlname, "BODY", 4U);
+	variable.sqlname_length = 4;
+	reset_controlled_blob(payload, payload_length);
+	blob_lookup_charset = 0;
+	controlled_segment_length = segment_limit;
+	blob_info_total_length = (uint32_t) payload_length;
+	blob_info_mode = 0;
+	ib_cursor_set_blob_read_limit(&cursor, limit, 1);
+	data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
+		&total_length, &truncated, &utf8_validated, &utf8_valid, &error);
+	check_case(data != NULL && error == NULL, name, "validated BLOB read failed");
+	check_case(length == retained && length <= limit + 1U, name,
+		"UTF8 scan retained more than the bounded prefix plus one byte");
+	check_case(utf8_validated && utf8_valid == expected_valid, name,
+		"whole-value UTF8 validity result changed");
+	check_case(total_length == (int64_t) payload_length &&
+		truncated == (payload_length > limit), name,
+		"validated BLOB length/truncation metadata changed");
+	for (size_t index = 0U; index < length; index++) {
+		check_case((unsigned char) data[index] == payload[index], name,
+			"validated BLOB prefix bytes changed");
+	}
+	ib_cursor_blob_read_stats(&cursor, &opens, &source_bytes);
+	check_case(opens == 1 && source_bytes == (int64_t) payload_length, name,
+		"UTF8 scan did not stream all bytes without retaining them");
+	free(data);
+	ib_error_free(error);
+}
+
+static void test_bounded_inferred_text_blob_utf8_validation(void)
+{
+	static const unsigned char invalid_after_valid_prefix[] = {
+		'a', 0xc3, 0xa9, 'x', 0xff, 'z'
+	};
+	static const unsigned char split_utf8_sequence[] = {
+		'a', 0xe2, 0x82, 0xac, 'z'
+	};
+	check_inferred_text_utf8_validation("invalid byte after valid retained prefix",
+		invalid_after_valid_prefix, sizeof(invalid_after_valid_prefix), 3U, 2U, 0);
+	check_inferred_text_utf8_validation("UTF8 rune split across native segments and cap",
+		split_utf8_sequence, sizeof(split_utf8_sequence), 1U, 2U, 1);
+}
+
+static void test_bounded_blob_validation_skips_declared_and_binary_values(void)
+{
+	static const unsigned char payload[] = {'a', 0xc3, 0xa9, 'x', 0xff, 'z'};
+	static const struct {
+		const char *name;
+		short subtype;
+		short charset;
+	} cases[] = {
+		{"declared-charset text BLOB", 1, 3},
+		{"binary BLOB", 0, 0},
+	};
+	for (size_t index = 0U; index < sizeof(cases) / sizeof(cases[0]); index++) {
+		ib_connection connection;
+		ib_cursor cursor;
+		XSQLVAR variable;
+		ISC_QUAD blob_id = {0};
+		char *data;
+		char *error = NULL;
+		size_t length = 0U;
+		int is_utf8 = 0;
+		int64_t total_length = -1;
+		int truncated = 0;
+		int utf8_validated = 0;
+		int utf8_valid = 0;
+		int64_t opens;
+		int64_t source_bytes;
+
+		memset(&connection, 0, sizeof(connection));
+		connection.database = &handle_token;
+		connection.dialect = SQL_DIALECT_V5;
+		memset(&cursor, 0, sizeof(cursor));
+		cursor.connection = &connection;
+		cursor.transaction = &handle_token;
+		memset(&variable, 0, sizeof(variable));
+		variable.sqltype = SQL_BLOB | 1;
+		variable.sqlsubtype = cases[index].subtype;
+		variable.sqldata = (char *) &blob_id;
+		memcpy(variable.relname, "T", 1U);
+		variable.relname_length = 1;
+		memcpy(variable.sqlname, "BODY", 4U);
+		variable.sqlname_length = 4;
+		reset_controlled_blob(payload, sizeof(payload));
+		blob_lookup_charset = cases[index].charset;
+		blob_info_total_length = (uint32_t) sizeof(payload);
+		blob_info_mode = 0;
+		ib_cursor_set_blob_read_limit(&cursor, 3U, 1);
+		data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
+			&total_length, &truncated, &utf8_validated, &utf8_valid, &error);
+		check_case(data != NULL && error == NULL, cases[index].name,
+			"bounded BLOB read failed");
+		check_case(!utf8_validated && !utf8_valid, cases[index].name,
+			"opt-in UTF8 validation included an ineligible BLOB");
+		check_case(length == 4U && length <= 4U, cases[index].name,
+			"ineligible BLOB exceeded the retained prefix bound");
+		ib_cursor_blob_read_stats(&cursor, &opens, &source_bytes);
+		check_case(opens == 1 && source_bytes == 4, cases[index].name,
+			"ineligible BLOB was streamed beyond the bounded prefix");
+		free(data);
+		ib_error_free(error);
+	}
+}
+
 static void test_bounded_null_blob_skips_native_read(void)
 {
 	ib_connection connection;
@@ -419,7 +571,7 @@ static void test_bounded_null_blob_skips_native_read(void)
 	output->sqlvar[0].sqldata = (char *) &blob_id;
 	output->sqlvar[0].sqlind = &indicator;
 	cursor.output = output;
-	ib_cursor_set_blob_read_limit(&cursor, 4U);
+	ib_cursor_set_blob_read_limit(&cursor, 4U, 0);
 	reset_controlled_blob(NULL, 0U);
 	blob_info_calls = 0;
 	check(ib_cursor_column(&cursor, 0U, &view, &error) == 0 && error == NULL,
@@ -454,6 +606,8 @@ static void test_bounded_blob_info_rejects_malformed_responses(void)
 		int is_utf8 = 0;
 		int64_t total_length = -1;
 		int truncated = 0;
+		int utf8_validated = 0;
+		int utf8_valid = 0;
 		memset(&connection, 0, sizeof(connection));
 		connection.database = &handle_token;
 		memset(&cursor, 0, sizeof(cursor));
@@ -466,9 +620,9 @@ static void test_bounded_blob_info_rejects_malformed_responses(void)
 		blob_info_total_length = 1U;
 		blob_info_mode = cases[index].mode;
 		blob_info_calls = 0;
-		ib_cursor_set_blob_read_limit(&cursor, 1U);
+		ib_cursor_set_blob_read_limit(&cursor, 1U, 0);
 		data = ib_read_blob(&cursor, &variable, &length, &is_utf8,
-			&total_length, &truncated, &error);
+			&total_length, &truncated, &utf8_validated, &utf8_valid, &error);
 		check_case(data == NULL && error != NULL, cases[index].name,
 			"malformed BLOB-info response was accepted");
 		check_case(blob_info_calls == 1 && get_segment_calls == 0,
@@ -1518,6 +1672,8 @@ int main(void)
 	test_cleanup_failure_without_message();
 	test_large_segment_materialization();
 	test_bounded_blob_read_limits();
+	test_bounded_inferred_text_blob_utf8_validation();
+	test_bounded_blob_validation_skips_declared_and_binary_values();
 	test_bounded_null_blob_skips_native_read();
 	test_bounded_blob_info_rejects_malformed_responses();
 	test_catalog_text_uses_configured_source_not_attachment();

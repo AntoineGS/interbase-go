@@ -2532,14 +2532,18 @@ func (c *nativeCursor) value(index int) (driver.Value, error) {
 		}
 		text := view.blob_text != 0
 		isUTF8 := view.blob_utf8 != 0
+		utf8Validated := view.blob_utf8_validated != 0
+		utf8Valid := view.blob_utf8_valid != 0
 		prefix = safeBlobPreviewPrefix(prefix, text, isUTF8)
 		truncated := view.blob_truncated != 0 || int64(view.blob_total_length) > int64(c.blobReadLimit)
 		return encodeBlobPreview(BlobPreview{
-			Prefix:      prefix,
-			TotalLength: int64(view.blob_total_length),
-			Truncated:   truncated,
-			Text:        text,
-			UTF8:        isUTF8,
+			Prefix:        prefix,
+			TotalLength:   int64(view.blob_total_length),
+			Truncated:     truncated,
+			Text:          text,
+			UTF8:          isUTF8,
+			UTF8Validated: utf8Validated,
+			UTF8Valid:     utf8Valid,
 		}), nil
 	}
 
@@ -2564,7 +2568,7 @@ func (c *nativeCursor) value(index int) (driver.Value, error) {
 	return value, nil
 }
 
-func (c *nativeCursor) setBlobReadLimit(maxPrefixBytes int) {
+func (c *nativeCursor) setBlobReadLimit(maxPrefixBytes int, validateUTF8 bool) {
 	if c == nil {
 		return
 	}
@@ -2575,7 +2579,11 @@ func (c *nativeCursor) setBlobReadLimit(maxPrefixBytes int) {
 	}
 	release := nativegate.Global.Enter()
 	defer release()
-	C.ib_cursor_set_blob_read_limit(c.ptr, C.size_t(maxPrefixBytes))
+	validate := C.int(0)
+	if validateUTF8 {
+		validate = 1
+	}
+	C.ib_cursor_set_blob_read_limit(c.ptr, C.size_t(maxPrefixBytes), validate)
 }
 
 func (c *nativeCursor) fingerprintValue(index int) (any, error) {

@@ -224,6 +224,7 @@ struct ib_cursor {
 	int fetched;
 	int allow_arrays;
 	int blob_read_limit_enabled;
+	int blob_utf8_validation_enabled;
 	size_t blob_read_limit;
 	char *query;
 	size_t query_length;
@@ -9986,9 +9987,91 @@ static short ib_catalog_text_override(const ib_cursor *cursor,
 	return 0;
 }
 
+typedef struct ib_utf8_validator {
+	unsigned char remaining;
+	unsigned char continuation_min;
+	unsigned char continuation_max;
+	int valid;
+} ib_utf8_validator;
+
+static void ib_utf8_validator_init(ib_utf8_validator *validator)
+{
+	memset(validator, 0, sizeof(*validator));
+	validator->valid = 1;
+}
+
+static void ib_utf8_validator_feed(ib_utf8_validator *validator,
+	const char *data, size_t length)
+{
+	size_t index;
+
+	if (validator == NULL || data == NULL || !validator->valid) {
+		return;
+	}
+	for (index = 0U; index < length; index++) {
+		unsigned char byte = (unsigned char) data[index];
+		if (validator->remaining > 0U) {
+			if (byte < validator->continuation_min ||
+				byte > validator->continuation_max) {
+				validator->valid = 0;
+				validator->remaining = 0U;
+				return;
+			}
+			validator->remaining--;
+			validator->continuation_min = 0x80U;
+			validator->continuation_max = 0xbfU;
+			continue;
+		}
+		if (byte < 0x80U) {
+			continue;
+		}
+		if (byte >= 0xc2U && byte <= 0xdfU) {
+			validator->remaining = 1U;
+			validator->continuation_min = 0x80U;
+			validator->continuation_max = 0xbfU;
+		} else if (byte == 0xe0U) {
+			validator->remaining = 2U;
+			validator->continuation_min = 0xa0U;
+			validator->continuation_max = 0xbfU;
+		} else if (byte >= 0xe1U && byte <= 0xecU) {
+			validator->remaining = 2U;
+			validator->continuation_min = 0x80U;
+			validator->continuation_max = 0xbfU;
+		} else if (byte == 0xedU) {
+			validator->remaining = 2U;
+			validator->continuation_min = 0x80U;
+			validator->continuation_max = 0x9fU;
+		} else if (byte >= 0xeeU && byte <= 0xefU) {
+			validator->remaining = 2U;
+			validator->continuation_min = 0x80U;
+			validator->continuation_max = 0xbfU;
+		} else if (byte == 0xf0U) {
+			validator->remaining = 3U;
+			validator->continuation_min = 0x90U;
+			validator->continuation_max = 0xbfU;
+		} else if (byte >= 0xf1U && byte <= 0xf3U) {
+			validator->remaining = 3U;
+			validator->continuation_min = 0x80U;
+			validator->continuation_max = 0xbfU;
+		} else if (byte == 0xf4U) {
+			validator->remaining = 3U;
+			validator->continuation_min = 0x80U;
+			validator->continuation_max = 0x8fU;
+		} else {
+			validator->valid = 0;
+			return;
+		}
+	}
+}
+
+static int ib_utf8_validator_finish(const ib_utf8_validator *validator)
+{
+	return validator != NULL && validator->valid && validator->remaining == 0U;
+}
+
 static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	size_t *length, int *is_utf8, int64_t *total_length, int *truncated,
-	char **error)
+	int *utf8_validated, int *whole_value_utf8_valid, char **error)
 {
 	ISC_STATUS status[IB_STATUS_VECTOR_LENGTH];
 	ISC_STATUS result;
@@ -10008,50 +10091,63 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	int use_bpb;
 	short override_charset;
 	int bounded;
+	int validate_utf8;
 	size_t max_read_length;
+	ib_utf8_validator utf8_validator;
 
 	if (length == NULL || cursor == NULL || cursor->connection == NULL ||
 		cursor->connection->database == NULL || cursor->transaction == NULL ||
 		variable == NULL || variable->sqldata == NULL || is_utf8 == NULL ||
-		total_length == NULL || truncated == NULL) {
+		total_length == NULL || truncated == NULL || utf8_validated == NULL ||
+		whole_value_utf8_valid == NULL) {
 		(void) ib_fail(error, "BLOB result storage is unavailable");
 		return NULL;
 	}
 	bounded = cursor->blob_read_limit_enabled;
 	max_read_length = bounded ? cursor->blob_read_limit + 1U : SIZE_MAX;
+	validate_utf8 = 0;
 	*total_length = -1;
 	*truncated = 0;
+	*utf8_validated = 0;
+	*whole_value_utf8_valid = 0;
 	memcpy(&blob_id, variable->sqldata, sizeof(blob_id));
 	*is_utf8 = 0;
 	override_charset = ib_catalog_text_override(cursor, variable);
 	bpb_length = 0U;
 	use_bpb = 0;
-	if (override_charset == 0 && variable->sqlsubtype == 1 &&
-		variable->sqlname_length > 0 &&
-		variable->relname_length > 0) {
+	if (override_charset == 0 && variable->sqlsubtype == 1) {
 		short known_charset;
 
-		if (ib_cursor_known_blob_charset(cursor, variable, &known_charset)) {
-			ib_blob_descriptor(&source_descriptor, 1, known_charset);
-		} else if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
-			error) != 0) {
-			return NULL;
-		}
-		if (source_descriptor.blob_desc_charset != 0 &&
-			source_descriptor.blob_desc_charset != 1) {
-			ib_blob_descriptor(&target_descriptor, 1, IB_CHARSET_UTF8);
-			memset(status, 0, sizeof(status));
-			/* Read through the column's charset and expose UTF-8 to Go. */
-			result = isc_blob_gen_bpb2(status, &target_descriptor,
-				&source_descriptor, (unsigned short) sizeof(bpb), bpb,
-				&bpb_length);
-			if (result != 0) {
-				(void) ib_fail_status(error, "generate output BLOB parameter block",
-					status);
+		/* Only NONE attachments use the UTF8/CP1252 detector. When a source
+		 * column's charset is known, validate only NONE; converted charsets and
+		 * OCTETS retain their existing bounded-read behavior. */
+		validate_utf8 = bounded && cursor->blob_utf8_validation_enabled &&
+			cursor->connection != NULL && cursor->connection->charset == 0;
+		if (variable->sqlname_length > 0 && variable->relname_length > 0) {
+			if (ib_cursor_known_blob_charset(cursor, variable, &known_charset)) {
+				ib_blob_descriptor(&source_descriptor, 1, known_charset);
+			} else if (ib_blob_lookup_descriptor(cursor, variable, &source_descriptor,
+				error) != 0) {
 				return NULL;
 			}
-			use_bpb = 1;
-			*is_utf8 = 1;
+			validate_utf8 = validate_utf8 &&
+				source_descriptor.blob_desc_charset == 0;
+			if (source_descriptor.blob_desc_charset != 0 &&
+				source_descriptor.blob_desc_charset != 1) {
+				ib_blob_descriptor(&target_descriptor, 1, IB_CHARSET_UTF8);
+				memset(status, 0, sizeof(status));
+				/* Read through the column's charset and expose UTF-8 to Go. */
+				result = isc_blob_gen_bpb2(status, &target_descriptor,
+					&source_descriptor, (unsigned short) sizeof(bpb), bpb,
+					&bpb_length);
+				if (result != 0) {
+					(void) ib_fail_status(error, "generate output BLOB parameter",
+						status);
+					return NULL;
+				}
+				use_bpb = 1;
+				*is_utf8 = 1;
+			}
 		}
 	}
 	blob = NULL;
@@ -10080,17 +10176,22 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	data = NULL;
 	data_length = 0U;
 	capacity = 0U;
+	if (validate_utf8) {
+		ib_utf8_validator_init(&utf8_validator);
+	}
 	cursor->blob_opens++;
 	for (;;) {
 		unsigned short segment_length;
 		size_t segment_capacity;
+		size_t retained_length;
 
 		segment_capacity = sizeof(segment);
 		if (bounded) {
-			if (data_length >= max_read_length) {
+			if (data_length >= max_read_length && !validate_utf8) {
 				break;
 			}
-			if (max_read_length - data_length < segment_capacity) {
+			if (data_length < max_read_length &&
+				max_read_length - data_length < segment_capacity) {
 				segment_capacity = max_read_length - data_length;
 			}
 		}
@@ -10116,9 +10217,21 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 			return NULL;
 		}
 		cursor->source_bytes += (int64_t) segment_length;
+		if (validate_utf8) {
+			ib_utf8_validator_feed(&utf8_validator, segment,
+				(size_t) segment_length);
+		}
+		retained_length = (size_t) segment_length;
+		if (bounded) {
+			if (data_length >= max_read_length) {
+				retained_length = 0U;
+			} else if (retained_length > max_read_length - data_length) {
+				retained_length = max_read_length - data_length;
+			}
+		}
 		first_error = NULL;
-		if (ib_append_blob_data(&data, &data_length, &capacity, segment,
-			(size_t) segment_length, &first_error) != 0) {
+		if (retained_length > 0U && ib_append_blob_data(&data, &data_length,
+			&capacity, segment, retained_length, &first_error) != 0) {
 			cleanup_error = NULL;
 			cleanup_failed = ib_blob_cleanup(&blob, 1, &cleanup_error);
 			if (cleanup_failed != 0) {
@@ -10129,9 +10242,13 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 			ib_give_error(error, first_error);
 			return NULL;
 		}
-		if (bounded && data_length >= max_read_length) {
+		if (bounded && data_length >= max_read_length && !validate_utf8) {
 			break;
 		}
+	}
+	if (validate_utf8) {
+		*utf8_validated = 1;
+		*whole_value_utf8_valid = ib_utf8_validator_finish(&utf8_validator);
 	}
 	if (bounded) {
 		*truncated = data_length > cursor->blob_read_limit;
@@ -10187,13 +10304,15 @@ static char *ib_read_blob(ib_cursor *cursor, const XSQLVAR *variable,
 	return data;
 }
 
-void ib_cursor_set_blob_read_limit(ib_cursor *cursor, size_t max_prefix_bytes)
+void ib_cursor_set_blob_read_limit(ib_cursor *cursor, size_t max_prefix_bytes,
+	int validate_utf8)
 {
 	if (cursor == NULL || max_prefix_bytes >= (size_t) IB_MAX_BLOB_BUFFER) {
 		return;
 	}
 	cursor->blob_read_limit = max_prefix_bytes;
 	cursor->blob_read_limit_enabled = 1;
+	cursor->blob_utf8_validation_enabled = validate_utf8 != 0;
 }
 
 void ib_cursor_blob_read_stats(const ib_cursor *cursor, int64_t *opens,
@@ -10351,13 +10470,16 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 		int blob_is_utf8;
 		int64_t blob_total_length;
 		int blob_truncated;
+		int blob_utf8_validated;
+		int blob_utf8_valid;
 
 		if (cursor->allow_arrays) {
 			return ib_cursor_blob_ref((ib_cursor *) cursor, variable, view, error);
 		}
 
 		blob_data = ib_read_blob((ib_cursor *) cursor, variable, &blob_length,
-			&blob_is_utf8, &blob_total_length, &blob_truncated, error);
+			&blob_is_utf8, &blob_total_length, &blob_truncated,
+			&blob_utf8_validated, &blob_utf8_valid, error);
 		if (blob_data == NULL) {
 			return -1;
 		}
@@ -10388,6 +10510,8 @@ int ib_cursor_column(const ib_cursor *cursor, size_t index,
 				(cursor->connection != NULL &&
 					cursor->connection->charset == IB_CHARSET_UTF8 &&
 					variable->sqlsubtype == 1);
+			view->blob_utf8_validated = blob_utf8_validated;
+			view->blob_utf8_valid = blob_utf8_valid;
 			return 0;
 		}
 		view->kind = variable->sqlsubtype == 1 ? IB_VALUE_STRING : IB_VALUE_BYTES;
