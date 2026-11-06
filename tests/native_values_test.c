@@ -844,6 +844,95 @@ static void test_charset_conversion_handles_a_multibyte_chunk_boundary(void)
 	ib_error_free(error);
 }
 
+static void test_win1252_conversion_rejects_undefined_bytes(void)
+{
+	static const unsigned char undefined_bytes[] = {
+		0x81U, 0x8dU, 0x8fU, 0x90U, 0x9dU
+	};
+	static const struct {
+		const char *text;
+		size_t length;
+	} unrepresentable[] = {
+		{"\xc5\x81", 2U}, /* U+0141 LATIN CAPITAL LETTER L WITH STROKE. */
+		{"\xf0\x9f\x98\x80", 4U} /* U+1F600 GRINNING FACE. */
+	};
+	static const struct {
+		const char *text;
+		size_t length;
+		unsigned int codepoint;
+	} undefined_controls[] = {
+		{"\xc2\x81", 2U, 0x0081U}, {"\xc2\x8d", 2U, 0x008dU},
+		{"\xc2\x8f", 2U, 0x008fU}, {"\xc2\x90", 2U, 0x0090U},
+		{"\xc2\x9d", 2U, 0x009dU}
+	};
+	static const char euro_utf8[] = "\xe2\x82\xac";
+	size_t converted_length;
+	char *converted;
+	char *error;
+	size_t index;
+	size_t undefined_control_failures;
+
+	for (index = 0U; index < sizeof(undefined_bytes) / sizeof(undefined_bytes[0]); index++) {
+		char byte = (char) undefined_bytes[index];
+
+		error = NULL;
+		converted_length = 99U;
+		converted = ib_convert_to_utf8(&byte, 1U, IB_CHARSET_WIN1252,
+			&converted_length, &error);
+		require_condition(converted == NULL && error != NULL && converted_length == 0U,
+			"undefined WIN1252 byte was not rejected without producing output");
+		ib_error_free(error);
+	}
+
+	error = NULL;
+	converted = ib_convert_to_utf8("\x80", 1U, IB_CHARSET_WIN1252,
+		&converted_length, &error);
+	require_condition(converted != NULL && error == NULL &&
+		converted_length == sizeof(euro_utf8) - 1U &&
+		memcmp(converted, euro_utf8, sizeof(euro_utf8) - 1U) == 0,
+		"valid WIN1252 euro byte did not convert to UTF8");
+	free(converted);
+
+	error = NULL;
+	converted = ib_convert_utf8(euro_utf8, sizeof(euro_utf8) - 1U,
+		IB_CHARSET_WIN1252, &converted_length, &error);
+	require_condition(converted != NULL && error == NULL && converted_length == 1U &&
+		(unsigned char) converted[0] == 0x80U,
+		"valid UTF8 euro did not convert to the WIN1252 byte");
+	free(converted);
+
+	undefined_control_failures = 0U;
+	for (index = 0U; index < sizeof(undefined_controls) / sizeof(undefined_controls[0]); index++) {
+		error = NULL;
+		converted_length = 99U;
+		converted = ib_convert_utf8(undefined_controls[index].text,
+			undefined_controls[index].length, IB_CHARSET_WIN1252,
+			&converted_length, &error);
+		if (converted != NULL || error == NULL || converted_length != 0U ||
+			strcmp(error, "character data could not be converted") != 0) {
+			(void) fprintf(stderr,
+				"native values test failed: UTF8 U+%04X did not return the fixed WIN1252 conversion error\n",
+				undefined_controls[index].codepoint);
+			undefined_control_failures++;
+		}
+		free(converted);
+		ib_error_free(error);
+	}
+	require_condition(undefined_control_failures == 0U,
+		"WIN1252 conversion accepted or misreported an undefined C1 control");
+
+	for (index = 0U; index < sizeof(unrepresentable) / sizeof(unrepresentable[0]); index++) {
+		error = NULL;
+		converted_length = 99U;
+		converted = ib_convert_utf8(unrepresentable[index].text,
+			unrepresentable[index].length, IB_CHARSET_WIN1252,
+			&converted_length, &error);
+		require_condition(converted == NULL && error != NULL && converted_length == 0U,
+			"unrepresentable UTF8 text was not rejected by WIN1252 conversion");
+		ib_error_free(error);
+	}
+}
+
 static void test_configured_charset_conversion(void)
 {
 	static const char utf8[] = "\xc4\x9b\xc5\xa1\xc4\x8d";
@@ -1628,6 +1717,7 @@ int main(void)
 	test_text_binding_converts_to_described_charset();
 	test_binding_converts_to_described_charset_capacity();
 	test_charset_conversion_handles_a_multibyte_chunk_boundary();
+	test_win1252_conversion_rejects_undefined_bytes();
 	test_configured_charset_conversion();
 	test_supported_charset_names();
 	test_output_nullability();

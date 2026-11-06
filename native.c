@@ -459,6 +459,12 @@ static const char *ib_charset_name(short charset)
 static int ib_append_conversion_data(char **data, size_t *length,
 	size_t *capacity, const char *source, size_t source_length, char **error);
 
+static int ib_cp1252_byte_is_undefined(unsigned char value)
+{
+	return value == 0x81U || value == 0x8dU || value == 0x8fU ||
+		value == 0x90U || value == 0x9dU;
+}
+
 static char *ib_convert_charset(const char *value, size_t length,
 	short source_charset, short target_charset, size_t *converted_length,
 	char **error)
@@ -480,6 +486,7 @@ static char *ib_convert_charset(const char *value, size_t length,
 	size_t output_length;
 	size_t output_left;
 	size_t copied;
+	size_t index;
 	size_t result;
 	int conversion_error;
 
@@ -505,6 +512,14 @@ static char *ib_convert_charset(const char *value, size_t length,
 		}
 		*converted_length = length;
 		return converted;
+	}
+	if (source_charset == IB_CHARSET_WIN1252) {
+		for (index = 0U; index < length; index++) {
+			if (ib_cp1252_byte_is_undefined((unsigned char) value[index])) {
+				(void) ib_fail(error, "character data could not be converted");
+				return NULL;
+			}
+		}
 	}
 	source_encoding = ib_charset_encoding(source_charset);
 	target_encoding = ib_charset_encoding(target_charset);
@@ -621,6 +636,15 @@ static char *ib_convert_charset(const char *value, size_t length,
 		if (converted == NULL) {
 			(void) ib_fail(error, "out of memory converting character data");
 			return NULL;
+		}
+	}
+	if (target_charset == IB_CHARSET_WIN1252) {
+		for (index = 0U; index < output_length; index++) {
+			if (ib_cp1252_byte_is_undefined((unsigned char) converted[index])) {
+				free(converted);
+				(void) ib_fail(error, "character data could not be converted");
+				return NULL;
+			}
 		}
 	}
 	*converted_length = output_length;
