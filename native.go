@@ -159,16 +159,17 @@ func enterNativeContext(ctx context.Context) (func(), error) {
 }
 
 const (
-	nativeValueNull      = 0
-	nativeValueString    = 1
-	nativeValueInt64     = 2
-	nativeValueFloat64   = 3
-	nativeValueBool      = 4
-	nativeValueTimestamp = 5
-	nativeValueScaledInt = 6
-	nativeValueBytes     = 7
-	nativeValueArray     = 8
-	nativeValueBlobRef   = 9
+	nativeValueNull        = 0
+	nativeValueString      = 1
+	nativeValueInt64       = 2
+	nativeValueFloat64     = 3
+	nativeValueBool        = 4
+	nativeValueTimestamp   = 5
+	nativeValueScaledInt   = 6
+	nativeValueBytes       = 7
+	nativeValueArray       = 8
+	nativeValueBlobRef     = 9
+	nativeValueBlobPreview = 10
 )
 
 type nativeHandleState uint8
@@ -832,6 +833,8 @@ type nativeCursor struct {
 	statement                *nativeStatement
 	explicitTransaction      bool
 	directTransaction        *Transaction
+	blobReadLimit            int
+	blobReadLimitEnabled     bool
 	metadata                 []columnMetadata
 }
 
@@ -2516,6 +2519,33 @@ func (c *nativeCursor) value(index int) (driver.Value, error) {
 	if result := C.ib_cursor_column(c.ptr, C.size_t(index), &view, &errorPointer); result != 0 {
 		return nil, takeNativeError(errorPointer)
 	}
+	if int(view.kind) == nativeValueBlobPreview {
+		if !c.blobReadLimitEnabled {
+			return nil, errors.New("native BLOB preview has no query read limit")
+		}
+		if uint64(view.length) > uint64(math.MaxInt32) {
+			return nil, errors.New("BLOB preview prefix is too long")
+		}
+		prefix := C.GoBytes(unsafe.Pointer(view.bytes), C.int(view.length))
+		if len(prefix) > c.blobReadLimit {
+			prefix = prefix[:c.blobReadLimit]
+		}
+		text := view.blob_text != 0
+		isUTF8 := view.blob_utf8 != 0
+		utf8Validated := view.blob_utf8_validated != 0
+		utf8Valid := view.blob_utf8_valid != 0
+		prefix = safeBlobPreviewPrefix(prefix, text, isUTF8)
+		truncated := view.blob_truncated != 0 || int64(view.blob_total_length) > int64(c.blobReadLimit)
+		return encodeBlobPreview(BlobPreview{
+			Prefix:        prefix,
+			TotalLength:   int64(view.blob_total_length),
+			Truncated:     truncated,
+			Text:          text,
+			UTF8:          isUTF8,
+			UTF8Validated: utf8Validated,
+			UTF8Valid:     utf8Valid,
+		}), nil
+	}
 
 	value, err := nativeValueView(&view)
 	if err != nil {
@@ -2536,6 +2566,24 @@ func (c *nativeCursor) value(index int) (driver.Value, error) {
 		}, nil
 	}
 	return value, nil
+}
+
+func (c *nativeCursor) setBlobReadLimit(maxPrefixBytes int, validateUTF8 bool) {
+	if c == nil {
+		return
+	}
+	c.blobReadLimit = maxPrefixBytes
+	c.blobReadLimitEnabled = true
+	if c.ptr == nil {
+		return
+	}
+	release := nativegate.Global.Enter()
+	defer release()
+	validate := C.int(0)
+	if validateUTF8 {
+		validate = 1
+	}
+	C.ib_cursor_set_blob_read_limit(c.ptr, C.size_t(maxPrefixBytes), validate)
 }
 
 func (c *nativeCursor) fingerprintValue(index int) (any, error) {
