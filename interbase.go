@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"reflect"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,6 +19,17 @@ import (
 
 	"interbase-go/txcontext"
 )
+
+// ErrDriverPanic identifies a panic recovered at the database/sql driver
+// boundary. It is deliberately not driver.ErrBadConn: the outcome may be
+// unknown, so database/sql must not retry the operation.
+var ErrDriverPanic = errors.New("interbase: driver operation panicked")
+
+// DriverPanicObserver receives the safe ErrDriverPanic diagnostic when
+// ResetSession recovers a panic and database/sql discards the connection.
+type DriverPanicObserver struct {
+	Notify func(error)
+}
 
 // TLSConfig contains the InterBase native client TLS attachment options.
 //
@@ -104,9 +117,10 @@ type Config struct {
 	// ConnectTimeout bounds the native attachment handshake. Zero leaves the
 	// InterBase client default unchanged; positive values are rounded up to
 	// whole seconds because the native DPB stores an unsigned 32-bit count.
-	ConnectTimeout     time.Duration
-	TLS                TLSConfig
-	TransactionOptions TransactionOptions
+	ConnectTimeout      time.Duration
+	TLS                 TLSConfig
+	TransactionOptions  TransactionOptions
+	DriverPanicObserver *DriverPanicObserver
 }
 
 var (
@@ -147,6 +161,10 @@ func NewConnector(cfg Config) (driver.Connector, error) {
 	cfg.CatalogTextCharset = catalogTextCharset
 	cfg.ConnectTimeout = connectTimeout
 	cfg.TransactionOptions = transactionOptions
+	if cfg.DriverPanicObserver != nil {
+		observer := *cfg.DriverPanicObserver
+		cfg.DriverPanicObserver = &observer
+	}
 	return &connector{cfg: cfg}, nil
 }
 
@@ -447,10 +465,15 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		return nil, err
 	}
 
+	var resetPanicObserver func(error)
+	if c.cfg.DriverPanicObserver != nil {
+		resetPanicObserver = c.cfg.DriverPanicObserver.Notify
+	}
 	return &conn{
 		native:             native,
 		transactionOptions: c.cfg.TransactionOptions,
 		redactionSecrets:   configSecrets(c.cfg),
+		resetPanicObserver: resetPanicObserver,
 	}, nil
 }
 
@@ -746,10 +769,105 @@ type conn struct {
 	distributed  *DistributedTransaction
 	// activityPerItem is set once the combined activity response exceeded the
 	// native limit; guarded by mu.
-	activityPerItem bool
+	activityPerItem    bool
+	panicErr           error
+	resetPanicObserver func(error)
 	// directBeforeLock is a package-test seam for deterministic cancellation
 	// tests while a direct operation waits for the connection mutex.
 	directBeforeLock func()
+}
+
+func driverPanicError(operation string, recovered any) error {
+	log.Printf("interbase: driver operation %s panicked: %v\n%s", operation, recovered, debug.Stack())
+	return fmt.Errorf("%w: %s", ErrDriverPanic, operation)
+}
+
+func (c *conn) recoverDriverPanic(operation string, result *error) {
+	if recovered := recover(); recovered != nil {
+		panicErr := driverPanicError(operation, recovered)
+		c.invalidateAfterPanic(panicErr)
+		*result = panicErr
+	}
+}
+
+func (c *conn) recoverDriverPanicBool(operation string, valid *bool) {
+	if recovered := recover(); recovered != nil {
+		*valid = false
+		c.invalidateAfterPanic(driverPanicError(operation, recovered))
+	}
+}
+
+func (c *conn) invalidateAfterPanic(cause error) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	native := c.poisonLocked(cause)
+	c.mu.Unlock()
+	if native != nil {
+		go closeNativeAfterPanic(native)
+	}
+}
+
+func (c *conn) poisonLocked(cause error) *nativeConnection {
+	if c.closed {
+		return nil
+	}
+	if cause == nil {
+		cause = errConnectionInvalidated
+	}
+	if errors.Is(cause, ErrDriverPanic) {
+		c.panicErr = cause
+	}
+	for result := range c.rows {
+		result.terminalErr = cause
+		result.closed = true
+		result.native = nil
+	}
+	c.rows = nil
+	for statement := range c.statements {
+		statement.mu.Lock()
+		statement.closed = true
+		statement.native = nil
+		statement.mu.Unlock()
+	}
+	c.statements = nil
+	c.pending, c.pendingQuery = nil, ""
+	c.closed = true
+	native := c.native
+	c.native = nil
+	return native
+}
+
+func (c *conn) invalidConnectionErrorLocked() error {
+	if c.panicErr != nil {
+		return c.panicErr
+	}
+	return driver.ErrBadConn
+}
+
+func (c *conn) notifyResetSessionPanic(err error) {
+	c.mu.Lock()
+	observer := c.resetPanicObserver
+	c.mu.Unlock()
+	if observer == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			driverPanicError("reset session panic observer", recovered)
+		}
+	}()
+	observer(err)
+}
+
+func closeNativeAfterPanic(native *nativeConnection) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			driverPanicError("close native connection after panic", recovered)
+		}
+	}()
+	_ = native.close()
 }
 
 func (c *conn) sanitizeError(operation string, err error) error {
@@ -780,7 +898,12 @@ type stmt struct {
 	closed   bool
 }
 
-func (s *stmt) Close() error {
+func (s *stmt) Close() (retErr error) {
+	var conn *conn
+	if s != nil {
+		conn = s.conn
+	}
+	defer conn.recoverDriverPanic("close prepared statement", &retErr)
 	if s == nil || s.conn == nil {
 		return nil
 	}
@@ -813,7 +936,17 @@ func (s *stmt) Close() error {
 	return nil
 }
 
-func (s *stmt) NumInput() int {
+func (s *stmt) NumInput() (count int) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			count = -1
+			if s != nil && s.conn != nil {
+				s.conn.invalidateAfterPanic(driverPanicError("inspect prepared statement", recovered))
+			} else {
+				driverPanicError("inspect prepared statement", recovered)
+			}
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.numInput
@@ -827,7 +960,12 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	return s.QueryContext(context.Background(), namedValues(args))
 }
 
-func (s *stmt) ExecContext(ctx context.Context, values []driver.NamedValue) (driver.Result, error) {
+func (s *stmt) ExecContext(ctx context.Context, values []driver.NamedValue) (driverResult driver.Result, retErr error) {
+	var conn *conn
+	if s != nil {
+		conn = s.conn
+	}
+	defer conn.recoverDriverPanic("execute prepared statement", &retErr)
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
@@ -835,7 +973,7 @@ func (s *stmt) ExecContext(ctx context.Context, values []driver.NamedValue) (dri
 	if err != nil {
 		return nil, err
 	}
-	conn := s.conn
+	conn = s.conn
 	if conn == nil {
 		return nil, driver.ErrBadConn
 	}
@@ -885,7 +1023,12 @@ func (s *stmt) ExecContext(ctx context.Context, values []driver.NamedValue) (dri
 	return driver.RowsAffected(affected), nil
 }
 
-func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (driver.Rows, error) {
+func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (driverRows driver.Rows, retErr error) {
+	var conn *conn
+	if s != nil {
+		conn = s.conn
+	}
+	defer conn.recoverDriverPanic("query prepared statement", &retErr)
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
@@ -897,7 +1040,7 @@ func (s *stmt) QueryContext(ctx context.Context, values []driver.NamedValue) (dr
 	if err != nil {
 		return nil, err
 	}
-	conn := s.conn
+	conn = s.conn
 	if conn == nil {
 		return nil, driver.ErrBadConn
 	}
@@ -1043,11 +1186,21 @@ func namedValues(values []driver.Value) []driver.NamedValue {
 	return converted
 }
 
-func (t *tx) Commit() error {
+func (t *tx) Commit() (err error) {
+	var conn *conn
+	if t != nil {
+		conn = t.conn
+	}
+	defer conn.recoverDriverPanic("commit transaction", &err)
 	return t.finish(true)
 }
 
-func (t *tx) Rollback() error {
+func (t *tx) Rollback() (err error) {
+	var conn *conn
+	if t != nil {
+		conn = t.conn
+	}
+	defer conn.recoverDriverPanic("roll back transaction", &err)
 	return t.finish(false)
 }
 
@@ -1096,7 +1249,8 @@ func (c *conn) Prepare(query string) (driver.Stmt, error) {
 	return c.PrepareContext(context.Background(), query)
 }
 
-func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+func (c *conn) PrepareContext(ctx context.Context, query string) (driverStmt driver.Stmt, retErr error) {
+	defer c.recoverDriverPanic("prepare statement", &retErr)
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
@@ -1107,7 +1261,7 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.native == nil || c.native.broken() {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -1151,7 +1305,8 @@ func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, e
 	return prepared, nil
 }
 
-func (c *conn) Close() error {
+func (c *conn) Close() (err error) {
+	defer c.recoverDriverPanic("close connection", &err)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.closeLocked()
@@ -1190,7 +1345,8 @@ func (c *conn) Begin() (driver.Tx, error) {
 	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
 
-func (c *conn) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx, error) {
+func (c *conn) BeginTx(ctx context.Context, options driver.TxOptions) (transaction driver.Tx, retErr error) {
+	defer c.recoverDriverPanic("begin transaction", &retErr)
 	// Only callers opting into explicit ending separate native admission from
 	// database/sql's transaction lifetime. All ordinary contexts are unchanged.
 	admission := txcontext.BeginAdmission(ctx)
@@ -1207,7 +1363,7 @@ func (c *conn) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx
 		return nil, ErrDistributedParticipantManaged
 	}
 	if c.closed || c.native == nil || c.native.broken() {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(admission); err != nil {
 		return nil, err
@@ -1232,7 +1388,8 @@ func (c *conn) BeginTx(ctx context.Context, options driver.TxOptions) (driver.Tx
 	return &tx{conn: c}, nil
 }
 
-func (c *conn) ExecContext(ctx context.Context, query string, values []driver.NamedValue) (driver.Result, error) {
+func (c *conn) ExecContext(ctx context.Context, query string, values []driver.NamedValue) (driverResult driver.Result, retErr error) {
+	defer c.recoverDriverPanic("execute statement", &retErr)
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
@@ -1244,7 +1401,7 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.native == nil {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -1302,11 +1459,13 @@ func (c *conn) ExecContext(ctx context.Context, query string, values []driver.Na
 	return driver.RowsAffected(affected), nil
 }
 
-func (c *conn) CheckNamedValue(value *driver.NamedValue) error {
+func (c *conn) CheckNamedValue(value *driver.NamedValue) (err error) {
+	defer c.recoverDriverPanic("normalize statement argument", &err)
 	return normalizeNamedValue(value)
 }
 
-func (c *conn) QueryContext(ctx context.Context, query string, values []driver.NamedValue) (driver.Rows, error) {
+func (c *conn) QueryContext(ctx context.Context, query string, values []driver.NamedValue) (driverRows driver.Rows, retErr error) {
+	defer c.recoverDriverPanic("query statement", &retErr)
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
@@ -1323,7 +1482,7 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	defer c.mu.Unlock()
 
 	if c.closed || c.native == nil {
-		return nil, driver.ErrBadConn
+		return nil, c.invalidConnectionErrorLocked()
 	}
 	if err := contextError(ctx); err != nil {
 		return nil, err
@@ -1386,7 +1545,8 @@ func (c *conn) QueryContext(ctx context.Context, query string, values []driver.N
 	return result, nil
 }
 
-func (c *conn) Ping(ctx context.Context) error {
+func (c *conn) Ping(ctx context.Context) (err error) {
+	defer c.recoverDriverPanic("ping", &err)
 	if err := contextError(ctx); err != nil {
 		return err
 	}
@@ -1418,38 +1578,39 @@ func (c *conn) Ping(ctx context.Context) error {
 
 // IsValid lets database/sql discard unusable connections without replaying a
 // query whose original operation error must be preserved.
-func (c *conn) IsValid() bool {
+func (c *conn) IsValid() (valid bool) {
+	defer c.recoverDriverPanicBool("validate connection", &valid)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return !c.closed && c.native != nil && !c.native.broken()
 }
 
+// ResetSession rejects an invalid attachment so database/sql discards it
+// before another operation can reuse it from the pool.
+func (c *conn) ResetSession(ctx context.Context) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			panicErr := driverPanicError("reset session", recovered)
+			c.invalidateAfterPanic(panicErr)
+			err = driver.ErrBadConn
+			c.notifyResetSessionPanic(panicErr)
+		}
+	}()
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.native == nil || c.native.broken() {
+		return driver.ErrBadConn
+	}
+	return nil
+}
+
 func (c *conn) invalidateLocked(cause error) {
-	if c.closed {
-		return
-	}
-	if cause == nil {
-		cause = errConnectionInvalidated
-	}
-	for result := range c.rows {
-		result.terminalErr = cause
-		result.closed = true
-		result.native = nil
-	}
-	c.rows = nil
-	for statement := range c.statements {
-		statement.mu.Lock()
-		statement.closed = true
-		statement.native = nil
-		statement.mu.Unlock()
-	}
-	c.statements = nil
-	c.pending, c.pendingQuery = nil, ""
-	c.closed = true
-	native := c.native
-	c.native = nil
+	native := c.poisonLocked(cause)
 	if native != nil {
-		_ = native.close()
+		closeNativeAfterPanic(native)
 	}
 }
 
@@ -1508,7 +1669,12 @@ func (r *rows) ColumnTypeScanType(index int) reflect.Type {
 	return r.metadata[index].scanType
 }
 
-func (r *rows) Next(dest []driver.Value) error {
+func (r *rows) Next(dest []driver.Value) (err error) {
+	var conn *conn
+	if r != nil {
+		conn = r.conn
+	}
+	defer conn.recoverDriverPanic("fetch result row", &err)
 	r.conn.mu.Lock()
 	defer r.conn.mu.Unlock()
 
@@ -1580,7 +1746,12 @@ func (r *rows) Next(dest []driver.Value) error {
 	return nil
 }
 
-func (r *rows) Close() error {
+func (r *rows) Close() (err error) {
+	var conn *conn
+	if r != nil {
+		conn = r.conn
+	}
+	defer conn.recoverDriverPanic("close result rows", &err)
 	r.conn.mu.Lock()
 	defer r.conn.mu.Unlock()
 	if r.ctx != nil && r.ctx.Err() != nil {
