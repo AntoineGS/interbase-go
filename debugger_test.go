@@ -309,6 +309,57 @@ func TestDebugPauseWhileRunning(t *testing.T) {
 	}
 }
 
+func TestDebugResumeSnapshotRetainsCumulativeState(t *testing.T) {
+	entered := make(chan struct{})
+	var run *lpRun
+	rows := func() (bool, error) {
+		close(entered)
+		<-run.ctx.Done()
+		return false, run.ctx.Err()
+	}
+	s, run, _ := newDebugFakeRun(t, "DECLARE VARIABLE X INTEGER;\nBEGIN\n"+
+		"  FOR SELECT ID FROM LP_T INTO :X DO\n    X = X + 1;\nEND", rows)
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+	s.mu.Lock()
+	s.debug.messages = append(s.debug.messages, DebugMessage{Kind: "info", Text: "cumulative message"})
+	s.debug.statements = 9
+	run.result.Columns = []string{"ID"}
+	run.result.KeptRows = [][]Cell{{{Value: int64(11)}}}
+	run.result.Rows = 12
+	s.mu.Unlock()
+	if err := s.Command(DebugCommand{Kind: DebugContinue}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("fake fetch did not start")
+	}
+
+	var running DebugSnapshot
+	select {
+	case running = <-s.Snapshots():
+		if running.Status != DebugRunning {
+			t.Fatalf("snapshot after resume = %+v, want running", running)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for running snapshot")
+	}
+	latest := s.Latest()
+	for _, snapshot := range []DebugSnapshot{running, latest} {
+		if snapshot.Status != DebugRunning || len(snapshot.Frames) != 0 || snapshot.Outcome != "" || snapshot.Err != nil || snapshot.FailedAt != nil {
+			t.Fatalf("running snapshot retained stop-specific state: %+v", snapshot)
+		}
+		if snapshot.Statements != 9 || snapshot.RowsTotal != 12 || !reflect.DeepEqual(snapshot.Columns, []string{"ID"}) || !reflect.DeepEqual(snapshot.Rows, [][]Cell{{{Value: int64(11)}}}) {
+			t.Fatalf("running snapshot lost cumulative results: %+v", snapshot)
+		}
+		if len(snapshot.Messages) == 0 || snapshot.Messages[len(snapshot.Messages)-1].Text != "cumulative message" {
+			t.Fatalf("running snapshot lost cumulative messages: %+v", snapshot.Messages)
+		}
+	}
+}
+
 func TestDebugStopDuringServerCall(t *testing.T) {
 	entered := make(chan struct{})
 	var run *lpRun
@@ -333,6 +384,51 @@ func TestDebugStopDuringServerCall(t *testing.T) {
 		t.Fatalf("stopped snapshot/result = %+v, rolledBack=%v counts=%+v", snap, run.result.RolledBack, counts)
 	}
 	assertLineProfileFakeClosed(t, run, counts)
+}
+
+func TestDebugStopWithFullSnapshotBuffer(t *testing.T) {
+	s, run, counts := newDebugFakeRun(t, "DECLARE VARIABLE X INTEGER;\nBEGIN\n  X = 1;\nEND", func() (bool, error) { return false, nil })
+	_ = nextDebugStop(t, s)
+	for len(s.snapshots) < cap(s.snapshots) {
+		s.snapshots <- DebugSnapshot{Status: DebugRunning}
+	}
+	if err := s.Command(DebugCommand{Kind: DebugContinue}); err != nil {
+		t.Fatal(err)
+	}
+
+	stopDone := make(chan struct{})
+	go func() {
+		s.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+	case <-time.After(3 * time.Second):
+		// Drain only after observing the deadlock, to unblock the old
+		// unconditional intermediate-snapshot send.
+		drained := make(chan struct{})
+		go func() {
+			for range s.Snapshots() {
+			}
+			close(drained)
+		}()
+		select {
+		case <-stopDone:
+			<-drained
+		case <-time.After(3 * time.Second):
+			t.Fatal("Stop remained blocked while draining the full snapshot buffer")
+		}
+		t.Fatal("Stop blocked with a full snapshot buffer and no reader")
+	}
+	snap := s.Latest()
+	if snap.Status != DebugEndedStatus || snap.Outcome != DebugStopped || !run.result.RolledBack || !counts.rolledBack {
+		t.Fatalf("stopped snapshot/result = %+v, rolledBack=%v counts=%+v", snap, run.result.RolledBack, counts)
+	}
+	if len(run.statements) != 0 || len(run.tx.cursors) != 0 || len(run.tx.prepared) != 0 {
+		t.Fatalf("stopped run retains statements %d, cursors %d, prepared %d", len(run.statements), len(run.tx.cursors), len(run.tx.prepared))
+	}
+	for range s.Snapshots() {
+	}
 }
 
 func TestDebugCommandErrors(t *testing.T) {
@@ -361,6 +457,105 @@ func TestDebugCommandErrors(t *testing.T) {
 	<-s.Done()
 	if err := s.Command(DebugCommand{Kind: DebugContinue}); !errors.Is(err, ErrDebugEnded) {
 		t.Fatalf("command after end error = %v", err)
+	}
+}
+
+func TestDebugEvaluateRejectsResumeAdmissionInProgress(t *testing.T) {
+	s := newDebugSession(context.Background(), DebugAnalysis{}, DebugOptions{})
+	s.mu.Lock()
+	s.latest.Status = DebugPaused
+	s.mu.Unlock()
+
+	commandResult := make(chan error, 1)
+	go func() {
+		commandResult <- s.Command(DebugCommand{Kind: DebugContinue})
+	}()
+	deadline := time.After(3 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		commandSent := s.commandSent
+		s.mu.Unlock()
+		if commandSent {
+			break
+		}
+		select {
+		case <-deadline:
+			s.cancel()
+			t.Fatal("Continue did not enter command admission")
+		case <-ticker.C:
+		}
+	}
+
+	evalCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, evalErr := s.Evaluate(evalCtx, 0, []string{"1"})
+	cancel()
+	s.cancel()
+	select {
+	case err := <-commandResult:
+		if !errors.Is(err, ErrDebugEnded) {
+			t.Fatalf("concurrent Continue error = %v, want ended after cancellation", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Continue did not return after session cancellation")
+	}
+	if !errors.Is(evalErr, ErrDebugNotPaused) {
+		t.Fatalf("Evaluate during Continue admission error = %v, want %v", evalErr, ErrDebugNotPaused)
+	}
+}
+
+func TestDebugContinueRejectsEvaluationAdmissionInProgress(t *testing.T) {
+	s := newDebugSession(context.Background(), DebugAnalysis{}, DebugOptions{})
+	s.mu.Lock()
+	s.latest.Status = DebugPaused
+	s.mu.Unlock()
+	evalCtx, cancelEval := context.WithCancel(context.Background())
+	evalResult := make(chan error, 1)
+	go func() {
+		_, err := s.Evaluate(evalCtx, 0, []string{"1"})
+		evalResult <- err
+	}()
+	deadline := time.After(3 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		s.mu.Lock()
+		evaluationSent := s.evaluationSent
+		s.mu.Unlock()
+		if evaluationSent {
+			break
+		}
+		select {
+		case <-deadline:
+			cancelEval()
+			s.cancel()
+			t.Fatal("Evaluate did not enter request admission")
+		case <-ticker.C:
+		}
+	}
+
+	commandResult := make(chan error, 1)
+	go func() {
+		commandResult <- s.Command(DebugCommand{Kind: DebugContinue})
+	}()
+	var commandErr error
+	select {
+	case commandErr = <-commandResult:
+	case <-time.After(100 * time.Millisecond):
+		cancelEval()
+		s.cancel()
+		<-commandResult
+		<-evalResult
+		t.Fatal("Continue was admitted while evaluation was already in progress")
+	}
+	cancelEval()
+	s.cancel()
+	if !errors.Is(commandErr, ErrDebugNotPaused) {
+		t.Fatalf("Continue during Evaluate admission error = %v, want %v", commandErr, ErrDebugNotPaused)
+	}
+	if err := <-evalResult; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Evaluate error = %v, want context canceled", err)
 	}
 }
 

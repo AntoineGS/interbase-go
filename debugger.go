@@ -166,18 +166,19 @@ type DebugSession struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu          sync.Mutex
-	latest      DebugSnapshot
-	snapshots   chan DebugSnapshot
-	commands    chan DebugCommand
-	evals       chan debugEvalRequest
-	done        chan struct{}
-	debug       *debugState
-	run         *lpRun
-	commandSent bool
-	ended       bool
-	endOnce     sync.Once
-	closeOnce   sync.Once
+	mu             sync.Mutex
+	latest         DebugSnapshot
+	snapshots      chan DebugSnapshot
+	commands       chan DebugCommand
+	evals          chan debugEvalRequest
+	done           chan struct{}
+	debug          *debugState
+	run            *lpRun
+	commandSent    bool
+	evaluationSent bool
+	ended          bool
+	endOnce        sync.Once
+	closeOnce      sync.Once
 }
 
 type debugEvalRequest struct {
@@ -242,7 +243,9 @@ func (s *DebugSession) Analysis() DebugAnalysis {
 	return cloneDebugAnalysis(s.analysis)
 }
 
-// Snapshots returns snapshots in order and closes after the ended snapshot.
+// Snapshots returns snapshots in order and closes after the session ends. The
+// ended snapshot may be dropped if the buffer is full; after the channel closes,
+// Latest returns that ended snapshot.
 func (s *DebugSession) Snapshots() <-chan DebugSnapshot { return s.snapshots }
 
 // Latest returns the latest published snapshot.
@@ -272,7 +275,7 @@ func (s *DebugSession) Command(cmd DebugCommand) error {
 		s.mu.Unlock()
 		return nil
 	}
-	if s.latest.Status != DebugPaused || s.commandSent {
+	if s.latest.Status != DebugPaused || s.commandSent || s.evaluationSent {
 		s.mu.Unlock()
 		return ErrDebugNotPaused
 	}
@@ -346,9 +349,9 @@ func (s *DebugSession) validBreakpoint(bp DebugBreakpoint) bool {
 	return false
 }
 
-// Evaluate queues an evaluation request to the paused hook. Expression
-// execution is added by the evaluation task; the request/response path is
-// already serialized with the run here.
+// Evaluate queues an evaluation request to the paused hook. Admission is
+// serialized against resume commands. Expression execution is added by the
+// evaluation task; the request/response path is already serialized with the run.
 func (s *DebugSession) Evaluate(ctx context.Context, frame int, expressions []string) ([]DebugEvaluation, error) {
 	if s == nil {
 		return nil, ErrDebugEnded
@@ -361,11 +364,17 @@ func (s *DebugSession) Evaluate(ctx context.Context, frame int, expressions []st
 		s.mu.Unlock()
 		return nil, ErrDebugEnded
 	}
-	if s.latest.Status != DebugPaused {
+	if s.latest.Status != DebugPaused || s.commandSent || s.evaluationSent {
 		s.mu.Unlock()
 		return nil, ErrDebugNotPaused
 	}
+	s.evaluationSent = true
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.evaluationSent = false
+		s.mu.Unlock()
+	}()
 	req := debugEvalRequest{ctx: ctx, frame: frame, expressions: append([]string(nil), expressions...), result: make(chan debugEvalResult, 1)}
 	select {
 	case s.evals <- req:
@@ -634,10 +643,7 @@ func (d *debugState) pauseLoop(f *lpFrame, n *psql.Node) error {
 		select {
 		case cmd := <-d.session.commands:
 			d.acceptCommand(cmd, f, n)
-			d.session.mu.Lock()
-			phase := d.phase
-			d.session.mu.Unlock()
-			d.session.publish(DebugSnapshot{Status: DebugRunning, Phase: phase})
+			d.session.publish(buildDebugSnapshot(d, nil, nil, DebugRunning))
 			d.session.mu.Lock()
 			d.session.commandSent = false
 			d.session.mu.Unlock()
@@ -834,8 +840,16 @@ func (s *DebugSession) publish(snapshot DebugSnapshot) {
 	snapshot.Seq = s.latest.Seq + 1
 	s.latest = cloneDebugSnapshot(snapshot)
 	s.mu.Unlock()
-	s.snapshots <- cloneDebugSnapshot(snapshot)
 	if snapshot.Status == DebugEndedStatus {
+		select {
+		case s.snapshots <- cloneDebugSnapshot(snapshot):
+		default:
+		}
 		s.closeOnce.Do(func() { close(s.snapshots) })
+		return
+	}
+	select {
+	case s.snapshots <- cloneDebugSnapshot(snapshot):
+	case <-s.ctx.Done():
 	}
 }
