@@ -39,7 +39,7 @@ type DebugAnalysis struct {
 // AnalyzeDebug reads routine metadata in a short read-only transaction and
 // returns the entry and its parseable, step-in-reachable routines.
 func AnalyzeDebug(ctx context.Context, pooled *sql.Conn, entrySQL string, dialect int) (DebugAnalysis, error) {
-	plan, err := planLineProfile(ctx, pooled, entrySQL, dialect, nil, true)
+	plan, err := planDebug(ctx, pooled, entrySQL, dialect)
 	if err != nil {
 		return DebugAnalysis{}, err
 	}
@@ -353,9 +353,9 @@ func (s *DebugSession) validBreakpoint(bp DebugBreakpoint) bool {
 	return false
 }
 
-// Evaluate queues an evaluation request to the paused hook. Admission is
-// serialized against resume commands. Expression execution is added by the
-// evaluation task; the request/response path is already serialized with the run.
+// Evaluate evaluates expressions against a paused frame. Admission is
+// serialized against resume commands, and expression execution is served by
+// the paused run goroutine.
 func (s *DebugSession) Evaluate(ctx context.Context, frame int, expressions []string) ([]DebugEvaluation, error) {
 	if s == nil {
 		return nil, ErrDebugEnded
@@ -436,7 +436,7 @@ func StartDebug(ctx context.Context, pooled *sql.Conn, opts DebugOptions) (*Debu
 	if err := contextError(ctx); err != nil {
 		return nil, err
 	}
-	plan, err := planLineProfile(ctx, pooled, opts.SQL, opts.Dialect, nil, true)
+	plan, err := planDebug(ctx, pooled, opts.SQL, opts.Dialect)
 	if err != nil {
 		return nil, err
 	}
@@ -683,7 +683,7 @@ func (d *debugState) pauseLoop(f *lpFrame, n *psql.Node) error {
 			d.session.mu.Unlock()
 			return nil
 		case req := <-d.session.evals:
-			d.serveEvaluation(req)
+			d.serveEvaluation(req, f)
 		case <-d.session.ctx.Done():
 			return d.session.ctx.Err()
 		}
@@ -762,20 +762,6 @@ func (d *debugState) reachableBreakpointOrRunTo(name string) bool {
 	return false
 }
 
-func (d *debugState) serveEvaluation(req debugEvalRequest) {
-	result := debugEvalResult{evaluations: make([]DebugEvaluation, len(req.expressions))}
-	for i, expression := range req.expressions {
-		result.evaluations[i] = DebugEvaluation{
-			Expression: expression,
-			Err:        errors.New("interbase: debug expression evaluation is not available yet"),
-		}
-	}
-	select {
-	case req.result <- result:
-	case <-req.ctx.Done():
-	}
-}
-
 func debugStepIntoSet(plan *lpPlan) map[string]bool {
 	set := make(map[string]bool)
 	if plan == nil || plan.entry == nil {
@@ -790,15 +776,21 @@ func debugStepIntoSet(plan *lpPlan) map[string]bool {
 }
 
 func debugReachableRoutines(plan *lpPlan) []string {
-	if plan == nil || plan.entry == nil || plan.entry.routine == nil {
+	if plan == nil || plan.entry == nil {
 		return nil
 	}
 	seen := map[string]bool{plan.entry.name: true}
-	var reached []string
+	reached := make([]string, 0)
+	if plan.entry.routine == nil || plan.entry.routine.Body == nil {
+		return []string{plan.entry.name}
+	}
 	queue := []*lpRoutineMeta{plan.entry}
 	for len(queue) > 0 {
 		meta := queue[0]
 		queue = queue[1:]
+		if meta == nil || meta.routine == nil {
+			continue
+		}
 		for _, callee := range meta.routine.Callees() {
 			if !callee.StepInShape || seen[callee.Name] {
 				continue
@@ -824,6 +816,9 @@ func debugAnalysisFromPlan(plan *lpPlan) DebugAnalysis {
 	analysis.ReadWriteFromStart, analysis.ReadWriteReason = debugStartAnalysis(plan)
 	for _, name := range debugReachableRoutines(plan) {
 		meta := plan.procs[name]
+		if name == plan.entry.name {
+			meta = plan.entry
+		}
 		if meta == nil {
 			continue
 		}

@@ -64,6 +64,12 @@ func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dia
 	return plan, nil
 }
 
+// planDebug loads every parseable callee reachable through a step-in call
+// shape, so analysis and dynamic debugger stepping use the same routine set.
+func planDebug(ctx context.Context, pooled *sql.Conn, entrySQL string, dialect int) (*lpPlan, error) {
+	return planLineProfile(ctx, pooled, entrySQL, dialect, nil, true)
+}
+
 // lpDatabaseDialect reads the database's SQL dialect with one info call,
 // outside any transaction.
 func lpDatabaseDialect(ctx context.Context, pooled *sql.Conn) (int, error) {

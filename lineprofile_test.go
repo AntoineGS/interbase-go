@@ -400,6 +400,7 @@ type lineProfileFakeCounts struct {
 	rolledBack, committed                     bool
 	onPrepare, onCursorClose                  func()       // optional server-side effects of a prepare and of a cursor close
 	onQuery                                   func(string) // optional query observer
+	onQueryArgs                               func(string, []argument)
 	queryErr                                  func(string) error
 	onExec                                    func(string) // optional execution observer
 	onCommit, onRollback                      func()       // optional transaction completion observers
@@ -546,10 +547,13 @@ func newLineProfileFakeNative(counts *lineProfileFakeCounts, next func() (bool, 
 					}
 					return []OutputDescriptor{{Name: "ID", Kind: "INTEGER", Nullable: true}}, nil
 				},
-				queryOverride: func([]argument) (*nativeCursor, []string, error) {
+				queryOverride: func(args []argument) (*nativeCursor, []string, error) {
 					counts.queried++
 					if counts.onQuery != nil {
 						counts.onQuery(query)
+					}
+					if counts.onQueryArgs != nil {
+						counts.onQueryArgs(query, append([]argument(nil), args...))
 					}
 					if counts.queryErr != nil {
 						if err := counts.queryErr(query); err != nil {
