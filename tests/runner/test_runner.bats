@@ -313,10 +313,12 @@ teardown() {
 
   [ "$status" -eq 0 ]
   [[ "$output" == *"controlled go test success"* ]]
+  [[ "$output" == *"loopback host port 43123"* ]]
   docker_log="$(<"$FAKE_DOCKER_LOG")"
   go_log="$(<"$FAKE_GO_LOG")"
   [[ "$docker_log" == *"--pull=never"* ]]
-  [[ "$docker_log" == *"--publish 127.0.0.1:3050:3050"* ]]
+  [[ "$docker_log" == *"--publish 127.0.0.1::3050"* ]]
+  [[ "$docker_log" == *"docker port 0000000000000000000000000000000000000000000000000000000000000001 3050/tcp"* ]]
   [[ "$docker_log" == *"type=tmpfs,destination=/var/lib/interbase"* ]]
   [[ "$docker_log" == *"type=bind,source=$TMPDIR/interbase-go-docker."* ]]
   [[ "$docker_log" == *"target=$TMPDIR/interbase-go-docker."* ]]
@@ -339,6 +341,19 @@ teardown() {
   [[ "$go_log" == *"password-state=wrong"* ]]
   [[ "$go_log" == *'-test.run \^TestRead\$'* ]]
   [ ! -d "$root_path" ]
+}
+
+@test "rejects an invalid published host port and cleans up the owned container" {
+  export FAKE_DOCKER_PORT_OUTPUT='0.0.0.0:43123'
+
+  run "$RUNNER" -run '^TestRead$'
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"invalid isolated InterBase host port"* ]]
+  docker_log="$(<"$FAKE_DOCKER_LOG")"
+  [[ "$docker_log" == *"docker stop -- 0000000000000000000000000000000000000000000000000000000000000001"* ]]
+  [[ "$docker_log" == *"docker rm"*"0000000000000000000000000000000000000000000000000000000000000001"* ]]
+  [ ! -d "$(runner_root_from_log)" ]
 }
 
 @test "does not put credentials into the timeout command arguments" {
