@@ -474,14 +474,26 @@ func (r *lpRun) forExecStatement(f *lpFrame, n *psql.Node, node *LineProfileNode
 	}); err != nil {
 		return lpContinue, r.dynamicExecError(text, err)
 	}
+	var open *lpOpenCursor
+	if r.debug != nil {
+		open = f.pushCursor(n.Line, n.Into)
+	}
 	exhausted := false
-	defer func() { err = errors.Join(err, r.closeCursor(cursor, exhausted)) }()
+	defer func() {
+		if open != nil {
+			f.popCursor(open)
+		}
+		err = errors.Join(err, r.closeCursor(cursor, exhausted))
+	}()
 	outputs := stmt.Outputs()
 	for {
 		row, state, err := r.dynamicFetch(node, cursor)
 		if err != nil || state != lpFetchRow {
 			exhausted = state == lpFetchEnd
 			return lpContinue, err
+		}
+		if open != nil {
+			open.fetched++
 		}
 		if err := r.assignDynamic(f, n.Into, row, outputs); err != nil {
 			return lpContinue, err

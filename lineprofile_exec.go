@@ -60,6 +60,14 @@ type lpRun struct {
 	dynamic        map[string][]string
 	dynamicTexts   map[*LineProfileNode]map[uint64]struct{}
 	procedureNames map[string]bool
+	// hook is called before debugger-visible statement nodes; nil keeps the
+	// ordinary line-profile execution path unchanged.
+	hook func(f *lpFrame, n *psql.Node) error
+	// noMeasure skips line-profile baselines, counters and activity snapshots.
+	noMeasure bool
+	// stepDecider can dynamically choose which analyzed callees to emulate.
+	stepDecider func(f *lpFrame, n *psql.Node, callee string) bool
+	debug       *debugState
 }
 
 // runInTransaction runs the entry routine inside the run's transaction and
@@ -158,11 +166,19 @@ func (r *lpRun) exec(f *lpFrame, n *psql.Node) (lpSignal, error) {
 	if err := r.ctx.Err(); err != nil {
 		return lpContinue, &lpNodeError{routine: f.meta.name, line: n.Line, err: err}
 	}
+	if r.hook != nil && n.Kind != psql.NodeBlock && n.Kind != psql.NodeEmpty && n.Kind != psql.NodeWhile {
+		if err := r.beforeStatement(f, n); err != nil {
+			return lpContinue, &lpNodeError{routine: f.meta.name, line: n.Line, err: err}
+		}
+	}
 	node := &f.profile.Nodes[n.ID]
 	if n.Kind != psql.NodeWhile {
 		node.Metrics.Hits++
 	}
 	sig, err := r.execNode(f, n, node)
+	if err == nil && r.debug != nil {
+		r.debug.didExecute(n)
+	}
 	if err != nil {
 		var located *lpNodeError
 		if !errors.As(err, &located) {
@@ -171,6 +187,22 @@ func (r *lpRun) exec(f *lpFrame, n *psql.Node) (lpSignal, error) {
 		return lpContinue, err
 	}
 	return sig, nil
+}
+
+// beforeStatement lets a debugger pause before n. The caller has already
+// checked the context; the frame's current node is set before the hook runs.
+func (r *lpRun) beforeStatement(f *lpFrame, n *psql.Node) error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	f.current = n
+	if err := r.hook(f, n); err != nil {
+		return err
+	}
+	if r.debug != nil {
+		r.debug.countStatement()
+	}
+	return nil
 }
 
 // keepsBlock reports the statements whose errors keep the handling block's
@@ -218,6 +250,11 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 		return lpContinue, nil
 	case psql.NodeWhile:
 		for {
+			if r.hook != nil {
+				if err := r.beforeStatement(f, n); err != nil {
+					return lpContinue, err
+				}
+			}
 			node.Metrics.Hits++
 			ok, err := r.evalCond(f, node, n.Cond)
 			if err != nil || !ok {
@@ -232,12 +269,12 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 			}
 		}
 	case psql.NodeSelectInto:
-		if r.stepsInto(n) {
+		if r.stepsInto(f, n) {
 			return lpContinue, r.stepSelectInto(f, n, node)
 		}
 		return lpContinue, r.execSelectInto(f, n, node)
 	case psql.NodeForSelect:
-		if r.stepsInto(n) {
+		if r.stepsInto(f, n) {
 			return r.stepForSelect(f, n, node)
 		}
 		return r.execForSelect(f, n, node)
@@ -603,8 +640,17 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 	}); err != nil {
 		return lpContinue, err
 	}
+	var open *lpOpenCursor
+	if r.debug != nil {
+		open = f.pushCursor(n.Line, n.Into)
+	}
 	exhausted := false
-	defer func() { err = errors.Join(err, r.closeCursor(cursor, exhausted)) }()
+	defer func() {
+		if open != nil {
+			f.popCursor(open)
+		}
+		err = errors.Join(err, r.closeCursor(cursor, exhausted))
+	}()
 	outputs := b.stmt.Outputs()
 	for {
 		var hasRow bool
@@ -619,6 +665,9 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 			return lpContinue, nil
 		}
 		node.Metrics.Rows++
+		if open != nil {
+			open.fetched++
+		}
 		row, err := cursor.Row()
 		if err != nil {
 			return lpContinue, err
@@ -647,7 +696,11 @@ func (r *lpRun) execProcedure(f *lpFrame, n *psql.Node, node *LineProfileNode) e
 	if !ok {
 		return fmt.Errorf("interbase: line profile: procedure %s is not loaded", n.Proc.Name)
 	}
-	if r.stepInto[callee.name] {
+	if r.stepDecider == nil {
+		if r.stepInto[callee.name] {
+			return r.stepExecute(f, n, node, callee)
+		}
+	} else if r.emulates(f, n, callee.name) {
 		return r.stepExecute(f, n, node, callee)
 	}
 	if len(n.Proc.Args) > len(callee.inputs) {

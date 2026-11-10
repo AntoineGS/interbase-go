@@ -22,7 +22,11 @@ const lineProfileParametersQuery = "SELECT pp.RDB$PARAMETER_NAME, pp.RDB$PARAMET
 // planLineProfile performs the static analysis in one short read-only,
 // read-committed transaction. Problems are returned in the analysis; an
 // error means the catalog could not be read.
-func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dialect int, stepInto []string) (*lpPlan, error) {
+// planLineProfile performs the shared catalog analysis. When allStepInto is
+// true it loads every parseable callee reachable through a step-in call shape,
+// as a debugger needs to decide stepping dynamically.
+func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dialect int, stepInto []string, options ...bool) (*lpPlan, error) {
+	allStepInto := len(options) > 0 && options[0]
 	if pooled == nil {
 		return nil, ErrNotInterBaseConn
 	}
@@ -52,7 +56,7 @@ func planLineProfile(ctx context.Context, pooled *sql.Conn, entrySQL string, dia
 		ReadOnly:  true,
 		Isolation: sql.LevelReadCommitted,
 	}, func(tx *Transaction) error {
-		return plan.load(ctx, tx, stepInto)
+		return plan.load(ctx, tx, stepInto, allStepInto)
 	})
 	if err != nil {
 		return nil, err
@@ -85,7 +89,7 @@ func (plan *lpPlan) problem(routine string, line, column int, format string, arg
 	})
 }
 
-func (plan *lpPlan) load(ctx context.Context, tx *Transaction, stepInto []string) error {
+func (plan *lpPlan) load(ctx context.Context, tx *Transaction, stepInto []string, allStepInto bool) error {
 	var err error
 	if plan.dbCharset, err = databaseCharset(ctx, tx); err != nil {
 		return err
@@ -142,7 +146,7 @@ func (plan *lpPlan) load(ctx context.Context, tx *Transaction, stepInto []string
 	visited := map[string]bool{meta.name: true}
 	for i := 0; i < len(callees); i++ {
 		callee := callees[i]
-		if !selected[callee.Name] || visited[callee.Name] {
+		if (!(allStepInto && callee.StepInShape) && !selected[callee.Name]) || visited[callee.Name] {
 			continue
 		}
 		visited[callee.Name] = true
@@ -150,8 +154,15 @@ func (plan *lpPlan) load(ctx context.Context, tx *Transaction, stepInto []string
 		if calleeMeta == nil {
 			continue
 		}
-		plan.analysis.Problems = append(plan.analysis.Problems, calleeMeta.problems...)
+		if !allStepInto {
+			plan.analysis.Problems = append(plan.analysis.Problems, calleeMeta.problems...)
+		}
 		if !callee.Parses {
+			if allStepInto {
+				// An unparseable callee runs natively in the debugger, so its
+				// effects cannot be proven read-only.
+				plan.analysis.MayWrite = true
+			}
 			continue
 		}
 		more, calleeWrites, err := plan.callees(ctx, tx, calleeMeta, callee.Depth+1)

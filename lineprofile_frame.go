@@ -23,6 +23,9 @@ type lpFrame struct {
 	routine    int // index of profile in LineProfileResult.Routines
 	entry      bool
 	id         int // frame number in savepoint names; 0 for the entry routine
+	caller     *lpFrame
+	current    *psql.Node
+	cursors    []*lpOpenCursor
 	savepoints int // savepoints started by the frame so far
 	depth      int // stepped-into calls below the entry routine; 0 for it
 	// guards counts the blocks with WHEN handlers being run, the caller's
@@ -36,6 +39,28 @@ type lpFrame struct {
 	// routine (nil otherwise); columns are the outputs it selects.
 	suspend func([]any) error
 	columns []lpParam
+}
+
+// lpOpenCursor is an open FOR SELECT or FOR EXECUTE STATEMENT in one frame.
+type lpOpenCursor struct {
+	line    int
+	fetched int64
+	targets []string
+}
+
+func (f *lpFrame) pushCursor(line int, targets []string) *lpOpenCursor {
+	cursor := &lpOpenCursor{line: line, targets: append([]string(nil), targets...)}
+	f.cursors = append(f.cursors, cursor)
+	return cursor
+}
+
+func (f *lpFrame) popCursor(cursor *lpOpenCursor) {
+	for i := len(f.cursors) - 1; i >= 0; i-- {
+		if f.cursors[i] == cursor {
+			f.cursors = append(f.cursors[:i], f.cursors[i+1:]...)
+			return
+		}
+	}
 }
 
 func newFrame(meta *lpRoutineMeta, dbNone bool, profile *LineProfileRoutine) *lpFrame {
