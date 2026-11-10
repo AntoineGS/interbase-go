@@ -553,6 +553,7 @@ func (r *lpRun) evalValue(f *lpFrame, node *LineProfileNode, e *psql.Expr, targe
 	if err != nil {
 		return nil, err
 	}
+	r.markNativeProcedureWriteForExpr(f.meta, e)
 	if len(rows) != 1 || len(rows[0]) != 1 {
 		return nil, errors.New("interbase: line profile: value evaluation returned no value")
 	}
@@ -579,6 +580,7 @@ func (r *lpRun) evalCond(f *lpFrame, node *LineProfileNode, e *psql.Expr) (bool,
 	if err != nil {
 		return false, err
 	}
+	r.markNativeProcedureWriteForExpr(f.meta, e)
 	return len(rows) == 1, nil
 }
 

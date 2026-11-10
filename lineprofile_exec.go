@@ -205,16 +205,19 @@ func (r *lpRun) exec(f *lpFrame, n *psql.Node) (lpSignal, error) {
 		node.Metrics.Hits++
 	}
 	sig, err := r.execNode(f, n, node)
-	if err != nil && r.debug != nil && r.readOnly() && isDebugReadOnlyTransactionError(err) {
-		var headerErr *lpDebugHeaderError
-		retryable := errors.As(err, &headerErr) || r.debugLeafMayRetry(f, n)
-		if retryable {
-			if switchErr := r.switchToReadWrite(f, n); switchErr != nil {
-				err = switchErr
-			} else {
-				sig, err = r.execNode(f, n, node)
+	if err != nil && r.debug != nil && isDebugReadOnlyTransactionError(err) {
+		if r.readOnly() {
+			var headerErr *lpDebugHeaderError
+			retryable := errors.As(err, &headerErr) || r.debugLeafMayRetry(f, n)
+			if retryable {
+				if switchErr := r.switchToReadWrite(f, n); switchErr != nil {
+					err = switchErr
+				} else {
+					sig, err = r.execNode(f, n, node)
+				}
 			}
-		} else {
+		}
+		if err != nil && isDebugReadOnlyTransactionError(err) {
 			err = debugReadOnlyRestartFailure(err)
 		}
 	}
@@ -657,6 +660,9 @@ func (r *lpRun) execSelectInto(f *lpFrame, n *psql.Node, node *LineProfileNode) 
 	if err != nil {
 		return err
 	}
+	// This path is used only when the SELECT is executed natively; a stepped-
+	// into selectable procedure runs through stepSelectInto instead.
+	r.markNativeProcedureWriteForNode(f.meta, n)
 	node.Metrics.Rows += int64(len(rows))
 	switch len(rows) {
 	case 0:
@@ -711,6 +717,7 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 	}
 	exhausted := false
 	childRan := false
+	nativeProcedureChecked := false
 	defer func() {
 		if open != nil {
 			f.popCursor(open)
@@ -728,6 +735,10 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 			return e
 		}); err != nil {
 			return lpContinue, err
+		}
+		if !nativeProcedureChecked {
+			r.markNativeProcedureWriteForNode(f.meta, n)
+			nativeProcedureChecked = true
 		}
 		if !hasRow {
 			exhausted = true

@@ -475,6 +475,136 @@ func TestDebugReadOnlyErrorOutsideRetryableNodeFails(t *testing.T) {
 	}
 }
 
+func TestDebugReadOnlyRetryErrorIsFatalAndNotCaught(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n  BEGIN\n" +
+		"    EXECUTE PROCEDURE P_READ;\n  WHEN ANY DO\n    X = 1;\n  END\nEND"
+	attempts := 0
+	execute := func(query string, _ TransactionOptions) (int64, error) {
+		if strings.HasPrefix(strings.ToUpper(query), "EXECUTE PROCEDURE P_READ") {
+			attempts++
+			return 0, &Error{Operation: "fake execute", SQLCode: -817, NativeCode: 335544361,
+				Message: "synthetic read-only transaction", gdsCodes: []int64{335544361}}
+		}
+		return 1, nil
+	}
+	callee := debugTxProcedure{name: "P_READ", body: "BEGIN\n  EXIT;\nEND", readsOnly: true}
+	s, run, _, _ := newDebugTxRun(t, body, []debugTxProcedure{callee},
+		func() (bool, error) { return false, nil }, execute, false)
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+	ended := sendDebugCommand(t, s, DebugCommand{Kind: DebugContinue})
+	if ended.Status != DebugEndedStatus || ended.Outcome != DebugFailed || attempts != 2 || ended.Err == nil ||
+		!strings.Contains(ended.Err.Error(), "This statement needs a read-write transaction; restart the debug session.") {
+		t.Fatalf("repeated read-only error = %+v, attempts=%d", ended, attempts)
+	}
+	if lineProfileRoutineHits(run.result.Routines[0], 6) != 0 {
+		t.Fatalf("WHEN ANY handler caught a repeated read-only transaction error; nodes = %+v", run.result.Routines[0].Nodes)
+	}
+}
+
+func TestDebugReadOnlyErrorInReadWritePhaseIsFatalAndNotCaught(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n  BEGIN\n" +
+		"    UPDATE LP_T SET A = 1;\n  WHEN ANY DO\n    X = 1;\n  END\nEND"
+	attempts := 0
+	execute := func(query string, _ TransactionOptions) (int64, error) {
+		if strings.HasPrefix(strings.ToUpper(query), "UPDATE LP_T") {
+			attempts++
+			return 0, &Error{Operation: "fake update", SQLCode: -817, NativeCode: 335544361,
+				Message: "synthetic read-only transaction", gdsCodes: []int64{335544361}}
+		}
+		return 1, nil
+	}
+	s, run, _, _ := newDebugTxRun(t, body, nil, func() (bool, error) { return false, nil }, execute, false)
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+	ended := sendDebugCommand(t, s, DebugCommand{Kind: DebugContinue})
+	if ended.Status != DebugEndedStatus || ended.Outcome != DebugFailed || attempts != 1 || ended.Err == nil ||
+		!strings.Contains(ended.Err.Error(), "This statement needs a read-write transaction; restart the debug session.") {
+		t.Fatalf("read-only error in read-write phase = %+v, attempts=%d", ended, attempts)
+	}
+	if lineProfileRoutineHits(run.result.Routines[0], 6) != 0 {
+		t.Fatalf("WHEN ANY handler caught a read-only transaction error in read-write phase; nodes = %+v", run.result.Routines[0].Nodes)
+	}
+}
+
+func TestDebugNativeSelectableProcedureCallsMarkWritten(t *testing.T) {
+	procedure := debugTxProcedure{
+		name:    "P_WRITE",
+		body:    "BEGIN\n  UPDATE LP_T SET A = 1;\n  SUSPEND;\nEND",
+		inputs:  []lpParam{{name: "N", typeText: "INTEGER"}},
+		outputs: []lpParam{{name: "ID", typeText: "INTEGER"}},
+	}
+	tests := []struct {
+		name, body string
+		startPhase DebugPhase
+		pauseLine  int
+	}{
+		{
+			name:       "select into",
+			body:       "DECLARE VARIABLE X INTEGER;\nBEGIN\n  SELECT ID FROM P_WRITE(1) INTO :X;\n  X = X + 1;\nEND",
+			startPhase: DebugReadOnly, pauseLine: 4,
+		},
+		{
+			name:       "for select",
+			body:       "DECLARE VARIABLE X INTEGER;\nBEGIN\n  FOR SELECT ID FROM P_WRITE(1) INTO :X DO\n    X = X + 1;\n  X = 3;\nEND",
+			startPhase: DebugReadWrite, pauseLine: 4,
+		},
+		{
+			name:       "expression subquery",
+			body:       "DECLARE VARIABLE X INTEGER;\nBEGIN\n  X = (SELECT ID FROM P_WRITE(1));\n  X = X + 1;\nEND",
+			startPhase: DebugReadOnly, pauseLine: 4,
+		},
+		{
+			name:       "condition subquery",
+			body:       "DECLARE VARIABLE X INTEGER;\nBEGIN\n  IF ((SELECT ID FROM P_WRITE(1)) = 1) THEN X = 2;\nEND",
+			startPhase: DebugReadOnly, pauseLine: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows := 0
+			s, _, _, _ := newDebugTxRun(t, tt.body, []debugTxProcedure{procedure}, func() (bool, error) {
+				rows++
+				return rows == 1, nil
+			}, nil, false)
+			t.Cleanup(func() { s.Stop() })
+			if snap := nextDebugStop(t, s); snap.Phase != tt.startPhase {
+				t.Fatalf("entry phase = %s, want %s", snap.Phase, tt.startPhase)
+			}
+			snap := sendDebugCommand(t, s, DebugCommand{Kind: DebugStepOver})
+			if snap.Status != DebugPaused || snap.Frames[0].Line != tt.pauseLine || snap.Phase != DebugWritten {
+				t.Fatalf("after native selectable procedure = %+v, want pause at line %d with written phase", snap, tt.pauseLine)
+			}
+		})
+	}
+}
+
+func TestDebugEmulatedSelectableProcedureIsNotMarkedNative(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n" +
+		"  FOR SELECT ID FROM P_WRITE(1) INTO :X DO\n    X = X + 1;\nEND"
+	procedure := debugTxProcedure{
+		name:    "P_WRITE",
+		body:    "BEGIN\n  UPDATE LP_T SET A = 1;\n  SUSPEND;\nEND",
+		inputs:  []lpParam{{name: "N", typeText: "INTEGER"}},
+		outputs: []lpParam{{name: "ID", typeText: "INTEGER"}},
+	}
+	rows := 0
+	s, _, _, _ := newDebugTxRun(t, body, []debugTxProcedure{procedure}, func() (bool, error) {
+		rows++
+		return rows == 1, nil
+	}, nil, false)
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+	snap := sendDebugCommand(t, s, DebugCommand{Kind: DebugStepInto})
+	if snap.Status != DebugPaused || snap.Frames[0].Routine != "P_WRITE" || snap.Phase != DebugReadWrite {
+		t.Fatalf("paused in emulated selectable procedure before its update = %+v", snap)
+	}
+	snap = sendDebugCommand(t, s, DebugCommand{Kind: DebugStepOver})
+	if snap.Status != DebugPaused || snap.Phase != DebugWritten {
+		t.Fatalf("emulated procedure update phase = %+v, want written after its update", snap)
+	}
+}
+
 func TestDebugReadOnlyTransactionErrorName(t *testing.T) {
 	if code, ok := GDSCodeByName("read_only_trans"); !ok || code != 335544361 {
 		t.Fatalf("read_only_trans = %d, %v; want 335544361", code, ok)

@@ -247,6 +247,40 @@ func debugSiteInRanges(line int, ranges []debugLineRange) bool {
 	return false
 }
 
+func (r *lpRun) markNativeProcedureWrite(meta *lpRoutineMeta, ranges []debugLineRange) {
+	if r.debug == nil {
+		return
+	}
+	for _, site := range r.procedureSites(meta) {
+		if !debugSiteInRanges(site.line, ranges) {
+			continue
+		}
+		callee := r.plan.procs[site.name]
+		if callee == nil || !callee.readsOnly {
+			r.debug.didNativeWrite()
+			return
+		}
+	}
+}
+
+func (r *lpRun) markNativeProcedureWriteForNode(meta *lpRoutineMeta, node *psql.Node) {
+	if r.debug == nil {
+		return
+	}
+	_, ranges := debugNodeHeaderTexts(node)
+	r.markNativeProcedureWrite(meta, ranges)
+}
+
+func (r *lpRun) markNativeProcedureWriteForExpr(meta *lpRoutineMeta, expr *psql.Expr) {
+	if r.debug == nil || expr == nil {
+		return
+	}
+	r.markNativeProcedureWrite(meta, []debugLineRange{{
+		first: expr.Line,
+		last:  expr.Line + strings.Count(expr.Text, "\n"),
+	}})
+}
+
 func textContainsGenID(text string) bool {
 	found := false
 	wordsIn(text, func(start, end int, _, _ bool) {
