@@ -11,7 +11,7 @@ func buildDebugSnapshot(d *debugState, current *lpFrame, node *psql.Node, status
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := DebugSnapshot{
-		Status: status, Phase: d.phase,
+		Status: status, Phase: d.phase, Mixed: d.mixed,
 		Statements: d.statements,
 		Messages:   append([]DebugMessage(nil), d.messages...),
 	}

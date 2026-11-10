@@ -197,19 +197,23 @@ type debugState struct {
 	session *DebugSession
 	run     *lpRun
 
-	mode        DebugCommandKind
-	firstStop   bool
-	stopDepth   int
-	runTo       DebugBreakpoint
-	stepFrameID int
-	stepNode    *psql.Node
+	mode         DebugCommandKind
+	firstStop    bool
+	currentFrame *lpFrame
+	stopDepth    int
+	runTo        DebugBreakpoint
+	stepFrameID  int
+	stepNode     *psql.Node
 
 	pauseRequested atomic.Bool
 	breakpoints    map[DebugBreakpoint]struct{}
 	previous       map[int]map[string]any
 	statements     int64
 	phase          DebugPhase
+	mixed          string
 	messages       []DebugMessage
+	pending        []string
+	debugForceLazy bool // offline safety-net test seam
 }
 
 func newDebugSession(ctx context.Context, analysis DebugAnalysis, opts DebugOptions) *DebugSession {
@@ -227,7 +231,7 @@ func newDebugSession(ctx context.Context, analysis DebugAnalysis, opts DebugOpti
 		latest:    DebugSnapshot{Status: DebugRunning},
 	}
 	phase := DebugReadOnly
-	if analysis.MayWrite && opts.AllowWrites {
+	if analysis.ReadWriteFromStart {
 		phase = DebugReadWrite
 	}
 	s.debug = &debugState{
@@ -464,24 +468,26 @@ func (s *DebugSession) runDebug(pooled *sql.Conn, plan *lpPlan) {
 			beginErr = ErrNotInterBaseConn
 			return nil
 		}
+		readWriteFromStart := s.analysis.ReadWriteFromStart
 		result := &LineProfileResult{
-			ReadOnly: !plan.analysis.MayWrite,
+			ReadOnly: !readWriteFromStart,
 			Columns:  entryColumns(plan),
 			Routines: []LineProfileRoutine{newRoutineProfile(plan.entry)},
 		}
 		lineOpts := LineProfileOptions{
-			SQL: s.opts.SQL, Dialect: s.opts.Dialect, ReadOnly: !plan.analysis.MayWrite,
+			SQL: s.opts.SQL, Dialect: s.opts.Dialect, ReadOnly: !readWriteFromStart,
 			KeepRows: s.opts.KeepRows, MaxBlobBytes: s.opts.MaxBlobBytes,
 		}
-		run, err := beginRun(s.ctx, c, plan, lineOpts, result, debugStepIntoSet(plan))
+		txOptions := TransactionOptions{ReadOnly: !readWriteFromStart, Isolation: sql.LevelReadCommitted, NoWait: readWriteFromStart}
+		run, err := beginRunWithTransactionOptions(s.ctx, c, plan, lineOpts, result, debugStepIntoSet(plan), txOptions)
 		if err != nil {
 			beginErr = err
 			return nil
 		}
-		if plan.analysis.MayWrite {
+		if readWriteFromStart {
 			reason := s.analysis.ReadWriteReason
 			if reason == "" {
-				reason = "routine may write"
+				reason = "writes may occur inside an open cursor"
 			}
 			s.debug.addMessage(DebugMessage{Kind: "info", Text: "Started read-write: " + reason + "."})
 		} else {
@@ -511,9 +517,10 @@ func (s *DebugSession) attachRun(run *lpRun) {
 	run.debug = s.debug
 	run.hook = s.debug.hook
 	phase := s.debug.phase
+	mixed := s.debug.mixed
 	messages := append([]DebugMessage(nil), s.debug.messages...)
 	s.mu.Unlock()
-	s.publish(DebugSnapshot{Status: DebugRunning, Phase: phase, Messages: messages})
+	s.publish(DebugSnapshot{Status: DebugRunning, Phase: phase, Mixed: mixed, Messages: messages})
 }
 
 func (s *DebugSession) finishStartError(err error) {
@@ -522,6 +529,7 @@ func (s *DebugSession) finishStartError(err error) {
 		s.mu.Lock()
 		s.ended = true
 		phase := s.debug.phase
+		mixed := s.debug.mixed
 		messages := append([]DebugMessage(nil), s.debug.messages...)
 		s.mu.Unlock()
 		outcome := DebugFailed
@@ -529,7 +537,7 @@ func (s *DebugSession) finishStartError(err error) {
 			outcome, unwrapped, at = DebugStopped, nil, nil
 		}
 		s.publish(DebugSnapshot{
-			Status: DebugEndedStatus, Phase: phase, Messages: messages,
+			Status: DebugEndedStatus, Phase: phase, Mixed: mixed, Messages: messages,
 			Outcome: outcome, Err: unwrapped, FailedAt: at,
 		})
 		close(s.done)
@@ -556,10 +564,11 @@ func (s *DebugSession) finishRun(run *lpRun, outcomeErr, txErr error) {
 		s.mu.Lock()
 		s.ended = true
 		phase := s.debug.phase
+		mixed := s.debug.mixed
 		messages := append([]DebugMessage(nil), s.debug.messages...)
 		s.mu.Unlock()
 		snap := DebugSnapshot{
-			Status: DebugEndedStatus, Phase: phase, Messages: messages,
+			Status: DebugEndedStatus, Phase: phase, Mixed: mixed, Messages: messages,
 			Outcome: outcome, Err: runErr, FailedAt: location,
 		}
 		if run != nil && run.result != nil {
@@ -583,13 +592,21 @@ func (d *debugState) countStatement() {
 
 func (d *debugState) didExecute(n *psql.Node) {
 	switch n.Kind {
-	case psql.NodeInsert, psql.NodeUpdate, psql.NodeDelete, psql.NodeExecProc, psql.NodeExecStmt, psql.NodeForExecStmt:
+	case psql.NodeInsert, psql.NodeUpdate, psql.NodeDelete, psql.NodeExecStmt, psql.NodeForExecStmt:
 		d.session.mu.Lock()
 		if d.phase == DebugReadWrite {
 			d.phase = DebugWritten
 		}
 		d.session.mu.Unlock()
 	}
+}
+
+func (d *debugState) didNativeWrite() {
+	d.session.mu.Lock()
+	if d.phase == DebugReadWrite {
+		d.phase = DebugWritten
+	}
+	d.session.mu.Unlock()
 }
 
 func (d *debugState) addMessage(message DebugMessage) {
@@ -602,12 +619,29 @@ func (d *debugState) hook(f *lpFrame, n *psql.Node) error {
 	if err := d.session.ctx.Err(); err != nil {
 		return err
 	}
-	if !d.shouldStop(f, n) {
-		return nil
+	if d.shouldStop(f, n) {
+		snapshot := buildDebugSnapshot(d, f, n, DebugPaused)
+		d.session.publish(snapshot)
+		if err := d.pauseLoop(f, n); err != nil {
+			return err
+		}
 	}
-	snapshot := buildDebugSnapshot(d, f, n, DebugPaused)
-	d.session.publish(snapshot)
-	return d.pauseLoop(f, n)
+	d.session.mu.Lock()
+	readOnly := d.phase == DebugReadOnly
+	if readOnly {
+		d.currentFrame = f
+	}
+	d.session.mu.Unlock()
+	if readOnly {
+		mayWrite := d.run.nodeMayWrite(f.meta, n)
+		d.session.mu.Lock()
+		d.currentFrame = nil
+		d.session.mu.Unlock()
+		if mayWrite {
+			return d.run.switchToReadWrite(f, n)
+		}
+	}
+	return nil
 }
 
 func (d *debugState) shouldStop(f *lpFrame, n *psql.Node) bool {
@@ -787,9 +821,7 @@ func debugAnalysisFromPlan(plan *lpPlan) DebugAnalysis {
 		return DebugAnalysis{}
 	}
 	analysis := DebugAnalysis{LineProfileAnalysis: cloneLineProfileAnalysis(plan.analysis)}
-	if plan.analysis.MayWrite {
-		analysis.ReadWriteReason = "routine may write"
-	}
+	analysis.ReadWriteFromStart, analysis.ReadWriteReason = debugStartAnalysis(plan)
 	for _, name := range debugReachableRoutines(plan) {
 		meta := plan.procs[name]
 		if meta == nil {

@@ -68,18 +68,29 @@ type lpRun struct {
 	// stepDecider can dynamically choose which analyzed callees to emulate.
 	stepDecider func(f *lpFrame, n *psql.Node, callee string) bool
 	debug       *debugState
+	retired     *lpRetiredTransaction
 }
 
-// runInTransaction runs the entry routine inside the run's transaction and
-// always rolls it back. Every prepared statement of the run is closed before
-// the rollback on every path; cursors are closed where they are opened. The
-// first error is the run outcome; the second is a close or rollback failure.
+type lpRetiredTransaction struct {
+	tx         *Transaction
+	statements map[string]cachedStatement
+	open       int
+}
+
+// runInTransaction runs the entry routine inside the run's transaction.
+// Line-profile runs always roll back; debug runs commit only transactions that
+// remained read-only and always roll back their read-write transaction. Every
+// prepared statement is closed before its transaction completes.
 func (r *lpRun) runInTransaction() (outcomeErr, txErr error) {
-	txErr = runProfileTransaction(r.tx.Rollback, func() (closeErr error) {
-		defer func() { closeErr = r.closeStatements() }()
-		outcomeErr = r.runEntry()
-		return nil
-	}, &r.result.RolledBack)
+	if r.debug != nil {
+		outcomeErr, txErr = r.runDebugTransaction()
+	} else {
+		txErr = runProfileTransaction(r.tx.Rollback, func() (closeErr error) {
+			defer func() { closeErr = r.closeStatements() }()
+			outcomeErr = r.runEntry()
+			return nil
+		}, &r.result.RolledBack)
+	}
 	for _, profile := range r.routines[min(1, len(r.routines)):] {
 		r.result.Routines = append(r.result.Routines, *profile)
 	}
@@ -88,6 +99,24 @@ func (r *lpRun) runInTransaction() (outcomeErr, txErr error) {
 		clearCounters(r.result.Routines)
 		r.result.OverheadActivity = ActivityDelta{}
 	}
+	return outcomeErr, txErr
+}
+
+func (r *lpRun) runDebugTransaction() (outcomeErr, txErr error) {
+	outcomeErr = r.runEntry()
+	txErr = errors.Join(txErr, r.closeStatements())
+	if r.tx != nil {
+		if r.readOnly() {
+			txErr = errors.Join(txErr, r.tx.Commit())
+		} else {
+			err := r.tx.Rollback()
+			if err == nil {
+				r.result.RolledBack = true
+			}
+			txErr = errors.Join(txErr, err)
+		}
+	}
+	txErr = errors.Join(txErr, r.finishRetiredTransaction())
 	return outcomeErr, txErr
 }
 
@@ -176,6 +205,19 @@ func (r *lpRun) exec(f *lpFrame, n *psql.Node) (lpSignal, error) {
 		node.Metrics.Hits++
 	}
 	sig, err := r.execNode(f, n, node)
+	if err != nil && r.debug != nil && r.readOnly() && isDebugReadOnlyTransactionError(err) {
+		var headerErr *lpDebugHeaderError
+		retryable := errors.As(err, &headerErr) || r.debugLeafMayRetry(f, n)
+		if retryable {
+			if switchErr := r.switchToReadWrite(f, n); switchErr != nil {
+				err = switchErr
+			} else {
+				sig, err = r.execNode(f, n, node)
+			}
+		} else {
+			err = debugReadOnlyRestartFailure(err)
+		}
+	}
 	if err == nil && r.debug != nil {
 		r.debug.didExecute(n)
 	}
@@ -239,7 +281,7 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 	case psql.NodeIf:
 		ok, err := r.evalCond(f, node, n.Cond)
 		if err != nil {
-			return lpContinue, err
+			return lpContinue, r.debugHeaderError(err)
 		}
 		if ok {
 			return r.exec(f, n.Children[0])
@@ -249,6 +291,7 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 		}
 		return lpContinue, nil
 	case psql.NodeWhile:
+		childRan := false
 		for {
 			if r.hook != nil {
 				if err := r.beforeStatement(f, n); err != nil {
@@ -258,8 +301,12 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 			node.Metrics.Hits++
 			ok, err := r.evalCond(f, node, n.Cond)
 			if err != nil || !ok {
+				if err != nil && !childRan {
+					err = r.debugHeaderError(err)
+				}
 				return lpContinue, err
 			}
+			childRan = true
 			sig, err := r.exec(f, n.Children[0])
 			if err != nil || sig == lpExit {
 				return sig, err
@@ -396,6 +443,10 @@ func (r *lpRun) execBlock(f *lpFrame, n *psql.Node) (lpSignal, error) {
 func (r *lpRun) startSavepoint(f *lpFrame) (string, error) {
 	f.savepoints++
 	name := fmt.Sprintf("LP$SP_%d_%d", f.id, f.savepoints)
+	if r.debug != nil && r.readOnly() {
+		r.debug.addPendingSavepoint(name)
+		return name, nil
+	}
 	return name, r.savepoint("SAVEPOINT " + name)
 }
 
@@ -438,6 +489,17 @@ func (r *lpRun) runHandlers(f *lpFrame, n *psql.Node, first int) (lpSignal, erro
 // activity snapshot follows, whether or not it succeeded, so that its
 // counters (an undo's backouts) are overhead, not the next node's.
 func (r *lpRun) savepoint(text string) error {
+	if r.debug != nil && r.readOnly() {
+		if operation, name, ok := parseSavepointOperation(text); ok && r.debug.isPendingSavepoint(name) {
+			switch operation {
+			case "release":
+				r.debug.removePendingSavepoint(name)
+			case "rollback":
+				r.debug.rollbackPendingSavepoint(name)
+			}
+			return nil
+		}
+	}
 	start := time.Now()
 	_, err := r.tx.Exec(r.ctx, text)
 	r.result.Savepoints += time.Since(start)
@@ -455,6 +517,9 @@ func (r *lpRun) closeCursor(cursor *Cursor, exhausted bool) error {
 	err := cursor.Close()
 	if !exhausted {
 		err = errors.Join(err, fatal(r.snapshot(nil)))
+	}
+	if r.retired != nil && cursor != nil && cursor.tx == r.retired.tx {
+		err = errors.Join(err, r.retiredCursorClosed())
 	}
 	return err
 }
@@ -630,7 +695,7 @@ func (r *lpRun) assignRow(f *lpFrame, node *LineProfileNode, targets []string, r
 func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (sig lpSignal, err error) {
 	b, cast, err := r.bindSelect(f, n, node)
 	if err != nil {
-		return lpContinue, err
+		return lpContinue, r.debugHeaderError(err)
 	}
 	node.SQL = b.text
 	var cursor *Cursor
@@ -638,18 +703,22 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 		cursor, e = b.stmt.Query(r.ctx, b.args...)
 		return e
 	}); err != nil {
-		return lpContinue, err
+		return lpContinue, r.debugHeaderError(err)
 	}
 	var open *lpOpenCursor
 	if r.debug != nil {
 		open = f.pushCursor(n.Line, n.Into)
 	}
 	exhausted := false
+	childRan := false
 	defer func() {
 		if open != nil {
 			f.popCursor(open)
 		}
 		err = errors.Join(err, r.closeCursor(cursor, exhausted))
+		if err != nil && !childRan {
+			err = r.debugHeaderError(err)
+		}
 	}()
 	outputs := b.stmt.Outputs()
 	for {
@@ -675,6 +744,7 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 		if err := r.assignRow(f, node, n.Into, row, outputs, cast); err != nil {
 			return lpContinue, err
 		}
+		childRan = true
 		sig, err := r.exec(f, n.Children[0])
 		if err != nil || sig == lpExit {
 			return sig, err
@@ -751,14 +821,21 @@ func (r *lpRun) execProcedure(f *lpFrame, n *psql.Node, node *LineProfileNode) e
 	outputs := b.stmt.Outputs()
 	if len(outputs) == 0 {
 		node.SQL = b.text
-		return r.serverCall(node, func() error {
+		err := r.serverCall(node, func() error {
 			_, e := b.stmt.Exec(r.ctx, b.args...)
 			return e
 		})
+		if err == nil && !callee.readsOnly && r.debug != nil {
+			r.debug.didNativeWrite()
+		}
+		return err
 	}
 	rows, err := r.queryRows(node, b, 1)
 	if err != nil {
 		return err
+	}
+	if !callee.readsOnly && r.debug != nil {
+		r.debug.didNativeWrite()
 	}
 	if len(rows) == 0 || len(n.Returning) == 0 {
 		return nil

@@ -109,7 +109,7 @@ func nativeCallSites(plan *lpPlan, stepInto map[string]bool) []LineProfileCallSi
 // prepare, the plain text is used and runsAhead is the call site to label.
 func (r *lpRun) procedureCursorText(f *lpFrame, n *psql.Node, node *LineProfileNode) (string, *LineProfileCallSite) {
 	text := n.SQL.Text
-	if n.Kind != psql.NodeForSelect || r.opts.ReadOnly || hasForUpdate(text) {
+	if n.Kind != psql.NodeForSelect || r.readOnly() || hasForUpdate(text) {
 		return text, nil
 	}
 	procedure, ok := r.procedureCursorWrites(f.meta, n)

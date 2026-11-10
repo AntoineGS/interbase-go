@@ -446,6 +446,24 @@ func TestLineProfileForExecuteStatement(t *testing.T) {
 	}
 }
 
+func TestLineProfileForExecuteStatementHeaderDoesNotWrapErrorsAsDebugHeader(t *testing.T) {
+	wantErr := errors.New("synthetic dynamic fetch failure")
+	run, _, _ := newLineProfileDynamicRun(t,
+		"DECLARE VARIABLE X INTEGER;\nBEGIN\n"+
+			"  FOR EXECUTE STATEMENT 'SELECT ID FROM LP_T' INTO :X DO\n"+"    X = X;\nEND",
+		[]string{"X"}, func() (bool, error) { return false, wantErr }, nil)
+	run.procedureNames = map[string]bool{"LP_T": false}
+
+	outcome, _ := run.runInTransaction()
+	if !errors.Is(outcome, wantErr) {
+		t.Fatalf("run outcome = %v, want underlying error %v", outcome, wantErr)
+	}
+	var headerErr *lpDebugHeaderError
+	if errors.As(outcome, &headerErr) {
+		t.Fatalf("non-debug line-profile outcome contains debugger-only header wrapper: %v", headerErr)
+	}
+}
+
 // TestLineProfileDynamicCloseFailureKeepsStatement checks that an evicted
 // or refused dynamic statement leaves the run's statements only once it is
 // closed, so that closeStatements still closes it when its close fails.

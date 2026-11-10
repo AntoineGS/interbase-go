@@ -16,7 +16,7 @@ var gdsCodesByName = map[string]int64{
 	"no_cur_rec":                       335544348,
 	"no_dup":                           335544349,
 	"no_record":                        335544354,
-	"read_only_trans":                  335544361,
+	"read_only_trans":                  335544361, // isc_read_only_trans
 	"read_only_view":                   335544362,
 	"req_sync":                         335544364,
 	"stream_eof":                       335544374,

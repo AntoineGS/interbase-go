@@ -353,10 +353,14 @@ func profileOnConn(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileO
 // opts.ReadOnly) on c; the run measures into result.
 func beginRun(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileOptions,
 	result *LineProfileResult, stepInto map[string]bool) (*lpRun, error) {
-	tx, err := (&Attachment{conn: c}).BeginTx(ctx, TransactionOptions{
-		ReadOnly:  opts.ReadOnly,
-		Isolation: sql.LevelReadCommitted,
+	return beginRunWithTransactionOptions(ctx, c, plan, opts, result, stepInto, TransactionOptions{
+		ReadOnly: opts.ReadOnly, Isolation: sql.LevelReadCommitted,
 	})
+}
+
+func beginRunWithTransactionOptions(ctx context.Context, c *conn, plan *lpPlan, opts LineProfileOptions,
+	result *LineProfileResult, stepInto map[string]bool, txOptions TransactionOptions) (*lpRun, error) {
+	tx, err := (&Attachment{conn: c}).BeginTx(ctx, txOptions)
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,7 @@ package interbase
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"reflect"
 	"strings"
@@ -40,8 +41,22 @@ func newDebugFakeRunFromRun(t *testing.T, makeRun func() (*lpRun, *lineProfileFa
 	if run.plan.entry.source == "" {
 		run.plan.entry.source = "BEGIN END"
 	}
+	markDebugFakeReadOnlyCallees(run.plan)
 	analysis := debugAnalysisFromPlan(run.plan)
-	s := newDebugSession(context.Background(), analysis, DebugOptions{KeepRows: 200})
+	initial := TransactionOptions{ReadOnly: !analysis.ReadWriteFromStart,
+		Isolation: sql.LevelReadCommitted, NoWait: analysis.ReadWriteFromStart}
+	if counts != nil {
+		execute := func(query string, _ TransactionOptions) (int64, error) {
+			if counts.execute == nil {
+				return 0, nil
+			}
+			return counts.execute(query)
+		}
+		_, tx := beginDebugFakeTransaction(t, run, counts, initial, counts.next, execute)
+		run.tx = tx
+	}
+	run.opts.ReadOnly = initial.ReadOnly
+	s := newDebugSession(context.Background(), analysis, DebugOptions{KeepRows: 200, AllowWrites: true})
 	run.opts.KeepRows = 200
 	s.attachRun(run)
 	go func() {
@@ -380,10 +395,14 @@ func TestDebugStopDuringServerCall(t *testing.T) {
 		t.Fatal("fake fetch did not start")
 	}
 	snap := stopDebugSession(t, s)
-	if snap.Status != DebugEndedStatus || snap.Outcome != DebugStopped || !run.result.RolledBack || !counts.rolledBack {
+	if snap.Status != DebugEndedStatus || snap.Outcome != DebugStopped || counts.rolledBack || !debugFakeCommitted(counts) {
 		t.Fatalf("stopped snapshot/result = %+v, rolledBack=%v counts=%+v", snap, run.result.RolledBack, counts)
 	}
-	assertLineProfileFakeClosed(t, run, counts)
+	if counts.closed != counts.prepared || counts.cursorsClosed != counts.queried ||
+		len(run.statements) != 0 || len(run.tx.cursors) != 0 || len(run.tx.prepared) != 0 {
+		t.Fatalf("stopped read-only debug run leaked resources: counts=%+v statements=%d cursors=%d prepared=%d",
+			counts, len(run.statements), len(run.tx.cursors), len(run.tx.prepared))
+	}
 }
 
 func TestDebugStopWithFullSnapshotBuffer(t *testing.T) {
@@ -421,7 +440,7 @@ func TestDebugStopWithFullSnapshotBuffer(t *testing.T) {
 		t.Fatal("Stop blocked with a full snapshot buffer and no reader")
 	}
 	snap := s.Latest()
-	if snap.Status != DebugEndedStatus || snap.Outcome != DebugStopped || !run.result.RolledBack || !counts.rolledBack {
+	if snap.Status != DebugEndedStatus || snap.Outcome != DebugStopped || counts.rolledBack || !debugFakeCommitted(counts) {
 		t.Fatalf("stopped snapshot/result = %+v, rolledBack=%v counts=%+v", snap, run.result.RolledBack, counts)
 	}
 	if len(run.statements) != 0 || len(run.tx.cursors) != 0 || len(run.tx.prepared) != 0 {
