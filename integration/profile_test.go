@@ -189,4 +189,53 @@ func TestProfileRunsAndAlwaysRollsBack(t *testing.T) {
 			t.Fatalf("caller Rollback(): %v", err)
 		}
 	})
+
+	t.Run("write beside caller transaction is measured and rolled back", func(t *testing.T) {
+		callerTx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelReadCommitted})
+		if err != nil {
+			t.Fatalf("caller BeginTx(): %v", err)
+		}
+		defer func() { _ = callerTx.Rollback() }()
+		rows, err := callerTx.QueryContext(ctx, "SELECT ID FROM PF_T ORDER BY ID")
+		if err != nil {
+			t.Fatalf("caller QueryContext(): %v", err)
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			t.Fatalf("caller first Next(): %v", rows.Err())
+		}
+
+		result, err := interbase.Profile(ctx, conn, "UPDATE PF_T SET V = V + 1", interbase.ProfileOptions{})
+		if err != nil {
+			t.Fatalf("Profile(UPDATE) beside caller cursor: %v", err)
+		}
+		if !result.RolledBack || !result.Complete || result.ReturnsRows {
+			t.Fatalf("Profile(UPDATE) beside caller cursor = %+v, want complete and rolled back", result)
+		}
+		if got := result.Activity.Tables[relationID].Updates; got != 1000 {
+			t.Fatalf("PF_T Updates = %d, want 1000", got)
+		}
+		if result.RelationNames[relationID] != "PF_T" {
+			t.Fatalf("PF_T relation name = %q, want PF_T", result.RelationNames[relationID])
+		}
+
+		if !rows.Next() {
+			t.Fatalf("caller second Next() after Profile(UPDATE): %v", rows.Err())
+		}
+		var second int64
+		if err := rows.Scan(&second); err != nil || second != 2 {
+			t.Fatalf("caller second row = %d, %v; want 2", second, err)
+		}
+		_ = rows.Close()
+		if err := callerTx.Rollback(); err != nil {
+			t.Fatalf("caller Rollback(): %v", err)
+		}
+		var value int64
+		if err := conn.QueryRowContext(ctx, "SELECT V FROM PF_T WHERE ID = 1").Scan(&value); err != nil {
+			t.Fatalf("read PF_T value after Profile(UPDATE): %v", err)
+		}
+		if value != 10 {
+			t.Fatalf("PF_T value after Profile(UPDATE) beside caller = %d, want 10", value)
+		}
+	})
 }
