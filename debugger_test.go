@@ -170,6 +170,97 @@ func TestDebugStepIntoExecuteProcedure(t *testing.T) {
 	}
 }
 
+func TestDebugStepIntoRecursiveEntry(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n  EXECUTE PROCEDURE LP_FAKE;\n  X = 1;\nEND"
+	s, _, _ := newDebugFakeRun(t, body, func() (bool, error) { return false, nil })
+	t.Cleanup(func() { s.Stop() })
+	if got := nextDebugStop(t, s).Frames[0].Line; got != 3 {
+		t.Fatalf("entry line %d, want 3", got)
+	}
+
+	snap := sendDebugCommand(t, s, DebugCommand{Kind: DebugStepInto})
+	if len(snap.Frames) != 2 || snap.Frames[0].Routine != "LP_FAKE" || snap.Frames[1].Routine != "LP_FAKE" || snap.Frames[0].Line != 3 {
+		t.Fatalf("recursive step-into frames = %+v, want recursive LP_FAKE call at line 3", snap.Frames)
+	}
+}
+
+func TestDebugStepIntoIndirectRecursiveEntry(t *testing.T) {
+	body := "BEGIN\n  EXECUTE PROCEDURE P_A;\n  X = 1;\nEND"
+	procs := []lineProfileTestProc{
+		{name: "P_A", body: "BEGIN\n  EXECUTE PROCEDURE P_B;\nEND"},
+		{name: "P_B", body: "BEGIN\n  EXECUTE PROCEDURE LP_FAKE;\nEND"},
+	}
+	s, _ := newDebugFakeStepRun(t, body, procs, func() (bool, error) { return false, nil })
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+
+	for _, want := range [][]string{
+		{"P_A", "LP_FAKE"},
+		{"P_B", "P_A", "LP_FAKE"},
+		{"LP_FAKE", "P_B", "P_A", "LP_FAKE"},
+	} {
+		snap := sendDebugCommand(t, s, DebugCommand{Kind: DebugStepInto})
+		got := make([]string, len(snap.Frames))
+		for i := range snap.Frames {
+			got[i] = snap.Frames[i].Routine
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("indirect recursive step-into frames = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestDebugBreakpointInRecursiveEntry(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n  EXECUTE PROCEDURE LP_FAKE;\n  X = 1;\nEND"
+	s, _, _ := newDebugFakeRun(t, body, func() (bool, error) { return false, nil })
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+	if accepted := s.SetBreakpoints([]DebugBreakpoint{{Routine: "LP_FAKE", Line: 3}}); len(accepted) != 1 {
+		t.Fatalf("accepted recursive breakpoint = %+v", accepted)
+	}
+
+	snap := sendDebugCommand(t, s, DebugCommand{Kind: DebugContinue})
+	if snap.Status != DebugPaused || len(snap.Frames) != 2 || snap.Frames[0].Routine != "LP_FAKE" || snap.Frames[1].Routine != "LP_FAKE" || snap.Frames[0].Line != 3 {
+		t.Fatalf("recursive breakpoint stop = %+v, want the recursive entry frame at line 3", snap)
+	}
+}
+
+func TestDebugBreakpointInIndirectRecursiveEntry(t *testing.T) {
+	body := "BEGIN\n  EXECUTE PROCEDURE P_A;\n  X = 1;\nEND"
+	procs := []lineProfileTestProc{
+		{name: "P_A", body: "BEGIN\n  EXECUTE PROCEDURE P_B;\nEND"},
+		{name: "P_B", body: "BEGIN\n  EXECUTE PROCEDURE LP_FAKE;\nEND"},
+	}
+	s, _ := newDebugFakeStepRun(t, body, procs, func() (bool, error) { return false, nil })
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+	if accepted := s.SetBreakpoints([]DebugBreakpoint{{Routine: "LP_FAKE", Line: 2}}); len(accepted) != 1 {
+		t.Fatalf("accepted indirect recursive breakpoint = %+v", accepted)
+	}
+
+	snap := sendDebugCommand(t, s, DebugCommand{Kind: DebugContinue})
+	want := []string{"LP_FAKE", "P_B", "P_A", "LP_FAKE"}
+	got := make([]string, len(snap.Frames))
+	for i := range snap.Frames {
+		got[i] = snap.Frames[i].Routine
+	}
+	if snap.Status != DebugPaused || !reflect.DeepEqual(got, want) || snap.Frames[0].Line != 2 {
+		t.Fatalf("indirect recursive breakpoint stop = %+v, want frames %v at line 2", snap, want)
+	}
+}
+
+func TestDebugRecursiveEntryRespectsMaxDepth(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n  EXECUTE PROCEDURE LP_FAKE;\n  X = 1;\nEND"
+	s, _, _ := newDebugFakeRun(t, body, func() (bool, error) { return false, nil })
+	t.Cleanup(func() { s.Stop() })
+	_ = nextDebugStop(t, s)
+
+	snap := sendDebugCommand(t, s, DebugCommand{Kind: DebugRunTo, Routine: "LP_FAKE", Line: 4})
+	if snap.Status != DebugEndedStatus || snap.Outcome != DebugFailed || snap.Err == nil || !strings.Contains(snap.Err.Error(), "depth limit of 32") {
+		t.Fatalf("recursive run-to result = %+v, want failure at the stepping depth limit", snap)
+	}
+}
+
 func TestDebugStepIntoSelectableCallee(t *testing.T) {
 	body := "BEGIN\n  FOR SELECT I FROM LP_GEN(3) INTO :X DO\n    X = X + 1;\nEND"
 	s, _ := newDebugFakeStepRun(t, body, []lineProfileTestProc{lpGen}, func() (bool, error) { return false, nil })
@@ -580,29 +671,37 @@ func TestDebugContinueRejectsEvaluationAdmissionInProgress(t *testing.T) {
 
 func TestLineProfileUnaffectedByDebugHook(t *testing.T) {
 	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n  BEGIN\n    UPDATE LP_T SET A = 1;\n  WHEN ANY DO X = 0;\n  END\nEND"
-	makeRun := func() (*lpRun, *[]string) {
-		return newLineProfileHandlerRun(t, context.Background(), body)
-	}
-	first, firstSavepoints := makeRun()
-	second, secondSavepoints := makeRun()
-	if first.hook != nil || second.hook != nil || first.noMeasure || second.noMeasure {
+	run, savepoints := newLineProfileHandlerRun(t, context.Background(), body)
+	if run.hook != nil || run.noMeasure {
 		t.Fatal("ordinary line-profile runs must keep debug hooks and noMeasure disabled")
 	}
-	for i, run := range []*lpRun{first, second} {
-		outcome, txErr := run.runInTransaction()
-		if outcome != nil || txErr != nil {
-			t.Fatalf("run %d: %v / %v", i, outcome, txErr)
+	outcome, txErr := run.runInTransaction()
+	if outcome != nil || txErr != nil {
+		t.Fatalf("run: %v / %v", outcome, txErr)
+	}
+	wantNodes := []struct {
+		kind string
+		line int
+		hits int64
+	}{
+		{kind: "block", line: 2, hits: 1},
+		{kind: "block", line: 3, hits: 1},
+		{kind: "update", line: 4, hits: 1},
+		{kind: "assign", line: 5, hits: 0},
+	}
+	nodes := run.result.Routines[0].Nodes
+	if len(nodes) != len(wantNodes) {
+		t.Fatalf("LineProfile nodes = %d, want %d", len(nodes), len(wantNodes))
+	}
+	for i, want := range wantNodes {
+		if got := nodes[i]; got.Kind != want.kind || got.Line != want.line || got.Metrics.Hits != want.hits {
+			t.Errorf("LineProfile node %d = %s line %d hits %d, want %s line %d hits %d",
+				i, got.Kind, got.Line, got.Metrics.Hits, want.kind, want.line, want.hits)
 		}
 	}
-	hits := func(nodes []LineProfileNode) []int64 {
-		out := make([]int64, len(nodes))
-		for i := range nodes {
-			out[i] = nodes[i].Metrics.Hits
-		}
-		return out
-	}
-	if !reflect.DeepEqual(hits(first.result.Routines[0].Nodes), hits(second.result.Routines[0].Nodes)) || !reflect.DeepEqual(*firstSavepoints, *secondSavepoints) || len(*firstSavepoints) == 0 {
-		t.Fatal("LineProfile node hits or savepoint sequence changed with a nil debug hook")
+	wantSavepoints := []string{"SAVEPOINT LP$SP_0_1", "RELEASE SAVEPOINT LP$SP_0_1"}
+	if !reflect.DeepEqual(*savepoints, wantSavepoints) {
+		t.Fatalf("LineProfile savepoint operations = %q, want %q", *savepoints, wantSavepoints)
 	}
 }
 

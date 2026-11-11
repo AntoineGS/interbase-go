@@ -19,6 +19,35 @@ func newDebugEvalFakeRun(t *testing.T, body string, rows func() (bool, error)) (
 	})
 }
 
+func TestDebugEvaluateBlobReturnsCopy(t *testing.T) {
+	run, _ := newLineProfileFakeRun(t, context.Background(), "DECLARE VARIABLE B BLOB;\nBEGIN\n  X = 1;\nEND",
+		func() (bool, error) { return false, nil }, func(string) (int64, error) { return 0, nil })
+	frame := newFrame(run.plan.entry, true, &run.result.Routines[0])
+	frame.vars["B"].value = []byte{1, 2, 3}
+	d := &debugState{run: run}
+
+	first := d.evaluateExpression(context.Background(), frame, "B")
+	if first.Err != nil {
+		t.Fatalf("Evaluate(B) error = %v", first.Err)
+	}
+	value, ok := first.Value.([]byte)
+	if !ok {
+		t.Fatalf("Evaluate(B) value has type %T, want []byte", first.Value)
+	}
+	value[0] = 9
+
+	second := d.evaluateExpression(context.Background(), frame, "B")
+	if second.Err != nil {
+		t.Fatalf("second Evaluate(B) error = %v", second.Err)
+	}
+	if got := second.Value; !reflect.DeepEqual(got, []byte{1, 2, 3}) {
+		t.Fatalf("second Evaluate(B) = %#v, want original BLOB bytes", got)
+	}
+	if got := frame.vars["B"].value; !reflect.DeepEqual(got, []byte{1, 2, 3}) {
+		t.Fatalf("live BLOB value = %#v after mutating evaluation, want original bytes", got)
+	}
+}
+
 func TestDebugEvaluateLocalAndServer(t *testing.T) {
 	body := "DECLARE VARIABLE X INTEGER;\nDECLARE VARIABLE S VARCHAR(20);\nBEGIN\n" +
 		"  X = 4;\n  S = 'alpha';\n  X = X + 1;\nEND"

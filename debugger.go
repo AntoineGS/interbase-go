@@ -768,9 +768,10 @@ func debugStepIntoSet(plan *lpPlan) map[string]bool {
 		return set
 	}
 	for _, routine := range debugReachableRoutines(plan) {
-		if routine != plan.entry.name {
-			set[routine] = true
+		if routine == plan.entry.name && (plan.entry.routine == nil || plan.entry.routine.Body == nil || len(plan.entry.problems) != 0) {
+			continue
 		}
+		set[routine] = true
 	}
 	return set
 }

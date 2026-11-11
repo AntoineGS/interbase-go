@@ -154,7 +154,7 @@ func debugLocalResult(frame *lpFrame, expression psql.LocalNode, value localValu
 	case localOpaqueKind:
 		if variable, ok := expression.(psql.LocalVar); ok {
 			if declared, exists := frame.vars[variable.Name]; exists {
-				return declared.value, typeText, true
+				return cloneDebugValue(declared.value), typeText, true
 			}
 		}
 	}
