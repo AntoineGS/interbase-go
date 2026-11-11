@@ -84,11 +84,20 @@ type ProcCall struct {
 	Columns []string // selectInto/forSelect: selected output columns in order (normalized)
 }
 
+// Reference is one use of a variable in the routine body.
+type Reference struct {
+	Name   string // normalized variable name, as variableRefs reports it
+	Line   int    // 1-based line in the source passed to ParseRoutine
+	Column int    // 1-based byte column of the name's first byte (for :name, the name, not the colon)
+	Length int    // byte length of the name as written (quotes included for a quoted identifier)
+}
+
 // Routine is a parsed procedure body.
 type Routine struct {
 	Declarations []Declaration
-	Body         *Node   // the outermost BEGIN … END
-	Nodes        []*Node // every node, Nodes[i].ID == i
+	Body         *Node       // the outermost BEGIN … END
+	Nodes        []*Node     // every node, Nodes[i].ID == i
+	References   []Reference // sorted by Line, then Column; no duplicates
 
 	calls   []callSite
 	sources []callSite // bare FROM/JOIN source names
@@ -159,6 +168,19 @@ func ParseRoutine(body string, opts ParseOptions) (r *Routine, problems []Proble
 			}
 		}
 		walk(r.Body)
+	}
+	sort.SliceStable(r.References, func(i, j int) bool {
+		a, b := r.References[i], r.References[j]
+		return a.Line < b.Line || a.Line == b.Line && a.Column < b.Column
+	})
+	if len(r.References) > 1 {
+		unique := r.References[:1]
+		for _, ref := range r.References[1:] {
+			if ref != unique[len(unique)-1] {
+				unique = append(unique, ref)
+			}
+		}
+		r.References = unique
 	}
 	sort.SliceStable(p.problems, func(i, j int) bool {
 		a, b := p.problems[i], p.problems[j]
@@ -326,7 +348,17 @@ func (p *parser) expr(start, end int) *Expr {
 // analyze builds the Expr of tokens [start, end); sqlOnly applies the SQL
 // variable rule (only :name).
 func (p *parser) analyze(start, end int, sqlOnly bool) *Expr {
-	return analyzeExpr(p.text(start, end), p.toks[start].line, p.toks[start].column, p.names, p.dialect, sqlOnly)
+	e, refs := analyzeExprWithReferences(p.text(start, end), p.toks[start].line, p.toks[start].column, p.names, p.dialect, sqlOnly)
+	p.routine.References = append(p.routine.References, refs...)
+	return e
+}
+
+func (p *parser) addReferences(start, end int, sqlOnly bool) {
+	if start >= end {
+		return
+	}
+	_, refs := analyzeExprWithReferences(p.text(start, end), p.toks[start].line, p.toks[start].column, p.names, p.dialect, sqlOnly)
+	p.routine.References = append(p.routine.References, refs...)
 }
 
 // args analyzes the comma-separated arguments in tokens [start, end); ok
@@ -621,6 +653,7 @@ func (p *parser) parseSimple(kind NodeKind) *Node {
 func (p *parser) parseAssign() *Node {
 	n := p.newNode(NodeAssign, p.pos)
 	n.Target = normalizedName(p.toks[p.pos])
+	p.addReferences(p.pos, p.pos+1, false)
 	start := p.pos + 2
 	end := p.scanTo(start, p.semicolon)
 	if start >= end {
@@ -788,6 +821,8 @@ func (p *parser) parseSelectInto() *Node {
 		return nil
 	}
 	n.SQL, n.Into = p.sqlText(n.Kind, start, end), targets
+	p.addReferences(start, into, true)
+	p.addReferences(into+1, end, false)
 	if name := p.recordSQLCalls(start, into, end, false); name >= 0 {
 		var ok bool
 		if n.Proc, ok = p.stepInProc(start, name); !ok {
@@ -847,6 +882,8 @@ func (p *parser) parseFor() *Node {
 		return nil
 	}
 	n.SQL, n.Into = p.sqlText(n.Kind, start, end), targets
+	p.addReferences(start, into, true)
+	p.addReferences(into+1, end, false)
 	if name := p.recordSQLCalls(start, into, end, false); name >= 0 {
 		var ok bool
 		if n.Proc, ok = p.stepInProc(start, name); !ok {
@@ -871,6 +908,19 @@ func (p *parser) parseDML(kind NodeKind) *Node {
 		}
 	}
 	n.SQL = p.sqlText(kind, start, end)
+	refEnd := end
+	if kind == NodeUpdate {
+		if into, _ := p.intoClause(start, end); into >= 0 {
+			for i := start; i < into; i++ {
+				if p.toks[i].depth == 0 && p.kw(i, "RETURNING") {
+					refEnd = into
+					p.addReferences(into+1, end, false)
+					break
+				}
+			}
+		}
+	}
+	p.addReferences(start, refEnd, true)
 	p.recordSQLCalls(start, -1, end, kind == NodeDelete)
 	p.pos = end
 	return p.terminate(n)
@@ -1034,6 +1084,7 @@ func (p *parser) parseExecProc() *Node {
 			return nil
 		}
 		n.Returning = p.targetNames(start, stop)
+		p.addReferences(start, stop, false)
 		p.pos = listEnd
 	}
 	p.routine.calls = append(p.routine.calls, callSite{name: n.Proc.Name, quoted: n.Proc.Quoted, line: t.line, stepInShape: true})
@@ -1055,6 +1106,9 @@ func (p *parser) execStmtText(n *Node, end int) bool {
 		return false
 	}
 	n.Value, n.Into = p.expr(start, exprEnd), targets
+	if into >= 0 {
+		p.addReferences(into+1, end, false)
+	}
 	return true
 }
 

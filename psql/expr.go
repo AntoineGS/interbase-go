@@ -68,6 +68,11 @@ func AnalyzeExpr(text string, line, column int, names map[string]bool, dialect i
 // analyzeExpr applies the SQL variable rule (only :name) everywhere when
 // sqlOnly is set.
 func analyzeExpr(text string, line, column int, names map[string]bool, dialect int, sqlOnly bool) *Expr {
+	e, _ := analyzeExprWithReferences(text, line, column, names, dialect, sqlOnly)
+	return e
+}
+
+func analyzeExprWithReferences(text string, line, column int, names map[string]bool, dialect int, sqlOnly bool) (*Expr, []Reference) {
 	if dialect == 0 {
 		dialect = 3
 	}
@@ -97,7 +102,31 @@ func analyzeExpr(text string, line, column int, names map[string]bool, dialect i
 			e.Local = node
 		}
 	}
-	return e
+	return e, referencePositions(tokens, refs, line, column)
+}
+
+func referencePositions(tokens []token, refs map[int]variableRef, line, column int) []Reference {
+	references := make([]Reference, 0, len(refs))
+	for index, ref := range refs {
+		nameIndex := index
+		start := tokens[index].start
+		if tokens[index].kind == tokenParameter {
+			start++ // The token includes the leading colon; the reference name does not.
+		} else if tokens[index].kind == tokenPunctuation && tokens[index].text == ":" && ref.last > index {
+			nameIndex++
+			start = tokens[nameIndex].start
+		}
+		nameToken := tokens[nameIndex]
+		refLine, refColumn := line+nameToken.line-1, nameToken.column
+		if nameToken.line == 1 {
+			refColumn += column - 1
+		}
+		refColumn += start - nameToken.start
+		references = append(references, Reference{
+			Name: ref.name, Line: refLine, Column: refColumn, Length: nameToken.end - start,
+		})
+	}
+	return references
 }
 
 type variableRef struct {

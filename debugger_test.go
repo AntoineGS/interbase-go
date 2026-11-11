@@ -124,6 +124,39 @@ func TestDebugAnalysisIncludesReachableStatements(t *testing.T) {
 	if !reflect.DeepEqual(analysis.Routines[0].StatementLines, []int{2}) || !reflect.DeepEqual(analysis.Routines[1].StatementLines, []int{3}) {
 		t.Fatalf("statement lines = %+v", analysis.Routines)
 	}
+	if want := []DebugReference{{Name: "K", Line: 3, Column: 3, Length: 1}}; !reflect.DeepEqual(analysis.Routines[1].References, want) {
+		t.Fatalf("callee references = %+v, want %+v", analysis.Routines[1].References, want)
+	}
+}
+
+func TestDebugAnalysisCopiesRoutineReferencesAndCloneDeepCopiesThem(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\nBEGIN\n  X = X + 1;\nEND"
+	plan := newLineProfileFakePlan(t, body)
+	plan.entry.source = body
+	analysis := debugAnalysisFromPlan(plan)
+	if len(analysis.Routines) != 1 {
+		t.Fatalf("debug routines = %+v, want one", analysis.Routines)
+	}
+	want := []DebugReference{
+		{Name: "X", Line: 3, Column: 3, Length: 1},
+		{Name: "X", Line: 3, Column: 7, Length: 1},
+	}
+	if !reflect.DeepEqual(analysis.Routines[0].References, want) {
+		t.Fatalf("debug references = %+v, want %+v", analysis.Routines[0].References, want)
+	}
+
+	cloned := cloneDebugAnalysis(analysis)
+	analysis.Routines[0].References[0].Name = "Y"
+	if cloned.Routines[0].References[0].Name != "X" {
+		t.Fatalf("clone shares reference storage: %+v", cloned.Routines[0].References)
+	}
+
+	emptyPlan := newLineProfileFakePlan(t, "BEGIN\nEND")
+	emptyPlan.entry.source = "BEGIN\nEND"
+	empty := debugAnalysisFromPlan(emptyPlan)
+	if empty.Routines[0].References == nil || len(empty.Routines[0].References) != 0 {
+		t.Fatalf("empty debug references = %#v, want non-nil empty slice", empty.Routines[0].References)
+	}
 }
 
 func TestDebugStepOverSkipsCalleeAndBlocks(t *testing.T) {

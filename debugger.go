@@ -26,6 +26,15 @@ type DebugRoutine struct {
 	Name           string
 	Source         string
 	StatementLines []int
+	References     []DebugReference
+}
+
+// DebugReference is one variable use in a debug routine's source.
+type DebugReference struct {
+	Name   string
+	Line   int // 1-based line in DebugRoutine.Source
+	Column int // 1-based byte column within that line
+	Length int // byte length
 }
 
 // DebugAnalysis is the static analysis of a debug entry statement.
@@ -836,8 +845,17 @@ func debugAnalysisFromPlan(plan *lpPlan) DebugAnalysis {
 			statementLines = append(statementLines, line)
 		}
 		sort.Ints(statementLines)
+		references := make([]DebugReference, 0)
+		if meta.routine != nil {
+			references = make([]DebugReference, 0, len(meta.routine.References))
+			for _, ref := range meta.routine.References {
+				references = append(references, DebugReference{
+					Name: ref.Name, Line: ref.Line, Column: ref.Column, Length: ref.Length,
+				})
+			}
+		}
 		analysis.Routines = append(analysis.Routines, DebugRoutine{
-			Name: meta.name, Source: meta.source, StatementLines: statementLines,
+			Name: meta.name, Source: meta.source, StatementLines: statementLines, References: references,
 		})
 	}
 	return analysis
@@ -859,6 +877,9 @@ func cloneDebugAnalysis(a DebugAnalysis) DebugAnalysis {
 	a.Routines = append([]DebugRoutine(nil), a.Routines...)
 	for i := range a.Routines {
 		a.Routines[i].StatementLines = append([]int(nil), a.Routines[i].StatementLines...)
+		references := make([]DebugReference, len(a.Routines[i].References))
+		copy(references, a.Routines[i].References)
+		a.Routines[i].References = references
 	}
 	return a
 }

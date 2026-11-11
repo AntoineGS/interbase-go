@@ -855,3 +855,162 @@ func TestRoutineCalleeLinesAreSortedAndUnique(t *testing.T) {
 		t.Fatalf("Callees() = %+v, want %+v", got, want)
 	}
 }
+
+func TestParseRoutineVariableReferencesAssignment(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\n" +
+		"DECLARE VARIABLE Y INTEGER;\n" +
+		"BEGIN\n  X = Y + 1;\nEND"
+	r := parseClean(t, body, ParseOptions{})
+	want := []Reference{
+		{Name: "X", Line: 4, Column: 3, Length: 1},
+		{Name: "Y", Line: 4, Column: 7, Length: 1},
+	}
+	if !reflect.DeepEqual(r.References, want) {
+		t.Fatalf("References = %+v, want %+v", r.References, want)
+	}
+}
+
+func TestParseRoutineVariableReferencesControlFlowAndForSelectTargets(t *testing.T) {
+	body := "DECLARE VARIABLE A INTEGER;\n" +
+		"DECLARE VARIABLE B INTEGER;\n" +
+		"DECLARE VARIABLE X INTEGER;\n" +
+		"BEGIN\n" +
+		"  IF (A > 0) THEN X = B;\n" +
+		"  WHILE (B > 0) DO B = B - 1;\n" +
+		"  FOR SELECT A FROM T WHERE A = :A INTO :A, :B DO X = A;\n" +
+		"END"
+	r := parseClean(t, body, ParseOptions{})
+	want := []Reference{
+		{Name: "A", Line: 5, Column: 7, Length: 1},
+		{Name: "X", Line: 5, Column: 19, Length: 1},
+		{Name: "B", Line: 5, Column: 23, Length: 1},
+		{Name: "B", Line: 6, Column: 10, Length: 1},
+		{Name: "B", Line: 6, Column: 20, Length: 1},
+		{Name: "B", Line: 6, Column: 24, Length: 1},
+		{Name: "A", Line: 7, Column: 34, Length: 1},
+		{Name: "A", Line: 7, Column: 42, Length: 1},
+		{Name: "B", Line: 7, Column: 46, Length: 1},
+		{Name: "X", Line: 7, Column: 51, Length: 1},
+		{Name: "A", Line: 7, Column: 55, Length: 1},
+	}
+	if !reflect.DeepEqual(r.References, want) {
+		t.Fatalf("References = %+v, want %+v", r.References, want)
+	}
+}
+
+func TestParseRoutineVariableReferencesSQL(t *testing.T) {
+	body := "DECLARE VARIABLE A INTEGER;\n" +
+		"DECLARE VARIABLE B INTEGER;\n" +
+		"BEGIN\n" +
+		"  SELECT A FROM T WHERE A = :A INTO :B;\n" +
+		"  INSERT INTO T (A) VALUES (:B);\n" +
+		"  UPDATE T SET A = :A WHERE B = :B;\n" +
+		"  DELETE FROM T WHERE A = :A;\n" +
+		"  SELECT A FROM T WHERE A IN (SELECT B FROM U WHERE B = :B) INTO :A;\n" +
+		"END"
+	r := parseClean(t, body, ParseOptions{})
+	want := []Reference{
+		{Name: "A", Line: 4, Column: 30, Length: 1},
+		{Name: "B", Line: 4, Column: 38, Length: 1},
+		{Name: "B", Line: 5, Column: 30, Length: 1},
+		{Name: "A", Line: 6, Column: 21, Length: 1},
+		{Name: "B", Line: 6, Column: 34, Length: 1},
+		{Name: "A", Line: 7, Column: 28, Length: 1},
+		{Name: "B", Line: 8, Column: 58, Length: 1},
+		{Name: "A", Line: 8, Column: 67, Length: 1},
+	}
+	if !reflect.DeepEqual(r.References, want) {
+		t.Fatalf("References = %+v, want %+v", r.References, want)
+	}
+}
+
+func TestParseRoutineVariableReferencesOtherStatements(t *testing.T) {
+	body := "DECLARE VARIABLE A INTEGER;\n" +
+		"DECLARE VARIABLE B INTEGER;\n" +
+		"DECLARE VARIABLE C INTEGER;\n" +
+		"DECLARE VARIABLE D INTEGER;\n" +
+		"BEGIN\n" +
+		"  EXECUTE PROCEDURE P(:A + B) RETURNING_VALUES :C, D;\n" +
+		"  EXCEPTION E 'message ' || A;\n" +
+		"  EXECUTE STATEMENT 'select ' || B INTO A;\n" +
+		"  POST_EVENT A;\n" +
+		"END"
+	r := parseClean(t, body, ParseOptions{})
+	want := []Reference{
+		{Name: "A", Line: 6, Column: 24, Length: 1},
+		{Name: "B", Line: 6, Column: 28, Length: 1},
+		{Name: "C", Line: 6, Column: 49, Length: 1},
+		{Name: "D", Line: 6, Column: 52, Length: 1},
+		{Name: "A", Line: 7, Column: 29, Length: 1},
+		{Name: "B", Line: 8, Column: 34, Length: 1},
+		{Name: "A", Line: 8, Column: 41, Length: 1},
+		{Name: "A", Line: 9, Column: 14, Length: 1},
+	}
+	if !reflect.DeepEqual(r.References, want) {
+		t.Fatalf("References = %+v, want %+v", r.References, want)
+	}
+}
+
+func TestParseRoutineVariableReferencesUpdateAndForExecuteStatementTargets(t *testing.T) {
+	body := "DECLARE VARIABLE A INTEGER;\n" +
+		"DECLARE VARIABLE B INTEGER;\n" +
+		"BEGIN\n" +
+		"  UPDATE T SET A = :A RETURNING B INTO :B;\n" +
+		"  FOR EXECUTE STATEMENT 'select ' || A INTO B DO A = B;\n" +
+		"END"
+	r := parseClean(t, body, ParseOptions{})
+	want := []Reference{
+		{Name: "A", Line: 4, Column: 21, Length: 1},
+		{Name: "B", Line: 4, Column: 41, Length: 1},
+		{Name: "A", Line: 5, Column: 38, Length: 1},
+		{Name: "B", Line: 5, Column: 45, Length: 1},
+		{Name: "A", Line: 5, Column: 50, Length: 1},
+		{Name: "B", Line: 5, Column: 54, Length: 1},
+	}
+	if !reflect.DeepEqual(r.References, want) {
+		t.Fatalf("References = %+v, want %+v", r.References, want)
+	}
+}
+
+func TestParseRoutineVariableReferencesIgnoreLiteralsCommentsAndDeclarations(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\n" +
+		"BEGIN\n" +
+		"  X = 'X' || 1; -- X\n" +
+		"  /* X */\n" +
+		"END"
+	r := parseClean(t, body, ParseOptions{})
+	want := []Reference{{Name: "X", Line: 3, Column: 3, Length: 1}}
+	if !reflect.DeepEqual(r.References, want) {
+		t.Fatalf("References = %+v, want %+v", r.References, want)
+	}
+
+	withDefault := "DECLARE VARIABLE X INTEGER DEFAULT :P;\nBEGIN\nEND"
+	parsed, problems := ParseRoutine(withDefault, ParseOptions{Params: []string{"P"}})
+	if len(problems) != 1 || !strings.Contains(problems[0].Message, "initial value") {
+		t.Fatalf("ParseRoutine() problems = %+v, want unsupported declaration default", problems)
+	}
+	if parsed == nil || len(parsed.References) != 0 {
+		t.Fatalf("declaration references = %+v, want none", parsed)
+	}
+}
+
+func TestParseRoutineVariableReferencesUseByteColumnsAndQuotedLength(t *testing.T) {
+	body := "DECLARE VARIABLE X INTEGER;\n" +
+		"DECLARE VARIABLE Y INTEGER;\n" +
+		"BEGIN\n" +
+		"  /*\xe9*/ X = Y;\n" +
+		"END"
+	r := parseClean(t, body, ParseOptions{})
+	want := []Reference{
+		{Name: "X", Line: 4, Column: 9, Length: 1},
+		{Name: "Y", Line: 4, Column: 13, Length: 1},
+	}
+	if !reflect.DeepEqual(r.References, want) {
+		t.Fatalf("References = %+v, want %+v", r.References, want)
+	}
+
+	quoted := parseClean(t, "DECLARE VARIABLE \"q\" INTEGER;\nBEGIN\n  \"q\" = 1;\nEND", ParseOptions{})
+	if wantQuoted := []Reference{{Name: "q", Line: 3, Column: 3, Length: 3}}; !reflect.DeepEqual(quoted.References, wantQuoted) {
+		t.Fatalf("quoted References = %+v, want %+v", quoted.References, wantQuoted)
+	}
+}
