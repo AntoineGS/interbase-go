@@ -60,18 +60,37 @@ type lpRun struct {
 	dynamic        map[string][]string
 	dynamicTexts   map[*LineProfileNode]map[uint64]struct{}
 	procedureNames map[string]bool
+	// hook is called before debugger-visible statement nodes; nil keeps the
+	// ordinary line-profile execution path unchanged.
+	hook func(f *lpFrame, n *psql.Node) error
+	// noMeasure skips line-profile baselines, counters and activity snapshots.
+	noMeasure bool
+	// stepDecider can dynamically choose which analyzed callees to emulate.
+	stepDecider func(f *lpFrame, n *psql.Node, callee string) bool
+	debug       *debugState
+	retired     *lpRetiredTransaction
 }
 
-// runInTransaction runs the entry routine inside the run's transaction and
-// always rolls it back. Every prepared statement of the run is closed before
-// the rollback on every path; cursors are closed where they are opened. The
-// first error is the run outcome; the second is a close or rollback failure.
+type lpRetiredTransaction struct {
+	tx         *Transaction
+	statements map[string]cachedStatement
+	open       int
+}
+
+// runInTransaction runs the entry routine inside the run's transaction.
+// Line-profile runs always roll back; debug runs commit only transactions that
+// remained read-only and always roll back their read-write transaction. Every
+// prepared statement is closed before its transaction completes.
 func (r *lpRun) runInTransaction() (outcomeErr, txErr error) {
-	txErr = runProfileTransaction(r.tx.Rollback, func() (closeErr error) {
-		defer func() { closeErr = r.closeStatements() }()
-		outcomeErr = r.runEntry()
-		return nil
-	}, &r.result.RolledBack)
+	if r.debug != nil {
+		outcomeErr, txErr = r.runDebugTransaction()
+	} else {
+		txErr = runProfileTransaction(r.tx.Rollback, func() (closeErr error) {
+			defer func() { closeErr = r.closeStatements() }()
+			outcomeErr = r.runEntry()
+			return nil
+		}, &r.result.RolledBack)
+	}
 	for _, profile := range r.routines[min(1, len(r.routines)):] {
 		r.result.Routines = append(r.result.Routines, *profile)
 	}
@@ -80,6 +99,24 @@ func (r *lpRun) runInTransaction() (outcomeErr, txErr error) {
 		clearCounters(r.result.Routines)
 		r.result.OverheadActivity = ActivityDelta{}
 	}
+	return outcomeErr, txErr
+}
+
+func (r *lpRun) runDebugTransaction() (outcomeErr, txErr error) {
+	outcomeErr = r.runEntry()
+	txErr = errors.Join(txErr, r.closeStatements())
+	if r.tx != nil {
+		if r.readOnly() {
+			txErr = errors.Join(txErr, r.tx.Commit())
+		} else {
+			err := r.tx.Rollback()
+			if err == nil {
+				r.result.RolledBack = true
+			}
+			txErr = errors.Join(txErr, err)
+		}
+	}
+	txErr = errors.Join(txErr, r.finishRetiredTransaction())
 	return outcomeErr, txErr
 }
 
@@ -158,11 +195,35 @@ func (r *lpRun) exec(f *lpFrame, n *psql.Node) (lpSignal, error) {
 	if err := r.ctx.Err(); err != nil {
 		return lpContinue, &lpNodeError{routine: f.meta.name, line: n.Line, err: err}
 	}
+	if r.hook != nil && n.Kind != psql.NodeBlock && n.Kind != psql.NodeEmpty && n.Kind != psql.NodeWhile {
+		if err := r.beforeStatement(f, n); err != nil {
+			return lpContinue, &lpNodeError{routine: f.meta.name, line: n.Line, err: err}
+		}
+	}
 	node := &f.profile.Nodes[n.ID]
 	if n.Kind != psql.NodeWhile {
 		node.Metrics.Hits++
 	}
 	sig, err := r.execNode(f, n, node)
+	if err != nil && r.debug != nil && isDebugReadOnlyTransactionError(err) {
+		if r.readOnly() {
+			var headerErr *lpDebugHeaderError
+			retryable := errors.As(err, &headerErr) || r.debugLeafMayRetry(f, n)
+			if retryable {
+				if switchErr := r.switchToReadWrite(f, n); switchErr != nil {
+					err = switchErr
+				} else {
+					sig, err = r.execNode(f, n, node)
+				}
+			}
+		}
+		if err != nil && isDebugReadOnlyTransactionError(err) {
+			err = debugReadOnlyRestartFailure(err)
+		}
+	}
+	if err == nil && r.debug != nil {
+		r.debug.didExecute(n)
+	}
 	if err != nil {
 		var located *lpNodeError
 		if !errors.As(err, &located) {
@@ -171,6 +232,22 @@ func (r *lpRun) exec(f *lpFrame, n *psql.Node) (lpSignal, error) {
 		return lpContinue, err
 	}
 	return sig, nil
+}
+
+// beforeStatement lets a debugger pause before n. The caller has already
+// checked the context; the frame's current node is set before the hook runs.
+func (r *lpRun) beforeStatement(f *lpFrame, n *psql.Node) error {
+	if err := r.ctx.Err(); err != nil {
+		return err
+	}
+	f.current = n
+	if err := r.hook(f, n); err != nil {
+		return err
+	}
+	if r.debug != nil {
+		r.debug.countStatement()
+	}
+	return nil
 }
 
 // keepsBlock reports the statements whose errors keep the handling block's
@@ -207,7 +284,7 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 	case psql.NodeIf:
 		ok, err := r.evalCond(f, node, n.Cond)
 		if err != nil {
-			return lpContinue, err
+			return lpContinue, r.debugHeaderError(err)
 		}
 		if ok {
 			return r.exec(f, n.Children[0])
@@ -217,12 +294,22 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 		}
 		return lpContinue, nil
 	case psql.NodeWhile:
+		childRan := false
 		for {
+			if r.hook != nil {
+				if err := r.beforeStatement(f, n); err != nil {
+					return lpContinue, err
+				}
+			}
 			node.Metrics.Hits++
 			ok, err := r.evalCond(f, node, n.Cond)
 			if err != nil || !ok {
+				if err != nil && !childRan {
+					err = r.debugHeaderError(err)
+				}
 				return lpContinue, err
 			}
+			childRan = true
 			sig, err := r.exec(f, n.Children[0])
 			if err != nil || sig == lpExit {
 				return sig, err
@@ -232,12 +319,12 @@ func (r *lpRun) execNode(f *lpFrame, n *psql.Node, node *LineProfileNode) (lpSig
 			}
 		}
 	case psql.NodeSelectInto:
-		if r.stepsInto(n) {
+		if r.stepsInto(f, n) {
 			return lpContinue, r.stepSelectInto(f, n, node)
 		}
 		return lpContinue, r.execSelectInto(f, n, node)
 	case psql.NodeForSelect:
-		if r.stepsInto(n) {
+		if r.stepsInto(f, n) {
 			return r.stepForSelect(f, n, node)
 		}
 		return r.execForSelect(f, n, node)
@@ -359,6 +446,10 @@ func (r *lpRun) execBlock(f *lpFrame, n *psql.Node) (lpSignal, error) {
 func (r *lpRun) startSavepoint(f *lpFrame) (string, error) {
 	f.savepoints++
 	name := fmt.Sprintf("LP$SP_%d_%d", f.id, f.savepoints)
+	if r.debug != nil && r.readOnly() {
+		r.debug.addPendingSavepoint(name)
+		return name, nil
+	}
 	return name, r.savepoint("SAVEPOINT " + name)
 }
 
@@ -401,6 +492,17 @@ func (r *lpRun) runHandlers(f *lpFrame, n *psql.Node, first int) (lpSignal, erro
 // activity snapshot follows, whether or not it succeeded, so that its
 // counters (an undo's backouts) are overhead, not the next node's.
 func (r *lpRun) savepoint(text string) error {
+	if r.debug != nil && r.readOnly() {
+		if operation, name, ok := parseSavepointOperation(text); ok && r.debug.isPendingSavepoint(name) {
+			switch operation {
+			case "release":
+				r.debug.removePendingSavepoint(name)
+			case "rollback":
+				r.debug.rollbackPendingSavepoint(name)
+			}
+			return nil
+		}
+	}
 	start := time.Now()
 	_, err := r.tx.Exec(r.ctx, text)
 	r.result.Savepoints += time.Since(start)
@@ -418,6 +520,9 @@ func (r *lpRun) closeCursor(cursor *Cursor, exhausted bool) error {
 	err := cursor.Close()
 	if !exhausted {
 		err = errors.Join(err, fatal(r.snapshot(nil)))
+	}
+	if r.retired != nil && cursor != nil && cursor.tx == r.retired.tx {
+		err = errors.Join(err, r.retiredCursorClosed())
 	}
 	return err
 }
@@ -555,6 +660,9 @@ func (r *lpRun) execSelectInto(f *lpFrame, n *psql.Node, node *LineProfileNode) 
 	if err != nil {
 		return err
 	}
+	// This path is used only when the SELECT is executed natively; a stepped-
+	// into selectable procedure runs through stepSelectInto instead.
+	r.markNativeProcedureWriteForNode(f.meta, n)
 	node.Metrics.Rows += int64(len(rows))
 	switch len(rows) {
 	case 0:
@@ -593,7 +701,7 @@ func (r *lpRun) assignRow(f *lpFrame, node *LineProfileNode, targets []string, r
 func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (sig lpSignal, err error) {
 	b, cast, err := r.bindSelect(f, n, node)
 	if err != nil {
-		return lpContinue, err
+		return lpContinue, r.debugHeaderError(err)
 	}
 	node.SQL = b.text
 	var cursor *Cursor
@@ -601,10 +709,24 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 		cursor, e = b.stmt.Query(r.ctx, b.args...)
 		return e
 	}); err != nil {
-		return lpContinue, err
+		return lpContinue, r.debugHeaderError(err)
+	}
+	var open *lpOpenCursor
+	if r.debug != nil {
+		open = f.pushCursor(n.Line, n.Into)
 	}
 	exhausted := false
-	defer func() { err = errors.Join(err, r.closeCursor(cursor, exhausted)) }()
+	childRan := false
+	nativeProcedureChecked := false
+	defer func() {
+		if open != nil {
+			f.popCursor(open)
+		}
+		err = errors.Join(err, r.closeCursor(cursor, exhausted))
+		if err != nil && !childRan {
+			err = r.debugHeaderError(err)
+		}
+	}()
 	outputs := b.stmt.Outputs()
 	for {
 		var hasRow bool
@@ -614,11 +736,18 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 		}); err != nil {
 			return lpContinue, err
 		}
+		if !nativeProcedureChecked {
+			r.markNativeProcedureWriteForNode(f.meta, n)
+			nativeProcedureChecked = true
+		}
 		if !hasRow {
 			exhausted = true
 			return lpContinue, nil
 		}
 		node.Metrics.Rows++
+		if open != nil {
+			open.fetched++
+		}
 		row, err := cursor.Row()
 		if err != nil {
 			return lpContinue, err
@@ -626,6 +755,7 @@ func (r *lpRun) execForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 		if err := r.assignRow(f, node, n.Into, row, outputs, cast); err != nil {
 			return lpContinue, err
 		}
+		childRan = true
 		sig, err := r.exec(f, n.Children[0])
 		if err != nil || sig == lpExit {
 			return sig, err
@@ -647,7 +777,11 @@ func (r *lpRun) execProcedure(f *lpFrame, n *psql.Node, node *LineProfileNode) e
 	if !ok {
 		return fmt.Errorf("interbase: line profile: procedure %s is not loaded", n.Proc.Name)
 	}
-	if r.stepInto[callee.name] {
+	if r.stepDecider == nil {
+		if r.stepInto[callee.name] {
+			return r.stepExecute(f, n, node, callee)
+		}
+	} else if r.emulates(f, n, callee.name) {
 		return r.stepExecute(f, n, node, callee)
 	}
 	if len(n.Proc.Args) > len(callee.inputs) {
@@ -698,14 +832,21 @@ func (r *lpRun) execProcedure(f *lpFrame, n *psql.Node, node *LineProfileNode) e
 	outputs := b.stmt.Outputs()
 	if len(outputs) == 0 {
 		node.SQL = b.text
-		return r.serverCall(node, func() error {
+		err := r.serverCall(node, func() error {
 			_, e := b.stmt.Exec(r.ctx, b.args...)
 			return e
 		})
+		if err == nil && !callee.readsOnly && r.debug != nil {
+			r.debug.didNativeWrite()
+		}
+		return err
 	}
 	rows, err := r.queryRows(node, b, 1)
 	if err != nil {
 		return err
+	}
+	if !callee.readsOnly && r.debug != nil {
+		r.debug.didNativeWrite()
 	}
 	if len(rows) == 0 || len(n.Returning) == 0 {
 		return nil

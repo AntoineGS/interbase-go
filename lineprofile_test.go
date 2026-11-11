@@ -397,8 +397,15 @@ func sortStrings(values []string) {
 type lineProfileFakeCounts struct {
 	prepared, closed, queried, cursorsClosed  int
 	closedAtRollback, cursorsClosedAtRollback int
-	rolledBack                                bool
+	rolledBack, committed                     bool
 	onPrepare, onCursorClose                  func()       // optional server-side effects of a prepare and of a cursor close
+	onQuery                                   func(string) // optional query observer
+	onQueryArgs                               func(string, []argument)
+	queryErr                                  func(string) error
+	onExec                                    func(string) // optional execution observer
+	onCommit, onRollback                      func()       // optional transaction completion observers
+	next                                      func() (bool, error)
+	execute                                   func(string) (int64, error)
 	rowValue                                  driver.Value // fetched column value; nil means int64(1)
 	// Optional per-statement behavior: valueFor overrides the fetched value,
 	// outputsFor the output descriptors and prepareErr fails the prepare;
@@ -424,6 +431,7 @@ func newLineProfileFakeRun(t *testing.T, ctx context.Context, body string,
 	next func() (bool, error), exec func(query string) (int64, error)) (*lpRun, *lineProfileFakeCounts) {
 	t.Helper()
 	counts := &lineProfileFakeCounts{}
+	counts.next, counts.execute = next, exec
 	native := newLineProfileFakeNative(counts, next, exec)
 	connection := &conn{native: &nativeConnection{
 		brokenOverride:            func() bool { return false },
@@ -462,8 +470,17 @@ func newLineProfileFakeNative(counts *lineProfileFakeCounts, next func() (bool, 
 	exec func(query string) (int64, error)) *nativeTransaction {
 	return &nativeTransaction{
 		cancelSlotOverride: &fakeCancelSlot{},
-		commitOverride:     func() error { return nil },
+		commitOverride: func() error {
+			counts.committed = true
+			if counts.onCommit != nil {
+				counts.onCommit()
+			}
+			return nil
+		},
 		rollbackOverride: func() error {
+			if counts.onRollback != nil {
+				counts.onRollback()
+			}
 			counts.rolledBack = true
 			counts.closedAtRollback, counts.cursorsClosedAtRollback = counts.closed, counts.cursorsClosed
 			return nil
@@ -530,8 +547,19 @@ func newLineProfileFakeNative(counts *lineProfileFakeCounts, next func() (bool, 
 					}
 					return []OutputDescriptor{{Name: "ID", Kind: "INTEGER", Nullable: true}}, nil
 				},
-				queryOverride: func([]argument) (*nativeCursor, []string, error) {
+				queryOverride: func(args []argument) (*nativeCursor, []string, error) {
 					counts.queried++
+					if counts.onQuery != nil {
+						counts.onQuery(query)
+					}
+					if counts.onQueryArgs != nil {
+						counts.onQueryArgs(query, append([]argument(nil), args...))
+					}
+					if counts.queryErr != nil {
+						if err := counts.queryErr(query); err != nil {
+							return nil, nil, err
+						}
+					}
 					closeCursor := func() error {
 						counts.cursorsClosed++
 						if counts.onCursorClose != nil {
@@ -571,7 +599,12 @@ func newLineProfileFakeNative(counts *lineProfileFakeCounts, next func() (bool, 
 						abortOverride: closeCursor,
 					}, []string{"ID"}, nil
 				},
-				execOverride: func([]argument) (int64, error) { return exec(query) },
+				execOverride: func([]argument) (int64, error) {
+					if counts.onExec != nil {
+						counts.onExec(query)
+					}
+					return exec(query)
+				},
 				closeOverride: func() error {
 					counts.closed++
 					if counts.onClose != nil {
@@ -783,6 +816,29 @@ func newLineProfileHandlerRunRows(t *testing.T, ctx context.Context, body string
 	run.plan.exceptions = map[string]lpException{"E_ONE": {number: 7, message: "boom"}, "E_TWO": {number: 8, message: "two"}}
 	run.plan.exceptionNames = map[int32]string{7: "E_ONE", 8: "E_TWO"}
 	return run, &savepoints
+}
+
+func TestLineProfileConditionHeadersDoNotWrapErrorsAsDebugHeaders(t *testing.T) {
+	wantErr := errors.New("synthetic condition query failure")
+	for _, tt := range []struct{ name, body string }{
+		{name: "if", body: "DECLARE VARIABLE X INTEGER;\nBEGIN\n  IF (CURRENT_DATE = CURRENT_DATE) THEN X = 1;\nEND"},
+		{name: "while", body: "DECLARE VARIABLE X INTEGER;\nBEGIN\n  WHILE (CURRENT_DATE = CURRENT_DATE) DO X = 1;\nEND"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			run, counts := newLineProfileFakeRun(t, context.Background(), tt.body,
+				func() (bool, error) { return false, nil }, func(string) (int64, error) { return 0, nil })
+			counts.queryErr = func(string) error { return wantErr }
+
+			outcome, _ := run.runInTransaction()
+			if !errors.Is(outcome, wantErr) {
+				t.Fatalf("run outcome = %v, want underlying error %v", outcome, wantErr)
+			}
+			var headerErr *lpDebugHeaderError
+			if errors.As(outcome, &headerErr) {
+				t.Fatalf("non-debug line-profile outcome contains debugger-only header wrapper: %v", headerErr)
+			}
+		})
+	}
 }
 
 func lineProfileNodeHits(run *lpRun, line int) int64 {

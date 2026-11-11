@@ -248,8 +248,11 @@ these commands do not build, pull or publish a licensed image:
 ### Automated runner
 
 The repository runner owns the container and a unique private temporary root.
-It binds only `127.0.0.1:3050`, mounts that same absolute host path into the
-container, uses tmpfs for `/var/lib/interbase`, and disables automatic backups.
+It binds an ephemeral host port only on `127.0.0.1`, mounts that same absolute
+host path into the container, uses tmpfs for `/var/lib/interbase`, and disables
+automatic backups. The integration binary runs inside the container and
+connects to its internal `localhost/3050` listener; the host mapping avoids
+conflicts with other services bound to host port 3050.
 It copies the image's matching `libgds.so` and `isql` into that temporary root.
 It compiles the tagged integration and services test binaries on the host using
 the matching official headers from `INTERBASE_INCLUDE`, then executes those
@@ -300,7 +303,7 @@ for inspection rather than recursively deleted.
 TEST_ROOT=$(mktemp -d /tmp/interbase-go-docker.XXXXXX)
 TEST_CONTAINER="interbase-go-test-${TEST_ROOT##*.}"
 docker run --pull=never --detach --rm --name "$TEST_CONTAINER" \
-  --publish 127.0.0.1:3050:3050 \
+  --publish 127.0.0.1::3050 \
   --mount "type=bind,source=$TEST_ROOT,target=$TEST_ROOT" \
   --mount type=tmpfs,destination=/var/lib/interbase \
   --env IB_SYSDBA_USER=SYSDBA --env IB_SYSDBA_PASSWORD=masterkey \
@@ -310,9 +313,12 @@ docker run --pull=never --detach --rm --name "$TEST_CONTAINER" \
 ```
 
 The same-path bind mount is required: the host creates the temporary directories
-and the server creates the database files at those exact absolute paths. The
-image used for validation runs as root under rootful Docker; other UID mappings
-need their own permission validation. Do not broaden host permissions globally.
+and the server creates the database files at those exact absolute paths. Resolve
+the host-side port with `docker port "$TEST_CONTAINER" 3050/tcp` if a host
+process needs to connect; in-container test processes continue to use
+`localhost/3050`. The image used for validation runs as root under rootful
+Docker; other UID mappings need their own permission validation. Do not broaden
+host permissions globally.
 Wait for the server to accept the configured password and reject a wrong one
 before running tests. Do not bind the test server to all host interfaces.
 

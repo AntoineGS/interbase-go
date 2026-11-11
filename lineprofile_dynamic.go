@@ -300,7 +300,7 @@ func (r *lpRun) closeDynamic(stmt *PreparedStatement) error {
 // body may write. A procedure first met in a dynamic text is not analyzed,
 // so it is assumed to write.
 func (r *lpRun) dynamicRowByRow(f *lpFrame, n *psql.Node, text string) (string, bool, error) {
-	if r.opts.ReadOnly || hasForUpdate(text) {
+	if r.readOnly() || hasForUpdate(text) {
 		return "", false, nil
 	}
 	refs := psql.ExtractStatementRefs(text)
@@ -474,8 +474,21 @@ func (r *lpRun) forExecStatement(f *lpFrame, n *psql.Node, node *LineProfileNode
 	}); err != nil {
 		return lpContinue, r.dynamicExecError(text, err)
 	}
+	var open *lpOpenCursor
+	if r.debug != nil {
+		open = f.pushCursor(n.Line, n.Into)
+	}
 	exhausted := false
-	defer func() { err = errors.Join(err, r.closeCursor(cursor, exhausted)) }()
+	childRan := false
+	defer func() {
+		if open != nil {
+			f.popCursor(open)
+		}
+		err = errors.Join(err, r.closeCursor(cursor, exhausted))
+		if err != nil && !childRan {
+			err = r.debugHeaderError(err)
+		}
+	}()
 	outputs := stmt.Outputs()
 	for {
 		row, state, err := r.dynamicFetch(node, cursor)
@@ -483,9 +496,13 @@ func (r *lpRun) forExecStatement(f *lpFrame, n *psql.Node, node *LineProfileNode
 			exhausted = state == lpFetchEnd
 			return lpContinue, err
 		}
+		if open != nil {
+			open.fetched++
+		}
 		if err := r.assignDynamic(f, n.Into, row, outputs); err != nil {
 			return lpContinue, err
 		}
+		childRan = true
 		sig, err := r.exec(f, n.Children[0])
 		if err != nil || sig == lpExit {
 			return sig, err

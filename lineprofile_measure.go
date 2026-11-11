@@ -59,6 +59,9 @@ func measureBaseline(ctx context.Context, c *conn) (RoundTripBaseline, error) {
 // snapshot that attributes the call's counters to the node. Only op is timed
 // into the node; the snapshot time is overhead.
 func (r *lpRun) serverCall(node *LineProfileNode, op func() error) error {
+	if r.noMeasure {
+		return op()
+	}
 	start := time.Now()
 	err := op()
 	d := time.Since(start)
@@ -93,7 +96,7 @@ func (r *lpRun) serverCall(node *LineProfileNode, op func() error) error {
 // items or a counter that went backwards) the counters become unavailable
 // for the run and the run continues (R16); any other failure ends the run.
 func (r *lpRun) snapshot(m *LineMetrics) error {
-	if r.countersUnavailable {
+	if r.noMeasure || r.countersUnavailable {
 		return nil
 	}
 	start := time.Now()

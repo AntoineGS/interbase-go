@@ -85,6 +85,7 @@ func TestGDSCodeByName(t *testing.T) {
 		"no_dup":               335544349,
 		"not_valid":            335544347,
 		"update_conflict":      335544451,
+		"read_only_trans":      335544361,
 	} {
 		got, ok := GDSCodeByName(name)
 		if !ok || got != want {

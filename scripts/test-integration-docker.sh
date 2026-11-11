@@ -55,6 +55,7 @@ TEMP_PARENT=''
 TEST_ROOT=''
 CONTAINER_NAME=''
 CONTAINER_ID=''
+PUBLISHED_HOST_PORT=''
 CONTAINER_START_ATTEMPTED=0
 ACTIVE_PID=0
 CID_FILE=''
@@ -627,7 +628,7 @@ start_container() {
     --detach
     --name "${CONTAINER_NAME}"
     --cidfile "${CID_FILE}"
-    --publish "${SERVER_BIND}:${SERVER_PORT}:${SERVER_PORT}"
+    --publish "${SERVER_BIND}::${SERVER_PORT}"
     --mount "type=bind,source=${TEST_ROOT},target=${TEST_ROOT}"
     --mount 'type=tmpfs,destination=/var/lib/interbase'
     --env-file "${ENV_FILE}"
@@ -641,7 +642,26 @@ start_container() {
   if ! load_container_id; then
     die 1 'Docker did not return an owned container ID'
   fi
-  log_info 'started the isolated InterBase container'
+  resolve_published_host_port
+  log_info "started the isolated InterBase container on loopback host port ${PUBLISHED_HOST_PORT}"
+}
+
+resolve_published_host_port() {
+  local binding=''
+
+  if ! run_timed "${DOCKER_OUTPUT}" "${COMMAND_TIMEOUT}" \
+    "${DOCKER_BIN}" port "${CONTAINER_ID}" "${SERVER_PORT}/tcp"; then
+    print_sanitized_file "${DOCKER_OUTPUT}" >&2
+    die 1 'could not resolve the isolated InterBase host port'
+  fi
+  binding="$(<"${DOCKER_OUTPUT}")"
+  if [[ ! "${binding}" =~ ^${SERVER_BIND//./\\.}:([0-9]{1,5})$ ]]; then
+    die 1 'Docker returned an invalid isolated InterBase host port'
+  fi
+  PUBLISHED_HOST_PORT="${BASH_REMATCH[1]}"
+  if ((10#${PUBLISHED_HOST_PORT} < 1 || 10#${PUBLISHED_HOST_PORT} > 65535)); then
+    die 1 'Docker returned an out-of-range isolated InterBase host port'
+  fi
 }
 
 load_container_id() {
@@ -823,7 +843,9 @@ run_go_test() {
     export LD_LIBRARY_PATH="${TEST_ROOT}:/opt/interbase/lib"
     export TMPDIR="${TEST_ROOT}"
     export INTERBASE_TEST_ISQL="${ISQL_FILE}"
-    export INTERBASE_TEST_SERVER='localhost/3050'
+    # The test binary runs inside the server container, so its attachment target
+    # uses the container-side listener, not the host's dynamically mapped port.
+    export INTERBASE_TEST_SERVER="localhost/${SERVER_PORT}"
     export INTERBASE_TEST_USER="${SERVER_USER}"
     export INTERBASE_TEST_PASSWORD="${password}"
     exec timeout --signal=TERM --kill-after=5s "${duration}" "${DOCKER_BIN}" exec \

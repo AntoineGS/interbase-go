@@ -109,7 +109,7 @@ func nativeCallSites(plan *lpPlan, stepInto map[string]bool) []LineProfileCallSi
 // prepare, the plain text is used and runsAhead is the call site to label.
 func (r *lpRun) procedureCursorText(f *lpFrame, n *psql.Node, node *LineProfileNode) (string, *LineProfileCallSite) {
 	text := n.SQL.Text
-	if n.Kind != psql.NodeForSelect || r.opts.ReadOnly || hasForUpdate(text) {
+	if n.Kind != psql.NodeForSelect || r.readOnly() || hasForUpdate(text) {
 		return text, nil
 	}
 	procedure, ok := r.procedureCursorWrites(f.meta, n)
@@ -226,8 +226,26 @@ func hasForUpdate(text string) bool {
 
 // stepsInto reports whether a SELECT … INTO or FOR SELECT node calls a
 // procedure marked for step-in in a step-in shape.
-func (r *lpRun) stepsInto(n *psql.Node) bool {
-	return n.Proc != nil && r.stepInto[n.Proc.Name]
+func (r *lpRun) stepsInto(f *lpFrame, n *psql.Node) bool {
+	if n.Proc == nil {
+		return false
+	}
+	if r.stepDecider == nil {
+		return r.stepInto[n.Proc.Name]
+	}
+	return r.emulates(f, n, n.Proc.Name)
+}
+
+// emulates reports whether callee is in the analyzed step-in set and, when
+// installed, the debugger's current command/breakpoints require stepping it.
+func (r *lpRun) emulates(f *lpFrame, n *psql.Node, callee string) bool {
+	if !r.stepInto[callee] {
+		if r.stepDecider != nil {
+			r.stepDecider(f, n, callee)
+		}
+		return false
+	}
+	return r.stepDecider == nil || r.stepDecider(f, n, callee)
 }
 
 func (r *lpRun) newVar(typeText string) *lpVar {
@@ -291,6 +309,7 @@ func (r *lpRun) enterFrame(caller *lpFrame, n *psql.Node, callee *lpRoutineMeta,
 	r.frames++
 	g := newFrame(callee, r.dbNone, profile)
 	g.routine, g.id, g.depth, g.guards = index, r.frames, caller.depth+1, caller.guards
+	g.caller = caller
 	if r.active == nil {
 		r.active = make(map[*lpRoutineMeta]int)
 	}
@@ -471,7 +490,16 @@ func (r *lpRun) stepForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 	if err != nil {
 		return lpContinue, err
 	}
-	defer func() { err = closeCallee(co, err) }()
+	var open *lpOpenCursor
+	if r.debug != nil {
+		open = f.pushCursor(n.Line, n.Into)
+	}
+	defer func() {
+		if open != nil {
+			f.popCursor(open)
+		}
+		err = closeCallee(co, err)
+	}()
 	for {
 		row, ok, err := co.next()
 		if err != nil {
@@ -481,6 +509,9 @@ func (r *lpRun) stepForSelect(f *lpFrame, n *psql.Node, node *LineProfileNode) (
 			return lpContinue, nil
 		}
 		node.Metrics.Rows++
+		if open != nil {
+			open.fetched++
+		}
 		if err := r.assignColumns(f, node, n.Into, row, columns); err != nil {
 			return lpContinue, err
 		}
