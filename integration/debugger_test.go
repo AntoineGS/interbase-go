@@ -60,6 +60,13 @@ BEGIN
   WHEN EXCEPTION DBG_E DO A = A;
   END
 END`,
+		`CREATE PROCEDURE DBG_MULTI_WRITE (P_ID INTEGER) RETURNS (A INTEGER) AS
+BEGIN
+  UPDATE DBG_T SET A = A + 1 WHERE ID = 1;
+  UPDATE DBG_T SET A = A + 1 WHERE ID = :P_ID;
+  SELECT A FROM DBG_T WHERE ID = :P_ID INTO :A;
+  SUSPEND;
+END`,
 		`CREATE PROCEDURE DBG_LOOP_WRITE (P_COUNT INTEGER) RETURNS (ITERATION INTEGER, A INTEGER) AS
 BEGIN
   ITERATION = 0;
@@ -372,6 +379,7 @@ func TestDebugLocksReleasedOnStop(t *testing.T) {
 
 func TestDebugNoWaitConflictAtLine(t *testing.T) {
 	f := newDebuggerFixture(t, 3)
+	observer := f.openConn(t, interbase.TransactionOptions{Isolation: sql.LevelReadCommitted})
 	blockerConn := f.openConn(t, interbase.TransactionOptions{Isolation: sql.LevelReadCommitted})
 	blocker, err := blockerConn.BeginTx(f.ctx, nil)
 	if err != nil {
@@ -381,13 +389,15 @@ func TestDebugNoWaitConflictAtLine(t *testing.T) {
 	if _, err := blocker.ExecContext(f.ctx, "UPDATE DBG_T SET A = A + 1 WHERE ID = 2"); err != nil {
 		t.Fatalf("hold row-2 lock: %v", err)
 	}
+	baseline := debuggerTransactionCount(t, f.ctx, observer)
 
-	query := "SELECT * FROM DBG_WRITE(2)"
+	query := "SELECT * FROM DBG_MULTI_WRITE(2)"
 	analysis, err := interbase.AnalyzeDebug(f.ctx, f.conn, query, 3)
 	if err != nil {
 		t.Fatalf("AnalyzeDebug(): %v", err)
 	}
-	updateLine := lpLine(t, analysis.Routines[0].Source, "UPDATE DBG_T SET A = A + 1")
+	updateLine := lpLine(t, analysis.Routines[0].Source,
+		"UPDATE DBG_T SET A = A + 1 WHERE ID = :P_ID")
 	session, err := interbase.StartDebug(f.ctx, f.conn, interbase.DebugOptions{
 		SQL: query, Dialect: 3, AllowWrites: true,
 	})
@@ -408,8 +418,8 @@ func TestDebugNoWaitConflictAtLine(t *testing.T) {
 	}
 	failed := session.Latest()
 	if failed.Outcome != interbase.DebugFailed || failed.FailedAt == nil ||
-		failed.FailedAt.Routine != "DBG_WRITE" || failed.FailedAt.Line != updateLine {
-		t.Fatalf("debug failure = outcome %s at %+v, error %v; want DBG_WRITE line %d",
+		failed.FailedAt.Routine != "DBG_MULTI_WRITE" || failed.FailedAt.Line != updateLine {
+		t.Fatalf("debug failure = outcome %s at %+v, error %v; want DBG_MULTI_WRITE line %d",
 			failed.Outcome, failed.FailedAt, failed.Err, updateLine)
 	}
 	lockErr := requireNativeError(t, failed.Err)
@@ -417,41 +427,112 @@ func TestDebugNoWaitConflictAtLine(t *testing.T) {
 		t.Fatalf("debug update status = %d (GDS %d), want lock conflict %d",
 			lockErr.NativeCode, lockErr.GDSCode(), iscLockConflict)
 	}
+	after := debuggerTransactionCount(t, f.ctx, observer)
+	if after != baseline {
+		t.Fatalf("transaction count after conflict = %d, baseline with blocker %d", after, baseline)
+	}
+	var rowOne int64
+	if err := observer.QueryRowContext(f.ctx, "SELECT A FROM DBG_T WHERE ID = 1").Scan(&rowOne); err != nil {
+		t.Fatalf("read row 1 through observer after failed debug: %v", err)
+	}
+	if rowOne != 10 {
+		t.Fatalf("row 1 after failed debug = %d, want original value 10 (the earlier write must roll back)", rowOne)
+	}
 	if err := blocker.Rollback(); err != nil {
 		t.Fatalf("rollback row-2 blocker: %v", err)
 	}
-	var value int64
-	if err := f.conn.QueryRowContext(f.ctx, "SELECT A FROM DBG_T WHERE ID = 2").Scan(&value); err != nil {
-		t.Fatalf("read row 2 after failed debug: %v", err)
+	var rowTwo int64
+	if err := observer.QueryRowContext(f.ctx, "SELECT A FROM DBG_T WHERE ID = 2").Scan(&rowTwo); err != nil {
+		t.Fatalf("read row 2 through observer after blocker rollback: %v", err)
 	}
-	if value != 20 {
-		t.Fatalf("row 2 after failed debug = %d, want original value 20", value)
+	if rowTwo != 20 {
+		t.Fatalf("row 2 after blocker rollback = %d, want original value 20", rowTwo)
 	}
 }
 
 func TestDebugStopDuringLongStatement(t *testing.T) {
 	f := newDebuggerFixture(t, 3)
-	query := "SELECT * FROM DBG_LOOP_WRITE(1000000)"
+	for _, statement := range []string{
+		"CREATE GENERATOR DBG_STOP_SIGNAL",
+		`CREATE TRIGGER DBG_DELAY_UPDATE FOR DBG_T
+ACTIVE BEFORE UPDATE POSITION 0
+AS
+DECLARE VARIABLE I INTEGER;
+BEGIN
+  I = GEN_ID(DBG_STOP_SIGNAL, 1);
+  I = 0;
+  WHILE (I < 2000000000) DO I = I + 1;
+END`,
+	} {
+		if _, err := f.conn.ExecContext(f.ctx, statement); err != nil {
+			t.Fatalf("set up server-side cancellation fixture %q: %v", strings.SplitN(statement, "\n", 2)[0], err)
+		}
+	}
+	observer := f.openConn(t, interbase.TransactionOptions{Isolation: sql.LevelReadCommitted})
+	baseline := debuggerTransactionCount(t, f.ctx, observer)
+	query := "SELECT * FROM DBG_WRITE(1)"
+	analysis, err := interbase.AnalyzeDebug(f.ctx, f.conn, query, 3)
+	if err != nil {
+		t.Fatalf("AnalyzeDebug(): %v", err)
+	}
+	lineAfterUpdate := lpLine(t, analysis.Routines[0].Source,
+		"SELECT A FROM DBG_T WHERE ID = :P_ID INTO :A")
 	session, err := interbase.StartDebug(f.ctx, f.conn, interbase.DebugOptions{
 		SQL: query, Dialect: 3, AllowWrites: true,
+		Breakpoints: []interbase.DebugBreakpoint{{Routine: "DBG_WRITE", Line: lineAfterUpdate}},
 	})
 	if err != nil {
 		t.Fatalf("StartDebug(): %v", err)
 	}
-	t.Cleanup(session.Stop)
+	t.Cleanup(func() {
+		// Do not let cleanup wait indefinitely if the explicit Stop bound fails.
+		select {
+		case <-session.Done():
+		default:
+			go session.Stop()
+		}
+	})
 	waitDebugSnapshot(t, session, func(snapshot interbase.DebugSnapshot) bool {
 		return snapshot.Status == interbase.DebugPaused
-	}, "DBG_LOOP_WRITE entry pause")
+	}, "DBG_WRITE entry pause")
 	if err := session.Command(interbase.DebugCommand{Kind: interbase.DebugContinue}); err != nil {
 		t.Fatalf("Continue(): %v", err)
 	}
 	waitDebugSnapshot(t, session, func(snapshot interbase.DebugSnapshot) bool {
 		return snapshot.Status == interbase.DebugRunning
-	}, "running long loop")
-	time.Sleep(100 * time.Millisecond)
-	if snapshot := session.Latest(); snapshot.Status != interbase.DebugRunning {
-		t.Fatalf("long loop ended before Stop(): status %s, outcome %s", snapshot.Status, snapshot.Outcome)
+	}, "running server UPDATE")
+
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	poll := time.NewTicker(10 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		if snapshot := session.Latest(); snapshot.Status != interbase.DebugRunning {
+			t.Fatalf("debug session left Running before the server-call entry signal: status %s, outcome %s",
+				snapshot.Status, snapshot.Outcome)
+		}
+		var entered int64
+		if err := observer.QueryRowContext(f.ctx,
+			"SELECT GEN_ID(DBG_STOP_SIGNAL, 0) FROM RDB$DATABASE").Scan(&entered); err != nil {
+			t.Fatalf("read trigger-entry signal: %v", err)
+		}
+		if entered != 0 {
+			if snapshot := session.Latest(); snapshot.Status != interbase.DebugRunning {
+				t.Fatalf("server UPDATE returned before Stop(): status %s, outcome %s",
+					snapshot.Status, snapshot.Outcome)
+			}
+			break
+		}
+		select {
+		case <-poll.C:
+		case <-deadline.C:
+			t.Fatal("server-side trigger entry signal was not observed within 10 seconds")
+		case <-session.Done():
+			t.Fatalf("debug session ended before the trigger-entry signal was observed: %+v", session.Latest())
+		}
 	}
+	t.Log("observed the trigger-entry generator while the server UPDATE was still running")
+
 	started := time.Now()
 	stopped := make(chan struct{})
 	go func() {
@@ -468,6 +549,17 @@ func TestDebugStopDuringLongStatement(t *testing.T) {
 	}
 	if snapshot := session.Latest(); snapshot.Outcome != interbase.DebugStopped {
 		t.Fatalf("Stop() outcome = %s, error %v; want stopped", snapshot.Outcome, snapshot.Err)
+	}
+	var value int64
+	if err := observer.QueryRowContext(f.ctx, "SELECT A FROM DBG_T WHERE ID = 1").Scan(&value); err != nil {
+		t.Fatalf("read DBG_T after Stop(): %v", err)
+	}
+	if value != 10 {
+		t.Fatalf("DBG_T value after Stop() = %d, want original value 10", value)
+	}
+	after := debuggerTransactionCount(t, f.ctx, observer)
+	if after != baseline {
+		t.Fatalf("transaction count after Stop() = %d, baseline %d", after, baseline)
 	}
 }
 
