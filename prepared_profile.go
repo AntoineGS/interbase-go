@@ -26,7 +26,9 @@ const (
 )
 
 // PreparedProfile is a one-shot described statement that can be profiled
-// without preparing it again. It is bound to the *sql.Conn used to create it.
+// without preparing it again (unless a database/sql transaction is active on
+// the connection when Profile runs; see Profile). It is bound to the *sql.Conn
+// used to create it.
 // Close it when it will not be run; do not execute other statements on that
 // connection until Profile or Close.
 type PreparedProfile struct {
